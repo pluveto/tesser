@@ -18,6 +18,9 @@ use tracing::info;
 #[derive(Parser)]
 #[command(author, version, about = "Tesser CLI")]
 struct Cli {
+    /// Increases logging verbosity (-v debug, -vv trace)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
     /// Selects which configuration environment to load (maps to config/{env}.toml)
     #[arg(long, default_value = "default")]
     env: String,
@@ -179,14 +182,16 @@ fn empty_table() -> toml::Value {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,tesser_cli=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
     let config = load_config(Some(&cli.env)).context("failed to load configuration")?;
+
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| match cli.verbose {
+        0 => config.log_level.clone(),
+        1 => "debug".to_string(),
+        _ => "trace".to_string(),
+    });
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match cli.command {
         Commands::Data { action } => handle_data(action, &config).await?,

@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use tesser_core::{Candle, Interval, Symbol};
+use tracing::debug;
 
 const MAX_LIMIT: usize = 1000;
 
@@ -80,10 +81,33 @@ impl BybitDownloader {
                 ])
                 .send()
                 .await
-                .context("request to Bybit failed")?
-                .json::<BybitKlineResponse>()
+                .context("request to Bybit failed")?;
+
+            let status = response.status();
+            let body = response
+                .text()
                 .await
-                .context("failed to parse Bybit response")?;
+                .context("failed to read Bybit response body")?;
+            debug!(
+                "bybit kline response (status {}): {}",
+                status,
+                truncate(&body, 512)
+            );
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "Bybit responded with status {}: {}",
+                    status,
+                    truncate(&body, 256)
+                ));
+            }
+
+            let response: BybitKlineResponse = serde_json::from_str(&body).map_err(|err| {
+                anyhow!(
+                    "failed to parse Bybit response: {} (body snippet: {})",
+                    err,
+                    truncate(&body, 256)
+                )
+            })?;
 
             if response.ret_code != 0 {
                 return Err(anyhow!(
@@ -165,4 +189,12 @@ struct BybitKlineResponse {
 #[derive(Debug, Deserialize)]
 struct KlineResult {
     list: Vec<Vec<String>>,
+}
+
+fn truncate(body: &str, max: usize) -> String {
+    if body.len() <= max {
+        body.to_string()
+    } else {
+        format!("{}…", &body[..max])
+    }
 }
