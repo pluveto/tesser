@@ -1,5 +1,7 @@
 //! Fundamental data types shared across the entire workspace.
 
+use std::str::FromStr;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -84,6 +86,37 @@ impl Interval {
             Self::OneHour => Duration::hours(1),
             Self::FourHours => Duration::hours(4),
             Self::OneDay => Duration::days(1),
+        }
+    }
+
+    /// Convert to Bybit interval identifiers.
+    #[must_use]
+    pub fn to_bybit(self) -> &'static str {
+        match self {
+            Self::OneSecond => "1",
+            Self::OneMinute => "1",
+            Self::FiveMinutes => "5",
+            Self::FifteenMinutes => "15",
+            Self::OneHour => "60",
+            Self::FourHours => "240",
+            Self::OneDay => "D",
+        }
+    }
+}
+
+impl FromStr for Interval {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_lowercase().as_str() {
+            "1s" | "1sec" | "1second" | "1" => Ok(Self::OneSecond),
+            "1m" | "1min" | "1minute" => Ok(Self::OneMinute),
+            "5m" | "5min" | "5minutes" => Ok(Self::FiveMinutes),
+            "15m" | "15min" | "15minutes" => Ok(Self::FifteenMinutes),
+            "1h" | "60m" | "1hour" | "60" => Ok(Self::OneHour),
+            "4h" | "240m" | "4hours" | "240" => Ok(Self::FourHours),
+            "1d" | "day" | "d" => Ok(Self::OneDay),
+            other => Err(format!("unsupported interval '{other}'")),
         }
     }
 }

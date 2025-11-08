@@ -1,12 +1,15 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use chrono::{Duration, Utc};
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde::Deserialize;
+use csv::Writer;
+use serde::{Deserialize, Serialize};
 use tesser_backtester::{BacktestConfig, BacktestReport, Backtester};
 use tesser_config::{load_config, AppConfig};
 use tesser_core::{Candle, Interval, Symbol};
+use tesser_data::download::{BybitDownloader, KlineRequest};
 use tesser_execution::{ExecutionEngine, FixedOrderSizer};
 use tesser_paper::PaperExecutionClient;
 use tesser_strategy::{build_builtin_strategy, builtin_strategy_names};
@@ -71,10 +74,61 @@ struct DataDownloadArgs {
     exchange: String,
     #[arg(long)]
     symbol: String,
+    #[arg(long, default_value = "linear")]
+    category: String,
+    #[arg(long, default_value = "1m")]
+    interval: String,
     #[arg(long)]
     start: String,
     #[arg(long)]
     end: Option<String>,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+impl DataDownloadArgs {
+    async fn run(&self, config: &AppConfig) -> Result<()> {
+        let exchange_cfg = config
+            .exchange
+            .get(&self.exchange)
+            .ok_or_else(|| anyhow!("exchange profile '{}' not found in config", self.exchange))?;
+        let interval: Interval = self.interval.parse().map_err(|err: String| anyhow!(err))?;
+        let start = parse_datetime(&self.start)?;
+        let end = match &self.end {
+            Some(value) => parse_datetime(value)?,
+            None => Utc::now(),
+        };
+        if start >= end {
+            return Err(anyhow!("start time must be earlier than end time"));
+        }
+
+        let downloader = BybitDownloader::new(&exchange_cfg.rest_url);
+        let request = KlineRequest::new(&self.category, &self.symbol, interval, start, end);
+        info!(
+            "Downloading {} candles for {} ({})",
+            self.interval, self.symbol, self.exchange
+        );
+        let candles = downloader
+            .download_klines(&request)
+            .await
+            .with_context(|| "failed to download candles from Bybit")?;
+
+        if candles.is_empty() {
+            info!("No candles returned for {}", self.symbol);
+            return Ok(());
+        }
+
+        let output_path = self.output.clone().unwrap_or_else(|| {
+            default_output_path(config, &self.exchange, &self.symbol, interval, start, end)
+        });
+        write_candles_csv(&output_path, &candles)?;
+        info!(
+            "Saved {} candles to {}",
+            candles.len(),
+            output_path.display()
+        );
+        Ok(())
+    }
 }
 
 #[derive(Args)]
@@ -151,14 +205,7 @@ async fn main() -> Result<()> {
 async fn handle_data(cmd: DataCommand, config: &AppConfig) -> Result<()> {
     match cmd {
         DataCommand::Download(args) => {
-            info!(
-                "stub: downloading data for {} on {} into {} ({} -> {:?})",
-                args.symbol,
-                args.exchange,
-                config.data_path.display(),
-                args.start,
-                args.end
-            );
+            args.run(config).await?;
         }
         DataCommand::Validate(args) => {
             info!("stub: validating dataset at {}", args.path.display());
@@ -263,4 +310,84 @@ fn synth_candles(symbol: &str, len: usize, offset_minutes: i64) -> Vec<Candle> {
         });
     }
     candles
+}
+
+fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow!("invalid date"))?;
+        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
+    }
+    Err(anyhow!("unable to parse datetime '{value}'"))
+}
+
+fn default_output_path(
+    config: &AppConfig,
+    exchange: &str,
+    symbol: &str,
+    interval: Interval,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> PathBuf {
+    let interval_part = interval_label(interval);
+    let start_part = start.format("%Y%m%d").to_string();
+    let end_part = end.format("%Y%m%d").to_string();
+    config
+        .data_path
+        .join(exchange)
+        .join(symbol)
+        .join(format!("{}_{}-{}.csv", interval_part, start_part, end_part))
+}
+
+fn interval_label(interval: Interval) -> &'static str {
+    match interval {
+        Interval::OneSecond => "1s",
+        Interval::OneMinute => "1m",
+        Interval::FiveMinutes => "5m",
+        Interval::FifteenMinutes => "15m",
+        Interval::OneHour => "1h",
+        Interval::FourHours => "4h",
+        Interval::OneDay => "1d",
+    }
+}
+
+#[derive(Serialize)]
+struct CandleRow<'a> {
+    symbol: &'a str,
+    timestamp: String,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+}
+
+fn write_candles_csv(path: &Path, candles: &[Candle]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    let mut writer =
+        Writer::from_path(path).with_context(|| format!("failed to create {}", path.display()))?;
+    for candle in candles {
+        let row = CandleRow {
+            symbol: &candle.symbol,
+            timestamp: candle.timestamp.to_rfc3339(),
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+        };
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    Ok(())
 }

@@ -1,5 +1,8 @@
-//! Data distribution utilities that consume [`tesser_broker::MarketStream`].
+//! Data utilities including streaming and historical downloads.
 
+pub mod download;
+
+/// Data distribution utilities that consume [`tesser_broker::MarketStream`].
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::time::{sleep, Duration};
