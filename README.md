@@ -1,8 +1,11 @@
 # Tesser: A High-Performance Quantitative Trading Framework in Rust
 
+
 [![CI](https://github.com/pluveto/tesser/actions/workflows/ci.yml/badge.svg)](https://github.com/pluveto/tesser/actions/workflows/ci.yml)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![Crates.io](https://img.shields.io/crates/v/tesser.svg)](https://crates.io/crates/tesser)
+
+<img src="./tesser.jpg" alt="Tesser" width="200" />
 
 Tesser is a modular, event-driven framework for building and executing quantitative trading strategies. Written entirely in Rust, it is designed for performance, reliability, and extensibility, allowing traders and developers to move from idea to backtesting and live deployment with confidence.
 
