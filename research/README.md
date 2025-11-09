@@ -22,6 +22,9 @@ Once the environment is ready, you can open notebooks or run scripts:
 uv run python scripts/find_optimal_sma.py --data ../data/btc.parquet
 uv run python scripts/optimize_rsi.py --data ../data/btc.parquet --output strategies/rsi_from_python.toml
 uv run python scripts/train_ml_classifier.py --data ../data/btc.parquet --output models/ml_linear.toml
+uv run python scripts/walk_forward_sma.py --data ../data/btc.parquet --summary-csv summaries/sma_walk_forward.csv
 ```
 
 Store generated strategy configs under `strategies/` (see `sma_cross.toml`, `rsi_reversion.toml`, etc.) and drop ML artifacts under `models/`. The Rust CLI consumes these files directly via `--strategy-config` (and the referenced `model_path`).
+
+The walk-forward script evaluates SMA crossover parameters on rolling train/test windows, writes a per-window CSV summary, and emits a ready-to-use TOML config that reflects the best-performing parameters across the out-of-sample slices.
