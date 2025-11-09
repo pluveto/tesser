@@ -251,6 +251,15 @@ struct BacktestRunArgs {
     candles: usize,
     #[arg(long, default_value_t = 0.01)]
     quantity: f64,
+    /// Symmetric slippage in basis points (1 bp = 0.01%) applied to fills
+    #[arg(long, default_value_t = 0.0)]
+    slippage_bps: f64,
+    /// Trading fees in basis points applied to notional
+    #[arg(long, default_value_t = 0.0)]
+    fee_bps: f64,
+    /// Number of candles between signal and execution
+    #[arg(long, default_value_t = 1)]
+    latency_candles: usize,
 }
 
 #[derive(Args)]
@@ -266,6 +275,15 @@ struct BacktestBatchArgs {
     /// Optional output CSV summarizing results
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Symmetric slippage in basis points (1 bp = 0.01%) applied to fills
+    #[arg(long, default_value_t = 0.0)]
+    slippage_bps: f64,
+    /// Trading fees in basis points applied to notional
+    #[arg(long, default_value_t = 0.0)]
+    fee_bps: f64,
+    /// Number of candles between signal and execution
+    #[arg(long, default_value_t = 1)]
+    latency_candles: usize,
 }
 
 #[derive(Args)]
@@ -377,7 +395,12 @@ impl BacktestRunArgs {
             }),
         );
 
-        let cfg = BacktestConfig::new(symbols[0].clone(), candles);
+        let mut cfg = BacktestConfig::new(symbols[0].clone(), candles);
+        cfg.order_quantity = self.quantity;
+        cfg.execution.slippage_bps = self.slippage_bps.max(0.0);
+        cfg.execution.fee_bps = self.fee_bps.max(0.0);
+        cfg.execution.latency_candles = self.latency_candles.max(1);
+
         let report = Backtester::new(cfg, strategy, execution)
             .run()
             .await
@@ -412,22 +435,29 @@ impl BacktestBatchArgs {
                     quantity: self.quantity,
                 }),
             );
-            let cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
+            let mut cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
+            cfg.order_quantity = self.quantity;
+            cfg.execution.slippage_bps = self.slippage_bps.max(0.0);
+            cfg.execution.fee_bps = self.fee_bps.max(0.0);
+            cfg.execution.latency_candles = self.latency_candles.max(1);
+
             let report = Backtester::new(cfg, strategy, execution)
                 .run()
                 .await
                 .with_context(|| format!("backtest failed for {}", config_path.display()))?;
             println!(
-                "[batch] {} -> signals {}, orders {}, ending equity {:.2}",
+                "[batch] {} -> signals {}, orders {}, dropped {}, ending equity {:.2}",
                 config_path.display(),
                 report.signals_emitted,
                 report.orders_sent,
+                report.dropped_orders,
                 report.ending_equity
             );
             aggregated.push(BatchRow {
                 config: config_path.display().to_string(),
                 signals: report.signals_emitted,
                 orders: report.orders_sent,
+                dropped_orders: report.dropped_orders,
                 ending_equity: report.ending_equity,
             });
         }
@@ -550,6 +580,7 @@ fn print_report(report: BacktestReport) {
     println!("Backtest completed:");
     println!("  Signals generated: {}", report.signals_emitted);
     println!("  Orders sent: {}", report.orders_sent);
+    println!("  Orders dropped: {}", report.dropped_orders);
     println!("  Ending equity: {:.2}", report.ending_equity);
 }
 
@@ -717,6 +748,7 @@ struct BatchRow {
     config: String,
     signals: usize,
     orders: usize,
+    dropped_orders: usize,
     ending_equity: f64,
 }
 
