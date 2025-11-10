@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use tesser_broker::{BrokerError, BrokerResult, ExecutionClient};
 use tesser_core::{Order, OrderRequest, OrderType, Quantity, Side, Signal, SignalKind};
+use thiserror::Error;
 use tracing::{info, warn};
 
 /// Determine how large an order should be for a given signal.
@@ -24,20 +25,142 @@ impl OrderSizer for FixedOrderSizer {
     }
 }
 
+/// Context passed to risk checks describing current exposure state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RiskContext {
+    /// Signed quantity of the current open position (long positive, short negative).
+    pub signed_position_qty: f64,
+    /// When true, only exposure-reducing orders are allowed.
+    pub liquidate_only: bool,
+}
+
+/// Validates an order before it reaches the broker.
+pub trait PreTradeRiskChecker: Send + Sync {
+    /// Return `Ok(())` if the order passes risk checks.
+    fn check(&self, request: &OrderRequest, ctx: &RiskContext) -> Result<(), RiskError>;
+}
+
+/// No-op risk checker used by tests/backtests.
+pub struct NoopRiskChecker;
+
+impl PreTradeRiskChecker for NoopRiskChecker {
+    fn check(&self, _request: &OrderRequest, _ctx: &RiskContext) -> Result<(), RiskError> {
+        Ok(())
+    }
+}
+
+/// Upper bounds enforced by the [`BasicRiskChecker`].
+#[derive(Clone, Copy, Debug)]
+pub struct RiskLimits {
+    pub max_order_quantity: f64,
+    pub max_position_quantity: f64,
+}
+
+impl RiskLimits {
+    /// Ensure limits are non-negative and default to zero (disabled) when NaN.
+    pub fn sanitized(self) -> Self {
+        Self {
+            max_order_quantity: self.max_order_quantity.max(0.0),
+            max_position_quantity: self.max_position_quantity.max(0.0),
+        }
+    }
+}
+
+/// Simple risk checker enforcing fat-finger order size limits plus position caps.
+pub struct BasicRiskChecker {
+    limits: RiskLimits,
+}
+
+impl BasicRiskChecker {
+    /// Build a new checker with the provided limits.
+    pub fn new(limits: RiskLimits) -> Self {
+        Self {
+            limits: limits.sanitized(),
+        }
+    }
+}
+
+impl PreTradeRiskChecker for BasicRiskChecker {
+    fn check(&self, request: &OrderRequest, ctx: &RiskContext) -> Result<(), RiskError> {
+        let qty = request.quantity.abs();
+        if self.limits.max_order_quantity > 0.0 && qty > self.limits.max_order_quantity {
+            return Err(RiskError::MaxOrderSize {
+                quantity: qty,
+                limit: self.limits.max_order_quantity,
+            });
+        }
+
+        let projected_position = match request.side {
+            Side::Buy => ctx.signed_position_qty + qty,
+            Side::Sell => ctx.signed_position_qty - qty,
+        };
+
+        if self.limits.max_position_quantity > 0.0
+            && projected_position.abs() > self.limits.max_position_quantity
+        {
+            return Err(RiskError::MaxPositionExposure {
+                projected: projected_position,
+                limit: self.limits.max_position_quantity,
+            });
+        }
+
+        if ctx.liquidate_only {
+            let position = ctx.signed_position_qty;
+            if position.abs() < f64::EPSILON {
+                return Err(RiskError::LiquidateOnly);
+            }
+            let reduces = (position > 0.0 && request.side == Side::Sell)
+                || (position < 0.0 && request.side == Side::Buy);
+            if !reduces {
+                return Err(RiskError::LiquidateOnly);
+            }
+            if qty > position.abs() + f64::EPSILON {
+                return Err(RiskError::LiquidateOnly);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Errors surfaced by pre-trade risk checks.
+#[derive(Debug, Error)]
+pub enum RiskError {
+    #[error("order quantity {quantity:.4} exceeds limit {limit:.4}")]
+    MaxOrderSize { quantity: f64, limit: f64 },
+    #[error("projected position {projected:.4} exceeds limit {limit:.4}")]
+    MaxPositionExposure { projected: f64, limit: f64 },
+    #[error("liquidate-only mode active")]
+    LiquidateOnly,
+}
+
 /// Translates signals into orders using a provided [`ExecutionClient`].
 pub struct ExecutionEngine {
     client: Arc<dyn ExecutionClient>,
     sizer: Box<dyn OrderSizer>,
+    risk: Arc<dyn PreTradeRiskChecker>,
 }
 
 impl ExecutionEngine {
     /// Instantiate the engine with its dependencies.
-    pub fn new(client: Arc<dyn ExecutionClient>, sizer: Box<dyn OrderSizer>) -> Self {
-        Self { client, sizer }
+    pub fn new(
+        client: Arc<dyn ExecutionClient>,
+        sizer: Box<dyn OrderSizer>,
+        risk: Arc<dyn PreTradeRiskChecker>,
+    ) -> Self {
+        Self {
+            client,
+            sizer,
+            risk,
+        }
     }
 
     /// Consume a signal and forward it to the broker.
-    pub async fn handle_signal(&self, signal: Signal) -> BrokerResult<Option<Order>> {
+    pub async fn handle_signal(
+        &self,
+        signal: Signal,
+        ctx: RiskContext,
+    ) -> BrokerResult<Option<Order>> {
         let qty = self
             .sizer
             .size(&signal)
@@ -49,29 +172,21 @@ impl ExecutionEngine {
             return Ok(None);
         }
 
-        let order = match signal.kind {
-            SignalKind::EnterLong => {
-                self.send_order(signal.symbol.clone(), Side::Buy, qty)
-                    .await?
-            }
+        let request = match signal.kind {
+            SignalKind::EnterLong => self.build_request(signal.symbol.clone(), Side::Buy, qty),
             SignalKind::ExitLong | SignalKind::Flatten => {
-                self.send_order(signal.symbol.clone(), Side::Sell, qty)
-                    .await?
+                self.build_request(signal.symbol.clone(), Side::Sell, qty)
             }
-            SignalKind::EnterShort => {
-                self.send_order(signal.symbol.clone(), Side::Sell, qty)
-                    .await?
-            }
-            SignalKind::ExitShort => {
-                self.send_order(signal.symbol.clone(), Side::Buy, qty)
-                    .await?
-            }
+            SignalKind::EnterShort => self.build_request(signal.symbol.clone(), Side::Sell, qty),
+            SignalKind::ExitShort => self.build_request(signal.symbol.clone(), Side::Buy, qty),
         };
+
+        let order = self.send_order(request, &ctx).await?;
         Ok(Some(order))
     }
 
-    async fn send_order(&self, symbol: String, side: Side, qty: Quantity) -> BrokerResult<Order> {
-        let request = OrderRequest {
+    fn build_request(&self, symbol: String, side: Side, qty: Quantity) -> OrderRequest {
+        OrderRequest {
             symbol,
             side,
             order_type: OrderType::Market,
@@ -79,9 +194,15 @@ impl ExecutionEngine {
             price: None,
             time_in_force: None,
             client_order_id: None,
-        };
+        }
+    }
+
+    async fn send_order(&self, request: OrderRequest, ctx: &RiskContext) -> BrokerResult<Order> {
+        self.risk
+            .check(&request, ctx)
+            .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
         let order = self.client.place_order(request).await?;
-        info!(order_id = %order.id, %qty, "order sent to broker");
+        info!(order_id = %order.id, qty = order.request.quantity, "order sent to broker");
         Ok(order)
     }
 }

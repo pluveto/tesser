@@ -229,9 +229,16 @@ webhook_url = ""          # Optional HTTP endpoint
 max_data_gap_secs = 300     # Alert if no ticks/candles are seen for 5 minutes
 max_order_failures = 3      # Trigger after N consecutive execution errors
 max_drawdown = 0.03         # 3% peak-to-trough drawdown guardrail
+
+[risk_management]
+max_order_quantity = 1.0    # Fat-finger guard per order (base asset qty)
+max_position_quantity = 2.0 # Absolute cap on aggregate exposure per symbol
+max_drawdown = 0.05         # Liquidate-only kill switch threshold (fractional)
 ```
 
 Every CLI flag (e.g., `--state-path`, `--metrics-addr`, `--log-path`, `--webhook-url`) overrides the config file so you can spin up multiple paper sessions with different telemetry endpoints.
+
+When `tesser-cli live run` executes, each order is filtered through the pre-trade risk layer: quantities above `max_order_quantity` are rejected, projected exposure cannot exceed `max_position_quantity`, and once equity suffers a drawdown beyond `max_drawdown` the portfolio flips into liquidate-only mode (only allowing exposure-reducing orders) until the process is restarted.
 
 ### Python Research Workflow
 

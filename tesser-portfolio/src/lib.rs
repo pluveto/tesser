@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tesser_core::{Fill, Position, Price, Symbol};
+use tesser_core::{Fill, Position, Price, Side, Symbol};
 use thiserror::Error;
 
 /// Result alias for portfolio operations.
@@ -24,12 +24,14 @@ pub enum PortfolioError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PortfolioConfig {
     pub initial_equity: Price,
+    pub max_drawdown: Option<f64>,
 }
 
 impl Default for PortfolioConfig {
     fn default() -> Self {
         Self {
             initial_equity: 10_000.0,
+            max_drawdown: None,
         }
     }
 }
@@ -40,16 +42,25 @@ pub struct Portfolio {
     cash: Price,
     realized_pnl: Price,
     initial_equity: Price,
+    drawdown_limit: Option<f64>,
+    peak_equity: Price,
+    liquidate_only: bool,
 }
 
 impl Portfolio {
     /// Instantiate a new portfolio with default configuration.
     pub fn new(config: PortfolioConfig) -> Self {
+        let limit = config
+            .max_drawdown
+            .filter(|value| value.is_finite() && *value > 0.0);
         Self {
             cash: config.initial_equity,
             positions: HashMap::new(),
             realized_pnl: 0.0,
             initial_equity: config.initial_equity,
+            drawdown_limit: limit,
+            peak_equity: config.initial_equity,
+            liquidate_only: false,
         }
     }
 
@@ -87,8 +98,8 @@ impl Portfolio {
                 let remaining = entry.quantity - fill.fill_quantity;
                 if let Some(entry_price) = entry.entry_price {
                     let delta = match fill.side {
-                        tesser_core::Side::Buy => entry_price - fill.fill_price,
-                        tesser_core::Side::Sell => fill.fill_price - entry_price,
+                        Side::Buy => entry_price - fill.fill_price,
+                        Side::Sell => fill.fill_price - entry_price,
                     };
                     self.realized_pnl += delta * fill.fill_quantity;
                 }
@@ -119,6 +130,7 @@ impl Portfolio {
         }
 
         entry.updated_at = fill.timestamp;
+        self.update_drawdown_state();
         Ok(())
     }
 
@@ -159,6 +171,25 @@ impl Portfolio {
         self.positions.values().cloned().collect()
     }
 
+    /// Signed position quantity helper (long positive, short negative).
+    #[must_use]
+    pub fn signed_position_qty(&self, symbol: &str) -> f64 {
+        self.positions
+            .get(symbol)
+            .and_then(|position| match position.side {
+                Some(Side::Buy) => Some(position.quantity),
+                Some(Side::Sell) => Some(-position.quantity),
+                None => Some(0.0),
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Whether the portfolio currently allows only exposure-reducing orders.
+    #[must_use]
+    pub fn liquidate_only(&self) -> bool {
+        self.liquidate_only
+    }
+
     /// Snapshot the current state for persistence.
     #[must_use]
     pub fn snapshot(&self) -> PortfolioState {
@@ -167,23 +198,54 @@ impl Portfolio {
             cash: self.cash,
             realized_pnl: self.realized_pnl,
             initial_equity: self.initial_equity,
+            drawdown_limit: self.drawdown_limit,
+            peak_equity: self.peak_equity,
+            liquidate_only: self.liquidate_only,
         }
     }
 
     /// Rehydrate a portfolio from a persisted snapshot.
-    pub fn from_state(state: PortfolioState) -> Self {
-        Self {
+    pub fn from_state(state: PortfolioState, config: PortfolioConfig) -> Self {
+        let drawdown_limit = config
+            .max_drawdown
+            .or(state.drawdown_limit)
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let mut portfolio = Self {
             positions: state.positions,
             cash: state.cash,
             realized_pnl: state.realized_pnl,
             initial_equity: state.initial_equity,
-        }
+            drawdown_limit,
+            peak_equity: state
+                .peak_equity
+                .max(state.initial_equity)
+                .max(config.initial_equity),
+            liquidate_only: state.liquidate_only,
+        };
+        portfolio.update_drawdown_state();
+        portfolio
     }
 
     /// Refresh mark-to-market pricing for a symbol when new data arrives.
     pub fn mark_price(&mut self, symbol: &str, price: Price) {
         if let Some(position) = self.positions.get_mut(symbol) {
             position.mark_price(price);
+        }
+        self.update_drawdown_state();
+    }
+
+    fn update_drawdown_state(&mut self) {
+        let equity = self.equity();
+        if equity > self.peak_equity {
+            self.peak_equity = equity;
+        }
+        if let Some(limit) = self.drawdown_limit {
+            if self.peak_equity > 0.0 {
+                let drawdown = (self.peak_equity - equity) / self.peak_equity;
+                if drawdown >= limit {
+                    self.liquidate_only = true;
+                }
+            }
         }
     }
 }
@@ -195,6 +257,9 @@ pub struct PortfolioState {
     pub cash: Price,
     pub realized_pnl: Price,
     pub initial_equity: Price,
+    pub drawdown_limit: Option<f64>,
+    pub peak_equity: Price,
+    pub liquidate_only: bool,
 }
 
 #[cfg(test)]

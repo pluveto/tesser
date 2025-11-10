@@ -18,9 +18,12 @@ use tesser_broker::{ExecutionClient, MarketStream};
 use tesser_bybit::{
     BybitClient, BybitConfig, BybitCredentials, BybitMarketStream, BybitSubscription, PublicChannel,
 };
-use tesser_config::{AlertingConfig, ExchangeConfig};
+use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{Candle, Fill, Interval, Order, Price, Side, Signal};
-use tesser_execution::{ExecutionEngine, FixedOrderSizer};
+use tesser_execution::{
+    BasicRiskChecker, ExecutionEngine, FixedOrderSizer, PreTradeRiskChecker, RiskContext,
+    RiskLimits,
+};
 use tesser_paper::PaperExecutionClient;
 use tesser_portfolio::{Portfolio, PortfolioConfig};
 use tesser_strategy::{Strategy, StrategyContext};
@@ -55,6 +58,16 @@ pub struct LiveSessionSettings {
     pub initial_equity: f64,
     pub alerting: AlertingConfig,
     pub exec_backend: ExecutionBackend,
+    pub risk: RiskManagementConfig,
+}
+
+impl LiveSessionSettings {
+    fn risk_limits(&self) -> RiskLimits {
+        RiskLimits {
+            max_order_quantity: self.risk.max_order_quantity.max(0.0),
+            max_position_quantity: self.risk.max_position_quantity.max(0.0),
+        }
+    }
 }
 
 pub async fn run_live(
@@ -97,11 +110,14 @@ pub async fn run_live(
             "live execution enabled via Bybit REST"
         );
     }
+    let risk_checker: Arc<dyn PreTradeRiskChecker> =
+        Arc::new(BasicRiskChecker::new(settings.risk_limits()));
     let execution = ExecutionEngine::new(
         execution_client,
         Box::new(FixedOrderSizer {
             quantity: settings.quantity,
         }),
+        risk_checker,
     );
 
     let runtime = LiveRuntime::new(stream, strategy, symbols, execution, settings).await?;
@@ -172,12 +188,14 @@ impl LiveRuntime {
                 LiveState::default()
             }
         };
+        let portfolio_cfg = PortfolioConfig {
+            initial_equity: settings.initial_equity,
+            max_drawdown: Some(settings.risk.max_drawdown),
+        };
         let portfolio = if let Some(snapshot) = persisted.portfolio.take() {
-            Portfolio::from_state(snapshot)
+            Portfolio::from_state(snapshot, portfolio_cfg.clone())
         } else {
-            Portfolio::new(PortfolioConfig {
-                initial_equity: settings.initial_equity,
-            })
+            Portfolio::new(portfolio_cfg.clone())
         };
         strategy_ctx.update_positions(portfolio.positions());
 
@@ -300,7 +318,11 @@ impl LiveRuntime {
         }
         self.metrics.inc_signals(signals.len());
         for signal in signals {
-            match self.execution.handle_signal(signal.clone()).await {
+            let ctx = RiskContext {
+                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                liquidate_only: self.portfolio.liquidate_only(),
+            };
+            match self.execution.handle_signal(signal.clone(), ctx).await {
                 Ok(Some(order)) => {
                     self.metrics.inc_order();
                     let result = if self.exec_backend.is_paper() {

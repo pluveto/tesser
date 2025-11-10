@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub exchange: HashMap<String, ExchangeConfig>,
     #[serde(default)]
     pub live: LiveRuntimeConfig,
+    #[serde(default)]
+    pub risk_management: RiskManagementConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +64,16 @@ pub struct AlertingConfig {
     pub max_drawdown: f64,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct RiskManagementConfig {
+    #[serde(default = "default_max_order_quantity")]
+    pub max_order_quantity: f64,
+    #[serde(default = "default_max_position_quantity")]
+    pub max_position_quantity: f64,
+    #[serde(default = "default_risk_drawdown_limit")]
+    pub max_drawdown: f64,
+}
+
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
@@ -88,6 +100,16 @@ impl Default for AlertingConfig {
             max_data_gap_secs: default_data_gap_secs(),
             max_order_failures: default_order_failure_limit(),
             max_drawdown: default_drawdown_limit(),
+        }
+    }
+}
+
+impl Default for RiskManagementConfig {
+    fn default() -> Self {
+        Self {
+            max_order_quantity: default_max_order_quantity(),
+            max_position_quantity: default_max_position_quantity(),
+            max_drawdown: default_risk_drawdown_limit(),
         }
     }
 }
@@ -126,6 +148,18 @@ fn default_order_failure_limit() -> u32 {
 
 fn default_drawdown_limit() -> f64 {
     0.03
+}
+
+fn default_max_order_quantity() -> f64 {
+    1.0
+}
+
+fn default_max_position_quantity() -> f64 {
+    2.0
+}
+
+fn default_risk_drawdown_limit() -> f64 {
+    0.05
 }
 
 /// Loads configuration by merging files and environment variables.

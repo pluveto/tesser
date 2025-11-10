@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use anyhow::Context;
 use tesser_core::{Candle, Fill, Order, Quantity, Side, Symbol};
-use tesser_execution::ExecutionEngine;
+use tesser_execution::{ExecutionEngine, RiskContext};
 use tesser_portfolio::{Portfolio, PortfolioConfig};
 use tesser_strategy::{Strategy, StrategyContext};
 use tracing::warn;
@@ -110,7 +110,11 @@ impl Backtester {
             let signals = self.strategy.drain_signals();
             for signal in signals {
                 signals_emitted += 1;
-                if let Some(order) = self.execution.handle_signal(signal).await? {
+                let ctx = RiskContext {
+                    signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                    liquidate_only: false,
+                };
+                if let Some(order) = self.execution.handle_signal(signal, ctx).await? {
                     orders_sent += 1;
                     let latency = self.config.execution.latency_candles.max(1);
                     let due_index = idx + latency;

@@ -11,3 +11,4 @@ tracing.workspace = true
 tesser-broker = { path = "../tesser-broker" }
 tesser-core = { path = "../tesser-core" }
 tesser-strategy = { path = "../tesser-strategy" }
+thiserror.workspace = true

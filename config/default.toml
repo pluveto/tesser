@@ -7,6 +7,11 @@ log_level = "info"
 [backtest]
 initial_equity = 10000.0
 
+[risk_management]
+max_order_quantity = 1.0
+max_position_quantity = 2.0
+max_drawdown = 0.05
+
 [exchange.bybit_testnet]
 rest_url = "https://api-testnet.bybit.com"
 ws_url = "wss://stream-testnet.bybit.com"

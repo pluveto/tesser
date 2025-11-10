@@ -25,7 +25,7 @@ use tesser_bybit::PublicChannel;
 use tesser_config::{load_config, AppConfig};
 use tesser_core::{Candle, Interval, Symbol};
 use tesser_data::download::{BybitDownloader, KlineRequest};
-use tesser_execution::{ExecutionEngine, FixedOrderSizer};
+use tesser_execution::{ExecutionEngine, FixedOrderSizer, NoopRiskChecker};
 use tesser_paper::PaperExecutionClient;
 use tesser_strategy::{build_builtin_strategy, builtin_strategy_names};
 use tracing::{info, warn};
@@ -505,6 +505,7 @@ impl BacktestRunArgs {
             Box::new(FixedOrderSizer {
                 quantity: self.quantity,
             }),
+            Arc::new(NoopRiskChecker),
         );
 
         let mut cfg = BacktestConfig::new(symbols[0].clone(), candles);
@@ -548,6 +549,7 @@ impl BacktestBatchArgs {
                 Box::new(FixedOrderSizer {
                     quantity: self.quantity,
                 }),
+                Arc::new(NoopRiskChecker),
             );
             let mut cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
             cfg.order_quantity = self.quantity;
@@ -630,6 +632,7 @@ impl LiveRunArgs {
             initial_equity: config.backtest.initial_equity,
             alerting,
             exec_backend: self.exec,
+            risk: config.risk_management.clone(),
         };
 
         info!(

@@ -1829,6 +1829,7 @@ dependencies = [
  "tesser-broker",
  "tesser-core",
  "tesser-strategy",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
