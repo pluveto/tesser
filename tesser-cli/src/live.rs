@@ -226,7 +226,14 @@ impl LiveRuntime {
         let alert_task = alerts.spawn_watchdog();
         let shutdown = ShutdownSignal::new();
 
-        info!(symbols = ?symbols, category = ?settings.category, "market stream ready");
+        info!(
+            symbols = ?symbols,
+            category = ?settings.category,
+            metrics_addr = %settings.metrics_addr,
+            state_path = %settings.state_path.display(),
+            history = settings.history,
+            "market stream ready"
+        );
 
         Ok(Self {
             stream,
