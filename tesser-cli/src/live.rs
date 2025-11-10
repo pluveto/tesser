@@ -25,11 +25,12 @@ use tesser_execution::{
     RiskLimits,
 };
 use tesser_paper::PaperExecutionClient;
-use tesser_portfolio::{Portfolio, PortfolioConfig};
+use tesser_portfolio::{
+    LiveState, Portfolio, PortfolioConfig, SqliteStateRepository, StateRepository,
+};
 use tesser_strategy::{Strategy, StrategyContext};
 
 use crate::alerts::{AlertDispatcher, AlertManager};
-use crate::state::{LiveState, LiveStateStore};
 use crate::telemetry::{spawn_metrics_server, LiveMetrics};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -163,7 +164,7 @@ struct LiveRuntime {
     market: HashMap<String, MarketSnapshot>,
     fill_model: FillModel,
     latency: Duration,
-    state_store: LiveStateStore,
+    state_repo: Arc<dyn StateRepository>,
     persisted: LiveState,
     shutdown: ShutdownSignal,
     metrics_task: JoinHandle<()>,
@@ -180,11 +181,21 @@ impl LiveRuntime {
         settings: LiveSessionSettings,
     ) -> Result<Self> {
         let mut strategy_ctx = StrategyContext::new(settings.history);
-        let state_store = LiveStateStore::new(settings.state_path.clone());
-        let mut persisted = match state_store.load().await {
-            Ok(state) => state,
-            Err(err) => {
+        let state_repo: Arc<dyn StateRepository> =
+            Arc::new(SqliteStateRepository::new(settings.state_path.clone()));
+        let mut persisted = match tokio::task::spawn_blocking({
+            let repo = state_repo.clone();
+            move || repo.load()
+        })
+        .await
+        {
+            Ok(Ok(state)) => state,
+            Ok(Err(err)) => {
                 warn!(error = %err, "failed to load live state; starting from defaults");
+                LiveState::default()
+            }
+            Err(err) => {
+                warn!(error = %err, "state load task failed; starting from defaults");
                 LiveState::default()
             }
         };
@@ -235,7 +246,7 @@ impl LiveRuntime {
             market,
             fill_model: FillModel::new(settings.slippage_bps, settings.fee_bps),
             latency: Duration::from_millis(settings.latency_ms),
-            state_store,
+            state_repo,
             persisted,
             shutdown,
             metrics_task,
@@ -419,7 +430,12 @@ impl LiveRuntime {
     }
 
     async fn save_state(&self) -> Result<()> {
-        self.state_store.save(&self.persisted).await
+        let repo = self.state_repo.clone();
+        let snapshot = self.persisted.clone();
+        tokio::task::spawn_blocking(move || repo.save(&snapshot))
+            .await
+            .map_err(|err| anyhow!("state persistence task failed: {err}"))?
+            .map_err(|err| anyhow!(err.to_string()))
     }
 }
 
