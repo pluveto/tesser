@@ -177,7 +177,7 @@ Configuration files live in `config/`. The loader merges the following sources (
 
 ### Live Trading & Observability
 
-`tesser-cli live run` now drives the full production event loop introduced in Phase 2:
+`tesser-cli live run` now drives the production event loop:
 
 ```sh
 cargo run -p tesser-cli -- \
