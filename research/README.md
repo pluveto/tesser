@@ -28,3 +28,25 @@ uv run python scripts/walk_forward_sma.py --data ../data/btc.parquet --summary-c
 Store generated strategy configs under `strategies/` (see `sma_cross.toml`, `rsi_reversion.toml`, etc.) and drop ML artifacts under `models/`. The Rust CLI consumes these files directly via `--strategy-config` (and the referenced `model_path`).
 
 The walk-forward script evaluates SMA crossover parameters on rolling train/test windows, writes a per-window CSV summary, and emits a ready-to-use TOML config that reflects the best-performing parameters across the out-of-sample slices.
+
+## Shipping Multiple Strategies
+
+Each TOML file under `strategies/` can drive its own `tesser-cli live run` process. When you're ready to graduate a model from research to production:
+
+1. Commit the generated config (e.g., `strategies/alpha_momo.toml`).
+2. Launch a dedicated CLI instance with per-strategy overrides:
+
+    ```sh
+    tesser-cli --env prod live run \
+      --strategy-config strategies/alpha_momo.toml \
+      --state-path reports/alpha_momo.db \
+      --metrics-addr 0.0.0.0:9300 \
+      --log-path logs/alpha_momo.json \
+      --initial-equity 25000 \
+      --risk-max-order-qty 0.4 \
+      --risk-max-position-qty 0.8
+    ```
+
+3. Repeat for each additional strategy (Docker Compose/systemd examples are documented in the top-level `README.md`).
+
+This multi-process model keeps failure domains small—one misbehaving strategy can be restarted or rolled back without touching the others.

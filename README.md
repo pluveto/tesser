@@ -192,8 +192,8 @@ Add `--exec live` (and populate your `[exchange.<name>]` `api_key`/`api_secret`)
 What happens under the hood:
 
 - **Market data**: `tesser-bybit` maintains a resilient WebSocket connection to the public `linear` stream (`kline.<interval>.<symbol>` and `publicTrade.<symbol>` topics). The connection automatically heartbeats every 20s and reconnects on transient errors.
-- **Execution**: Signals are routed through `tesser-execution` into the selected backend. `--exec paper` keeps the previous behavior (instant synthetic fills). `--exec live` submits real REST orders and records their IDs in `live_state.json` so you can reconcile with the exchange.
-- **State persistence**: Portfolio equity, open orders and last prices are serialized to `config.live.state_path` (default `./reports/live_state.json`). Restart the process and it will resume from this snapshot.
+- **Execution**: Signals are routed through `tesser-execution` into the selected backend. `--exec paper` keeps the previous behavior (instant synthetic fills). `--exec live` submits real REST orders and records their IDs inside the SQLite state database so you can reconcile with the exchange.
+- **State persistence**: Portfolio equity, open orders and last prices are serialized to `config.live.state_path` (default `./reports/live_state.db`). Restart the process or run `tesser-cli state inspect` to review the snapshot.
 - **Structured logging**: When running `live`, a JSON file is written to `config.live.log_path` (default `./logs/live.json`). Point Promtail/Loki/Grafana at that file to build dashboards without touching stdout logs.
 - **Metrics**: A Prometheus endpoint is exposed at `config.live.metrics_addr` (default `127.0.0.1:9100`). Scrape `/metrics` to monitor tick/candle throughput, portfolio equity, order errors, and data-gap gauges.
 - **Alerting**: The `[live.alerting]` section lets you enforce guardrails (max data gap, consecutive order failures, drawdown limit). Provide a `webhook_url` (Slack, Telegram, Alertmanager, etc.) or leave it empty for log-only alerts.
@@ -213,6 +213,9 @@ Key CLI flags:
 | `--latency-ms` | Delay between signal and fill simulation | `0` |
 | `--state-path`, `--metrics-addr`, `--log-path` | Override the `[live]` config block | see config |
 | `--webhook-url` | Per-run override for `[live.alerting].webhook_url` | empty |
+| `--initial-equity` | Override `[backtest].initial_equity` for this session | see config |
+| `--risk-max-order-qty`, `--risk-max-position-qty`, `--risk-max-drawdown` | Override `[risk_management]` guardrails | see config |
+| `--alert-max-data-gap-secs`, `--alert-max-order-failures`, `--alert-max-drawdown` | Override `[live.alerting]` thresholds | see config |
 
 Inspect all options with `cargo run -p tesser-cli -- live run --help`.
 
@@ -220,7 +223,7 @@ Sample snippet from `config/default.toml`:
 
 ```toml
 [live]
-state_path = "./reports/live_state.json"
+state_path = "./reports/live_state.db"
 metrics_addr = "127.0.0.1:9100"
 log_path = "./logs/live.json"
 
@@ -236,9 +239,61 @@ max_position_quantity = 2.0 # Absolute cap on aggregate exposure per symbol
 max_drawdown = 0.05         # Liquidate-only kill switch threshold (fractional)
 ```
 
-Every CLI flag (e.g., `--state-path`, `--metrics-addr`, `--log-path`, `--webhook-url`) overrides the config file so you can spin up multiple paper sessions with different telemetry endpoints.
+Every CLI flag (e.g., `--state-path`, `--metrics-addr`, `--log-path`, `--initial-equity`, `--risk-max-*`, `--alert-max-*`) overrides the config file so you can spin up multiple isolated sessions with tailored risk and telemetry controls.
 
 When `tesser-cli live run` executes, each order is filtered through the pre-trade risk layer: quantities above `max_order_quantity` are rejected, projected exposure cannot exceed `max_position_quantity`, and once equity suffers a drawdown beyond `max_drawdown` the portfolio flips into liquidate-only mode (only allowing exposure-reducing orders) until the process is restarted.
+
+### Multi-Strategy Deployment (Multi-Process Model)
+
+Instead of embedding a heavy multi-strategy scheduler inside the binary, the recommended path is to run one `tesser-cli live run` process per strategy. Each process receives its own SQLite state file, metrics port, log file, risk guardrails, and alert thresholds via the CLI overrides above. This makes it trivial to mix and match paper/live runs or roll strategies independently via Docker Compose, Nomad, or systemd.
+
+**Compose example:**
+
+```yaml
+version: "3.9"
+services:
+  momentum:
+    image: ghcr.io/pluveto/tesser:latest
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config:ro
+      - ./reports:/app/reports
+      - ./strategies:/app/strategies:ro
+      - ./logs:/app/logs
+    command: >
+      tesser-cli --env prod live run
+        --strategy-config /app/strategies/sma_cross.toml
+        --quantity 0.5
+        --state-path /app/reports/momentum_state.db
+        --metrics-addr 0.0.0.0:9200
+        --log-path /app/logs/momentum.json
+        --initial-equity 20000
+        --risk-max-order-qty 0.5
+        --risk-max-position-qty 1.0
+        --alert-max-data-gap-secs 120
+        --webhook-url https://hooks.slack.com/services/XXX/YYY/ZZZ
+  meanrev:
+    image: ghcr.io/pluveto/tesser:latest
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config:ro
+      - ./reports:/app/reports
+      - ./strategies:/app/strategies:ro
+      - ./logs:/app/logs
+    command: >
+      tesser-cli --env prod live run
+        --strategy-config /app/strategies/rsi_reversion.toml
+        --quantity 0.2
+        --state-path /app/reports/meanrev_state.db
+        --metrics-addr 0.0.0.0:9201
+        --log-path /app/logs/meanrev.json
+        --initial-equity 15000
+        --risk-max-order-qty 0.25
+        --risk-max-position-qty 0.5
+        --alert-max-drawdown 0.02
+```
+
+Bring the stack up with `docker compose up -d` and point Prometheus at the exposed ports (`9200`, `9201`, …). Because state lives in independent SQLite files, restarting or upgrading one strategy does not impact the others; you can introspect each database with `tesser-cli state inspect --path reports/momentum_state.db` before and after rollouts. Systemd and other supervisors work the same way—simply copy the command, change the overrides, and keep the services isolated.
 
 ### Python Research Workflow
 
