@@ -1,5 +1,7 @@
 //! Order management and signal execution helpers.
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use tesser_broker::{BrokerError, BrokerResult, ExecutionClient};
 use tesser_core::{Order, OrderRequest, OrderType, Quantity, Side, Signal, SignalKind};
@@ -23,17 +25,14 @@ impl OrderSizer for FixedOrderSizer {
 }
 
 /// Translates signals into orders using a provided [`ExecutionClient`].
-pub struct ExecutionEngine<C> {
-    client: C,
+pub struct ExecutionEngine {
+    client: Arc<dyn ExecutionClient>,
     sizer: Box<dyn OrderSizer>,
 }
 
-impl<C> ExecutionEngine<C>
-where
-    C: ExecutionClient,
-{
+impl ExecutionEngine {
     /// Instantiate the engine with its dependencies.
-    pub fn new(client: C, sizer: Box<dyn OrderSizer>) -> Self {
+    pub fn new(client: Arc<dyn ExecutionClient>, sizer: Box<dyn OrderSizer>) -> Self {
         Self { client, sizer }
     }
 

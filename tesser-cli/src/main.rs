@@ -6,12 +6,13 @@ mod telemetry;
 
 use crate::alerts::sanitize_webhook;
 use crate::data_validation::{validate_dataset, ValidationConfig, ValidationOutcome};
-use crate::live::{run_live, LiveSessionSettings};
+use crate::live::{run_live, ExecutionBackend, LiveSessionSettings};
 use crate::telemetry::init_tracing;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
@@ -19,6 +20,7 @@ use clap::{Args, Parser, Subcommand};
 use csv::Writer;
 use serde::{Deserialize, Serialize};
 use tesser_backtester::{BacktestConfig, BacktestReport, Backtester};
+use tesser_broker::ExecutionClient;
 use tesser_bybit::PublicChannel;
 use tesser_config::{load_config, AppConfig};
 use tesser_core::{Candle, Interval, Symbol};
@@ -337,6 +339,14 @@ struct LiveRunArgs {
     interval: String,
     #[arg(long, default_value_t = 1.0)]
     quantity: f64,
+    /// Selects which execution backend to use (`paper` or `bybit`)
+    #[arg(
+        long = "exec",
+        default_value = "paper",
+        value_enum,
+        alias = "live-exec"
+    )]
+    exec: ExecutionBackend,
     #[arg(long)]
     state_path: Option<PathBuf>,
     #[arg(long)]
@@ -489,8 +499,9 @@ impl BacktestRunArgs {
 
         candles.sort_by_key(|c| c.timestamp);
 
+        let execution_client: Arc<dyn ExecutionClient> = Arc::new(PaperExecutionClient::default());
         let execution = ExecutionEngine::new(
-            PaperExecutionClient::default(),
+            execution_client,
             Box::new(FixedOrderSizer {
                 quantity: self.quantity,
             }),
@@ -530,8 +541,10 @@ impl BacktestBatchArgs {
                 .with_context(|| format!("failed to configure strategy {}", def.name))?;
             let mut candles = load_candles_from_paths(&self.data_paths)?;
             candles.sort_by_key(|c| c.timestamp);
+            let execution_client: Arc<dyn ExecutionClient> =
+                Arc::new(PaperExecutionClient::default());
             let execution = ExecutionEngine::new(
-                PaperExecutionClient::default(),
+                execution_client,
                 Box::new(FixedOrderSizer {
                     quantity: self.quantity,
                 }),
@@ -616,6 +629,7 @@ impl LiveRunArgs {
             state_path,
             initial_equity: config.backtest.initial_equity,
             alerting,
+            exec_backend: self.exec,
         };
 
         info!(
@@ -623,6 +637,7 @@ impl LiveRunArgs {
             symbols = ?symbols,
             exchange = %self.exchange,
             interval = %self.interval,
+            exec = ?self.exec,
             "starting live session"
         );
 

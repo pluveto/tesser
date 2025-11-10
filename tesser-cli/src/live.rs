@@ -7,14 +7,17 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
+use clap::ValueEnum;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use tesser_broker::MarketStream;
-use tesser_bybit::{BybitMarketStream, BybitSubscription, PublicChannel};
+use tesser_broker::{ExecutionClient, MarketStream};
+use tesser_bybit::{
+    BybitClient, BybitConfig, BybitCredentials, BybitMarketStream, BybitSubscription, PublicChannel,
+};
 use tesser_config::{AlertingConfig, ExchangeConfig};
 use tesser_core::{Candle, Fill, Interval, Order, Price, Side, Signal};
 use tesser_execution::{ExecutionEngine, FixedOrderSizer};
@@ -25,6 +28,19 @@ use tesser_strategy::{Strategy, StrategyContext};
 use crate::alerts::{AlertDispatcher, AlertManager};
 use crate::state::{LiveState, LiveStateStore};
 use crate::telemetry::{spawn_metrics_server, LiveMetrics};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ExecutionBackend {
+    Paper,
+    Bybit,
+}
+
+impl ExecutionBackend {
+    fn is_paper(self) -> bool {
+        matches!(self, Self::Paper)
+    }
+}
 
 pub struct LiveSessionSettings {
     pub category: PublicChannel,
@@ -38,6 +54,7 @@ pub struct LiveSessionSettings {
     pub state_path: PathBuf,
     pub initial_equity: f64,
     pub alerting: AlertingConfig,
+    pub exec_backend: ExecutionBackend,
 }
 
 pub async fn run_live(
@@ -72,8 +89,16 @@ pub async fn run_live(
             .with_context(|| format!("failed to subscribe to klines for {symbol}"))?;
     }
 
+    let execution_client = build_execution_client(&exchange, &settings)?;
+    if matches!(settings.exec_backend, ExecutionBackend::Bybit) {
+        info!(
+            rest = %exchange.rest_url,
+            category = ?settings.category,
+            "live execution enabled via Bybit REST"
+        );
+    }
     let execution = ExecutionEngine::new(
-        PaperExecutionClient::default(),
+        execution_client,
         Box::new(FixedOrderSizer {
             quantity: settings.quantity,
         }),
@@ -83,11 +108,39 @@ pub async fn run_live(
     runtime.run().await
 }
 
+fn build_execution_client(
+    exchange: &ExchangeConfig,
+    settings: &LiveSessionSettings,
+) -> Result<Arc<dyn ExecutionClient>> {
+    match settings.exec_backend {
+        ExecutionBackend::Paper => Ok(Arc::new(PaperExecutionClient::default())),
+        ExecutionBackend::Bybit => {
+            let api_key = exchange.api_key.trim();
+            let api_secret = exchange.api_secret.trim();
+            if api_key.is_empty() || api_secret.is_empty() {
+                bail!("exchange profile is missing api_key/api_secret required for live execution");
+            }
+            let client = BybitClient::new(
+                BybitConfig {
+                    base_url: exchange.rest_url.clone(),
+                    category: settings.category.as_path().to_string(),
+                    recv_window: 5_000,
+                },
+                Some(BybitCredentials {
+                    api_key: api_key.to_string(),
+                    api_secret: api_secret.to_string(),
+                }),
+            );
+            Ok(Arc::new(client))
+        }
+    }
+}
+
 struct LiveRuntime {
     stream: BybitMarketStream,
     strategy: Box<dyn Strategy>,
     strategy_ctx: StrategyContext,
-    execution: ExecutionEngine<PaperExecutionClient>,
+    execution: ExecutionEngine,
     portfolio: Portfolio,
     metrics: LiveMetrics,
     alerts: AlertManager,
@@ -99,6 +152,7 @@ struct LiveRuntime {
     shutdown: ShutdownSignal,
     metrics_task: JoinHandle<()>,
     alert_task: Option<JoinHandle<()>>,
+    exec_backend: ExecutionBackend,
 }
 
 impl LiveRuntime {
@@ -106,7 +160,7 @@ impl LiveRuntime {
         stream: BybitMarketStream,
         strategy: Box<dyn Strategy>,
         symbols: Vec<String>,
-        execution: ExecutionEngine<PaperExecutionClient>,
+        execution: ExecutionEngine,
         settings: LiveSessionSettings,
     ) -> Result<Self> {
         let mut strategy_ctx = StrategyContext::new(settings.history);
@@ -161,6 +215,7 @@ impl LiveRuntime {
             shutdown,
             metrics_task,
             alert_task,
+            exec_backend: settings.exec_backend,
         })
     }
 
@@ -248,7 +303,12 @@ impl LiveRuntime {
             match self.execution.handle_signal(signal.clone()).await {
                 Ok(Some(order)) => {
                     self.metrics.inc_order();
-                    match self.settle_order(order, signal.clone()).await {
+                    let result = if self.exec_backend.is_paper() {
+                        self.settle_order(order, signal.clone()).await
+                    } else {
+                        self.handle_live_submission(order).await
+                    };
+                    match result {
                         Ok(()) => {
                             self.alerts.reset_order_failures().await;
                         }
@@ -272,6 +332,20 @@ impl LiveRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn handle_live_submission(&mut self, order: Order) -> Result<()> {
+        info!(
+            order_id = %order.id,
+            symbol = %order.request.symbol,
+            status = ?order.status,
+            "sent live order to external broker"
+        );
+        self.persisted
+            .open_orders
+            .retain(|existing| existing.id != order.id);
+        self.persisted.open_orders.push(order);
+        self.save_state().await
     }
 
     async fn settle_order(&mut self, order: Order, signal: Signal) -> Result<()> {

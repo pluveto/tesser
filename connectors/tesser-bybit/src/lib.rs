@@ -14,6 +14,7 @@ use serde_json::Value;
 use sha2::Sha256;
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient};
 use tesser_core::{AccountBalance, Order, OrderRequest, OrderStatus, Position, Side, TimeInForce};
+use tracing::warn;
 
 mod ws;
 
@@ -210,6 +211,21 @@ impl BybitClient {
     fn qty_string(qty: f64) -> String {
         format!("{}", qty)
     }
+
+    fn map_order_status(status: &str) -> OrderStatus {
+        match status {
+            "New" | "Created" | "PendingNew" => OrderStatus::PendingNew,
+            "Accepted" => OrderStatus::Accepted,
+            "Rejected" => OrderStatus::Rejected,
+            "PartiallyFilled" | "PartiallyFilledCanceled" => OrderStatus::PartiallyFilled,
+            "Filled" => OrderStatus::Filled,
+            "Cancelled" | "Canceled" => OrderStatus::Canceled,
+            other => {
+                warn!(status = other, "unhandled Bybit order status");
+                OrderStatus::PendingNew
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -285,11 +301,7 @@ impl ExecutionClient for BybitClient {
                     time_in_force: None,
                     client_order_id: Some(item.order_link_id),
                 },
-                status: match item.order_status.as_str() {
-                    "Filled" => OrderStatus::Filled,
-                    "Cancelled" => OrderStatus::Canceled,
-                    _ => OrderStatus::Accepted,
-                },
+                status: Self::map_order_status(&item.order_status),
                 filled_quantity: item.cum_exec_qty.parse().unwrap_or(0.0),
                 avg_fill_price: item.avg_price.parse().ok(),
                 created_at: millis_to_datetime(&item.created_time),

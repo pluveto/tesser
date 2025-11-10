@@ -3,7 +3,6 @@
 use std::collections::VecDeque;
 
 use anyhow::Context;
-use tesser_broker::ExecutionClient;
 use tesser_core::{Candle, Fill, Order, Quantity, Side, Symbol};
 use tesser_execution::ExecutionEngine;
 use tesser_portfolio::{Portfolio, PortfolioConfig};
@@ -62,14 +61,11 @@ pub struct BacktestReport {
 }
 
 /// The engine wiring strategies to execution and portfolio components.
-pub struct Backtester<C>
-where
-    C: ExecutionClient,
-{
+pub struct Backtester {
     config: BacktestConfig,
     strategy: Box<dyn Strategy>,
     strategy_ctx: StrategyContext,
-    execution: ExecutionEngine<C>,
+    execution: ExecutionEngine,
     portfolio: Portfolio,
     pending: VecDeque<PendingFill>,
 }
@@ -79,15 +75,12 @@ struct PendingFill {
     due_index: usize,
 }
 
-impl<C> Backtester<C>
-where
-    C: ExecutionClient,
-{
+impl Backtester {
     /// Construct a new backtester.
     pub fn new(
         config: BacktestConfig,
         strategy: Box<dyn Strategy>,
-        execution: ExecutionEngine<C>,
+        execution: ExecutionEngine,
     ) -> Self {
         Self {
             strategy_ctx: StrategyContext::new(config.history),
