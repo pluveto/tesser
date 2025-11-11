@@ -3,7 +3,7 @@
 //! Authentication details follow the rules described in
 //! `bybit-api-docs/docs/v5/guide.mdx`.
 
-use std::time::Duration;
+use std::{any::Any, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -12,11 +12,11 @@ use reqwest::{Client, Method};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use sha2::Sha256;
-use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient};
+use tesser_broker::{BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult, ExecutionClient};
 use tesser_core::{AccountBalance, Order, OrderRequest, OrderStatus, Position, Side, TimeInForce};
 use tracing::warn;
 
-mod ws;
+pub mod ws;
 
 pub use ws::{BybitMarketStream, BybitSubscription, PublicChannel};
 
@@ -77,6 +77,14 @@ impl BybitClient {
     /// Convenience helper for the Bybit testnet.
     pub fn testnet(credentials: Option<BybitCredentials>) -> Self {
         Self::new(BybitConfig::default(), credentials)
+    }
+
+    pub fn get_credentials(&self) -> Option<BybitCredentials> {
+        self.credentials.clone()
+    }
+
+    pub fn get_ws_url(&self) -> String {
+        self.config.base_url.replace("https://api", "wss://stream")
     }
 
     /// Fetch Bybit server time (docs/v5/market/time.mdx).
@@ -212,7 +220,7 @@ impl BybitClient {
         format!("{}", qty)
     }
 
-    fn map_order_status(status: &str) -> OrderStatus {
+    pub(crate) fn map_order_status(status: &str) -> OrderStatus {
         match status {
             "New" | "Created" | "PendingNew" | "Untriggered" => OrderStatus::PendingNew,
             "Accepted" | "Active" | "Triggered" => OrderStatus::Accepted,
@@ -343,11 +351,44 @@ impl ExecutionClient for BybitClient {
     }
 
     async fn positions(&self) -> BrokerResult<Vec<Position>> {
-        Ok(Vec::new())
+        let query = vec![("category".to_string(), self.config.category.clone())];
+        let resp: ApiResponse<PositionListResult> = self
+            .signed_request(Method::GET, "/v5/position/list", Value::Null, Some(query))
+            .await?;
+        let mut positions = Vec::new();
+        for item in resp.result.list {
+            let quantity = item.size.parse::<f64>().map_err(|err| {
+                BrokerError::from_display(err, BrokerErrorKind::Serialization)
+            })?;
+            if quantity.abs() < f64::EPSILON {
+                continue;
+            }
+            let entry_price = item.avg_price.parse::<f64>().ok();
+            positions.push(Position {
+                symbol: item.symbol,
+                side: match item.side.as_str() {
+                    "Buy" => Some(Side::Buy),
+                    "Sell" => Some(Side::Sell),
+                    _ => None,
+                },
+                quantity,
+                entry_price,
+                unrealized_pnl: item
+                    .unrealised_pnl
+                    .parse::<f64>()
+                    .unwrap_or(0.0),
+                updated_at: millis_to_datetime(&item.updated_time),
+            });
+        }
+        Ok(positions)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
-fn millis_to_datetime(value: &str) -> chrono::DateTime<Utc> {
+pub(crate) fn millis_to_datetime(value: &str) -> chrono::DateTime<Utc> {
     value
         .parse::<i64>()
         .ok()
@@ -422,6 +463,24 @@ struct CoinBalance {
     wallet_balance: String,
     #[serde(rename = "availableToWithdraw")]
     available_to_withdraw: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PositionListResult {
+    list: Vec<PositionItem>,
+}
+
+#[derive(Deserialize)]
+struct PositionItem {
+    symbol: String,
+    side: String,
+    size: String,
+    #[serde(rename = "avgPrice")]
+    avg_price: String,
+    #[serde(rename = "unrealisedPnl")]
+    unrealised_pnl: String,
+    #[serde(rename = "updatedTime")]
+    updated_time: String,
 }
 
 #[cfg(test)]
