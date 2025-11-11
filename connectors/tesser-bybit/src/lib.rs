@@ -3,7 +3,7 @@
 //! Authentication details follow the rules described in
 //! `bybit-api-docs/docs/v5/guide.mdx`.
 
-use std::time::Duration;
+use std::{any::Any, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -220,7 +220,7 @@ impl BybitClient {
         format!("{}", qty)
     }
 
-    fn map_order_status(status: &str) -> OrderStatus {
+    pub(crate) fn map_order_status(status: &str) -> OrderStatus {
         match status {
             "New" | "Created" | "PendingNew" | "Untriggered" => OrderStatus::PendingNew,
             "Accepted" | "Active" | "Triggered" => OrderStatus::Accepted,
@@ -382,12 +382,12 @@ impl ExecutionClient for BybitClient {
         Ok(positions)
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-fn millis_to_datetime(value: &str) -> chrono::DateTime<Utc> {
+pub(crate) fn millis_to_datetime(value: &str) -> chrono::DateTime<Utc> {
     value
         .parse::<i64>()
         .ok()

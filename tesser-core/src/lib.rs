@@ -248,6 +248,7 @@ pub struct Fill {
 /// Trade is an immutable record derived from a fill.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Trade {
+    pub id: Uuid,
     pub fill: Fill,
     pub realized_pnl: Price,
 }

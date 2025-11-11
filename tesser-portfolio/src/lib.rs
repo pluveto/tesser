@@ -231,11 +231,14 @@ impl Portfolio {
     }
 
     /// Refresh mark-to-market pricing for a symbol when new data arrives.
-    pub fn mark_price(&mut self, symbol: &str, price: Price) {
+    /// Returns true if a tracked position was updated.
+    pub fn mark_price(&mut self, symbol: &str, price: Price) -> bool {
         if let Some(position) = self.positions.get_mut(symbol) {
             position.mark_price(price);
+            self.update_drawdown_state();
+            return true;
         }
-        self.update_drawdown_state();
+        false
     }
 
     fn update_drawdown_state(&mut self) {

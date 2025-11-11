@@ -127,7 +127,7 @@ fn default_equity() -> f64 {
 }
 
 fn default_state_path() -> PathBuf {
-    PathBuf::from("./reports/live_state.json")
+    PathBuf::from("./reports/live_state.db")
 }
 
 fn default_metrics_addr() -> String {

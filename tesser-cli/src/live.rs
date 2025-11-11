@@ -601,7 +601,6 @@ impl LiveRuntime {
         info!("State reconciliation complete.");
         Ok(())
     }
-
     async fn settle_order(&mut self, order: Order, signal: Signal) -> Result<()> {
         if self.latency.as_millis() > 0 {
             tokio::time::sleep(self.latency).await;
