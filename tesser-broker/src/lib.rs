@@ -1,7 +1,9 @@
 //! Exchange-agnostic traits used by the rest of the framework.
 
+use std::any::Any;
+
 use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tesser_core::{AccountBalance, Candle, Order, OrderId, OrderRequest, Position, Signal, Tick};
 use thiserror::Error;
 
@@ -57,7 +59,7 @@ pub enum BrokerErrorKind {
 }
 
 /// Represents metadata describing the capabilities of a connector.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrokerInfo {
     pub name: String,
     pub markets: Vec<String>,
@@ -108,6 +110,9 @@ pub trait ExecutionClient: Send + Sync {
 
     /// Retrieve the current open positions.
     async fn positions(&self) -> BrokerResult<Vec<Position>>;
+
+    /// Helper for downcasting to a concrete type.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Strategy and execution share this event channel API during live trading and backtests.
