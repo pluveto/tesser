@@ -190,6 +190,7 @@ struct LiveRuntime {
     alert_task: Option<JoinHandle<()>>,
     private_event_rx: mpsc::Receiver<BrokerEvent>,
     exec_backend: ExecutionBackend,
+    #[allow(dead_code)]
     last_private_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
 }
 
