@@ -60,9 +60,8 @@ impl TwapAlgorithm {
         }
 
         let now = Utc::now();
-        let slice_interval = Duration::seconds(
-            (duration.num_seconds() as f64 / num_slices as f64).ceil() as i64,
-        );
+        let slice_interval =
+            Duration::seconds((duration.num_seconds() as f64 / num_slices as f64).ceil() as i64);
 
         Ok(Self {
             state: TwapState {
@@ -118,7 +117,8 @@ impl TwapAlgorithm {
                 time_in_force: None,
                 client_order_id: Some(format!(
                     "twap-{}-slice-{}",
-                    self.state.id, self.state.executed_slices + 1
+                    self.state.id,
+                    self.state.executed_slices + 1
                 )),
                 take_profit: None,
                 stop_loss: None,
@@ -247,8 +247,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
     }
 
     fn state(&self) -> serde_json::Value {
-        serde_json::to_value(&self.state)
-            .expect("Failed to serialize TWAP state")
+        serde_json::to_value(&self.state).expect("Failed to serialize TWAP state")
     }
 
     fn from_state(state_val: serde_json::Value) -> Result<Self>
@@ -263,7 +262,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tesser_core::{SignalKind};
+    use tesser_core::SignalKind;
 
     #[test]
     fn test_twap_creation() {

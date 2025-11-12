@@ -1,6 +1,10 @@
 //! Simple paper-trading connector used by the backtester.
 
-use std::{any::Any, collections::{HashMap, VecDeque}, sync::{Arc, Mutex}};
+use std::{
+    any::Any,
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -65,7 +69,12 @@ impl PaperExecutionClient {
     }
 
     /// Create a Fill object from an order with proper fee calculation.
-    fn create_fill_from_order(&self, order: &Order, fill_price: Price, timestamp: DateTime<Utc>) -> Fill {
+    fn create_fill_from_order(
+        &self,
+        order: &Order,
+        fill_price: Price,
+        timestamp: DateTime<Utc>,
+    ) -> Fill {
         let fee = if self.fee_bps > 0.0 {
             let fee_rate = self.fee_bps / 10_000.0;
             Some(fill_price.abs() * order.request.quantity.abs() * fee_rate)
@@ -121,7 +130,7 @@ impl PaperExecutionClient {
         let slippage_rate = self.slippage_bps / 10_000.0;
         let fill_price = if slippage_rate > 0.0 {
             match request.side {
-                Side::Buy => base_price * (1.0 + slippage_rate),  // Buy at higher price
+                Side::Buy => base_price * (1.0 + slippage_rate), // Buy at higher price
                 Side::Sell => base_price * (1.0 - slippage_rate), // Sell at lower price
             }
         } else {

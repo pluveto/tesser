@@ -543,7 +543,11 @@ impl LiveRuntime {
         }
         self.metrics.inc_signals(signals.len());
         for signal in signals {
-            let last_price = self.market.get(&signal.symbol).and_then(|s| s.price()).unwrap_or(0.0);
+            let last_price = self
+                .market
+                .get(&signal.symbol)
+                .and_then(|s| s.price())
+                .unwrap_or(0.0);
 
             let ctx = RiskContext {
                 signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
@@ -624,22 +628,23 @@ impl LiveRuntime {
         self.metrics.update_equity(self.portfolio.equity());
         self.metrics.inc_order(); // Count the fill as a completed order
         self.alerts.update_equity(self.portfolio.equity()).await;
-        self.alerts.notify(
-            "Order Filled",
-            &format!(
-                "order filled: {}@{:.2} ({})",
-                fill.fill_quantity,
-                fill.fill_price,
-                match fill.side {
-                    Side::Buy => "buy",
-                    Side::Sell => "sell",
-                }
+        self.alerts
+            .notify(
+                "Order Filled",
+                &format!(
+                    "order filled: {}@{:.2} ({})",
+                    fill.fill_quantity,
+                    fill.fill_price,
+                    match fill.side {
+                        Side::Buy => "buy",
+                        Side::Sell => "sell",
+                    }
+                ),
             )
-        ).await;
+            .await;
         self.persisted.portfolio = Some(self.portfolio.snapshot());
         self.save_state().await
     }
-
 
     async fn save_state(&self) -> Result<()> {
         let repo = self.state_repo.clone();
@@ -664,7 +669,6 @@ impl MarketSnapshot {
             .or_else(|| self.last_candle.as_ref().map(|c| c.close))
     }
 }
-
 
 struct ShutdownSignal {
     flag: Arc<AtomicBool>,

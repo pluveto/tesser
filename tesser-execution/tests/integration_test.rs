@@ -1,19 +1,12 @@
 use chrono::Duration;
-use tesser_core::{ExecutionHint, Signal, SignalKind};
-use tesser_execution::{
-    algorithm::TwapAlgorithm,
-    ExecutionAlgorithm,
-    AlgoStatus,
-    FixedOrderSizer,
-    NoopRiskChecker,
-    ExecutionEngine,
-    OrderOrchestrator,
-    SqliteAlgoStateRepository,
-    RiskContext
-};
-use tesser_paper::PaperExecutionClient;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
+use tesser_core::{ExecutionHint, Signal, SignalKind};
+use tesser_execution::{
+    algorithm::TwapAlgorithm, AlgoStatus, ExecutionAlgorithm, ExecutionEngine, FixedOrderSizer,
+    NoopRiskChecker, OrderOrchestrator, RiskContext, SqliteAlgoStateRepository,
+};
+use tesser_paper::PaperExecutionClient;
 
 #[tokio::test]
 async fn test_twap_algorithm_basic() {
@@ -23,10 +16,11 @@ async fn test_twap_algorithm_basic() {
     // Create TWAP algorithm directly with very short duration for testing
     let mut twap = TwapAlgorithm::new(
         signal.clone(),
-        1.0, // total quantity
+        1.0,                  // total quantity
         Duration::seconds(2), // Very short duration
-        2, // Only 2 slices for simplicity
-    ).unwrap();
+        2,                    // Only 2 slices for simplicity
+    )
+    .unwrap();
 
     // Test initial state
     assert_eq!(twap.status(), AlgoStatus::Working);
@@ -78,9 +72,9 @@ async fn test_orchestrator_integration() {
         .unwrap();
 
     // Create TWAP signal
-    let signal = Signal::new("BTCUSDT", SignalKind::EnterLong, 0.8)
-        .with_hint(ExecutionHint::Twap {
-            duration: Duration::minutes(2)
+    let signal =
+        Signal::new("BTCUSDT", SignalKind::EnterLong, 0.8).with_hint(ExecutionHint::Twap {
+            duration: Duration::minutes(2),
         });
 
     let ctx = RiskContext {

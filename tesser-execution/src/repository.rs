@@ -43,7 +43,9 @@ impl SqliteAlgoStateRepository {
             "#,
         )?;
 
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Create an in-memory repository for testing.
@@ -59,7 +61,9 @@ impl SqliteAlgoStateRepository {
             );
             "#,
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 

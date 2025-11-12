@@ -101,7 +101,8 @@ impl OrderOrchestrator {
     pub async fn on_signal(&self, signal: &Signal, ctx: &RiskContext) -> Result<()> {
         match &signal.execution_hint {
             Some(ExecutionHint::Twap { duration }) => {
-                self.handle_twap_signal(signal.clone(), *duration, ctx).await
+                self.handle_twap_signal(signal.clone(), *duration, ctx)
+                    .await
             }
             Some(ExecutionHint::Vwap { .. }) => {
                 // TODO: Implement VWAP
@@ -113,7 +114,9 @@ impl OrderOrchestrator {
             }
             None => {
                 // Handle normal, non-algorithmic orders
-                self.execution_engine.handle_signal(signal.clone(), *ctx).await?;
+                self.execution_engine
+                    .handle_signal(signal.clone(), *ctx)
+                    .await?;
                 Ok(())
             }
         }
@@ -127,11 +130,10 @@ impl OrderOrchestrator {
         ctx: &RiskContext,
     ) -> Result<()> {
         // Calculate total quantity using the execution engine's sizer
-        let total_quantity = self.execution_engine.sizer().size(
-            &signal,
-            ctx.portfolio_equity,
-            ctx.last_price,
-        )?;
+        let total_quantity =
+            self.execution_engine
+                .sizer()
+                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
 
         if total_quantity <= 0.0 {
             tracing::warn!("TWAP order size is zero, skipping");
@@ -180,7 +182,10 @@ impl OrderOrchestrator {
         child_req: ChildOrderRequest,
         ctx: &RiskContext,
     ) -> Result<Order> {
-        let order = self.execution_engine.send_order(child_req.order_request, ctx).await?;
+        let order = self
+            .execution_engine
+            .send_order(child_req.order_request, ctx)
+            .await?;
 
         // Track the mapping from order ID to parent algorithm
         {
