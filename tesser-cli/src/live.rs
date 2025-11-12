@@ -307,7 +307,9 @@ impl LiveRuntime {
                                                 .send(BrokerEvent::OrderUpdate(order))
                                                 .await
                                             {
-                                                error!("failed to send reconciled order update: {err}");
+                                                error!(
+                                                    "failed to send reconciled order update: {err}"
+                                                );
                                             }
                                         }
                                     }
@@ -318,25 +320,31 @@ impl LiveRuntime {
                             }
 
                             // 2) Fetch any executions since the last sync timestamp
-                            if let Some(bybit) = client
-                                .as_any()
-                                .downcast_ref::<tesser_bybit::BybitClient>()
+                            if let Some(bybit) =
+                                client.as_any().downcast_ref::<tesser_bybit::BybitClient>()
                             {
                                 let since = {
                                     let guard = last_sync.lock().await;
                                     // Default to 30 minutes ago if missing
-                                    guard.unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(30))
+                                    guard.unwrap_or_else(|| {
+                                        Utc::now() - chrono::Duration::minutes(30)
+                                    })
                                 };
                                 match bybit.list_executions_since(since).await {
                                     Ok(fills) => {
                                         for fill in fills {
-                                            if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await {
+                                            if let Err(err) =
+                                                private_tx.send(BrokerEvent::Fill(fill)).await
+                                            {
                                                 error!("failed to send reconciled fill: {err}");
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("failed to reconcile executions since {:?}: {}", since, e);
+                                        error!(
+                                            "failed to reconcile executions since {:?}: {}",
+                                            since, e
+                                        );
                                     }
                                 }
                                 // Update last sync time to now regardless to avoid tight loops

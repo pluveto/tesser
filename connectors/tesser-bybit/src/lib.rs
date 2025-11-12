@@ -13,7 +13,9 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use sha2::Sha256;
 use tesser_broker::{BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult, ExecutionClient};
-use tesser_core::{AccountBalance, Fill, Order, OrderRequest, OrderStatus, Position, Side, TimeInForce};
+use tesser_core::{
+    AccountBalance, Fill, Order, OrderRequest, OrderStatus, Position, Side, TimeInForce,
+};
 use tracing::warn;
 
 pub mod ws;
