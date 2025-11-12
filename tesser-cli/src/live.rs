@@ -24,8 +24,8 @@ use tesser_bybit::{
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{Candle, Fill, Interval, Order, OrderStatus, Price, Side, Signal};
 use tesser_execution::{
-    BasicRiskChecker, ExecutionEngine, FixedOrderSizer, PreTradeRiskChecker, RiskContext,
-    RiskLimits,
+    BasicRiskChecker, ExecutionEngine, FixedOrderSizer, OrderOrchestrator, PreTradeRiskChecker,
+    RiskContext, RiskLimits, SqliteAlgoStateRepository,
 };
 use tesser_paper::PaperExecutionClient;
 use tesser_portfolio::{
@@ -131,7 +131,14 @@ pub async fn run_live(
         risk_checker,
     );
 
-    let runtime = LiveRuntime::new(stream, strategy, symbols, execution, settings).await?;
+    // Create algorithm state repository
+    let algo_repo_path = settings.state_path.with_extension("algos.db");
+    let algo_state_repo = Arc::new(SqliteAlgoStateRepository::new(&algo_repo_path)?);
+
+    // Create orchestrator with execution engine
+    let orchestrator = OrderOrchestrator::new(Arc::new(execution), algo_state_repo).await?;
+
+    let runtime = LiveRuntime::new(stream, strategy, symbols, orchestrator, settings).await?;
     runtime.run().await
 }
 
@@ -167,7 +174,7 @@ struct LiveRuntime {
     stream: BybitMarketStream,
     strategy: Box<dyn Strategy>,
     strategy_ctx: StrategyContext,
-    execution: ExecutionEngine,
+    orchestrator: OrderOrchestrator,
     portfolio: Portfolio,
     metrics: LiveMetrics,
     alerts: AlertManager,
@@ -188,7 +195,7 @@ impl LiveRuntime {
         stream: BybitMarketStream,
         strategy: Box<dyn Strategy>,
         symbols: Vec<String>,
-        execution: ExecutionEngine,
+        orchestrator: OrderOrchestrator,
         settings: LiveSessionSettings,
     ) -> Result<Self> {
         let mut strategy_ctx = StrategyContext::new(settings.history);
@@ -239,11 +246,12 @@ impl LiveRuntime {
         let (private_event_tx, private_event_rx) = mpsc::channel(1024);
 
         if !settings.exec_backend.is_paper() {
-            let bybit_creds = match execution.credentials() {
+            let execution_engine = orchestrator.execution_engine();
+            let bybit_creds = match execution_engine.credentials() {
                 Some(creds) => creds,
                 None => bail!("live execution requires Bybit credentials"),
             };
-            let ws_url = execution.ws_url();
+            let ws_url = execution_engine.ws_url();
             let private_tx = private_event_tx.clone();
             tokio::spawn(async move {
                 let creds = bybit_creds;
@@ -324,7 +332,7 @@ impl LiveRuntime {
             stream,
             strategy,
             strategy_ctx,
-            execution,
+            orchestrator,
             portfolio,
             metrics,
             alerts,
@@ -348,6 +356,7 @@ impl LiveRuntime {
             .context("initial state reconciliation failed")?;
         let backoff = Duration::from_millis(200);
         let mut reconciliation_timer = tokio::time::interval(Duration::from_secs(60));
+        let mut orchestrator_timer = tokio::time::interval(Duration::from_secs(1));
 
         while !self.shutdown.triggered() {
             let mut progressed = false;
@@ -380,6 +389,12 @@ impl LiveRuntime {
                         error!("Periodic state reconciliation failed: {}", e);
                     }
                 }
+                _ = orchestrator_timer.tick() => {
+                    // Drive TWAP and other time-based algorithms
+                    if let Err(e) = self.orchestrator.on_timer_tick().await {
+                        error!("Orchestrator timer tick failed: {}", e);
+                    }
+                }
                 else => {}
             }
 
@@ -404,7 +419,7 @@ impl LiveRuntime {
         }
 
         info!("Running state reconciliation...");
-        let client = self.execution.client();
+        let client = self.orchestrator.execution_engine().client();
         match client.positions().await {
             Ok(remote_positions) => {
                 let local_positions = self.portfolio.positions();
@@ -507,33 +522,17 @@ impl LiveRuntime {
                 last_price,
                 liquidate_only: self.portfolio.liquidate_only(),
             };
-            match self.execution.handle_signal(signal.clone(), ctx).await {
-                Ok(Some(order)) => {
-                    self.metrics.inc_order();
-                    let result = if self.exec_backend.is_paper() {
-                        self.settle_order(order, signal.clone()).await
-                    } else {
-                        self.handle_live_submission(order).await
-                    };
-                    match result {
-                        Ok(()) => {
-                            self.alerts.reset_order_failures().await;
-                        }
-                        Err(err) => {
-                            warn!(error = %err, symbol = %signal.symbol, "failed to settle order");
-                            self.metrics.inc_order_failure();
-                            self.alerts
-                                .order_failure(&format!("settlement error: {err}"))
-                                .await;
-                        }
-                    }
+            match self.orchestrator.on_signal(&signal, &ctx).await {
+                Ok(()) => {
+                    // The orchestrator handles order submission internally
+                    // Metrics and alerts are handled when fills are received
+                    self.alerts.reset_order_failures().await;
                 }
-                Ok(None) => {}
                 Err(err) => {
-                    warn!(error = %err, "execution rejected order");
+                    warn!(error = %err, "orchestrator rejected signal");
                     self.metrics.inc_order_failure();
                     self.alerts
-                        .order_failure(&format!("execution error: {err}"))
+                        .order_failure(&format!("orchestrator error: {err}"))
                         .await;
                 }
             }
@@ -593,6 +592,12 @@ impl LiveRuntime {
             qty = fill.fill_quantity,
             "Processing real fill"
         );
+
+        // Route fill to orchestrator first (for algorithmic orders)
+        if let Err(e) = self.orchestrator.on_fill(&fill).await {
+            warn!(error = %e, "Orchestrator failed to process fill");
+        }
+
         self.portfolio
             .apply_fill(&fill)
             .context("Failed to apply real fill to portfolio")?;
@@ -602,7 +607,20 @@ impl LiveRuntime {
             .on_fill(&self.strategy_ctx, &fill)
             .context("Strategy failed on real fill event")?;
         self.metrics.update_equity(self.portfolio.equity());
+        self.metrics.inc_order(); // Count the fill as a completed order
         self.alerts.update_equity(self.portfolio.equity()).await;
+        self.alerts.notify(
+            "Order Filled",
+            &format!(
+                "order filled: {}@{:.2} ({})",
+                fill.fill_quantity,
+                fill.fill_price,
+                match fill.side {
+                    Side::Buy => "buy",
+                    Side::Sell => "sell",
+                }
+            )
+        ).await;
         self.persisted.portfolio = Some(self.portfolio.snapshot());
         self.save_state().await
     }
