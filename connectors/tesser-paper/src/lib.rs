@@ -356,7 +356,8 @@ struct RestingOrder {
 /// - hydrate depth via [`load_market_snapshot`] and [`upsert_market_level`].
 /// - feed tick prints into [`process_trade`] so maker orders can fill.
 /// - drain generated fills through [`drain_fills`] and forward them to strategies.
-/// CLI/backtester wiring for this engine will land in a follow-up change.
+///
+///  CLI/backtester wiring for this engine will land in a follow-up change.
 #[derive(Clone)]
 pub struct MatchingEngine {
     info: BrokerInfo,

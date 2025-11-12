@@ -70,14 +70,12 @@ impl Default for ExecutionModel {
 }
 
 /// Determines how the backtester consumes historical data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum BacktestMode {
     #[default]
     Candle,
     Tick,
 }
-
 
 /// Event emitted by the high-fidelity data source.
 #[derive(Clone, Debug)]

@@ -596,12 +596,15 @@ impl BacktestRunArgs {
             BacktestModeArg::Tick => BacktestMode::Tick,
         };
 
-        let (candles, lob_events, execution_client, matching_engine): (
+        type CandleModeBundle = (
             Vec<Candle>,
             Vec<MarketEvent>,
             Arc<dyn ExecutionClient>,
             Option<Arc<MatchingEngine>>,
-        ) = match mode {
+        );
+
+        let (candles, lob_events, execution_client, matching_engine): CandleModeBundle = match mode
+        {
             BacktestMode::Candle => {
                 let mut candles = if self.data_paths.is_empty() {
                     let mut generated = Vec::new();
