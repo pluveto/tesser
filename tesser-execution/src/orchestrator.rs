@@ -29,6 +29,9 @@ pub struct OrderOrchestrator {
     /// Maps order IDs to their parent algorithm IDs.
     order_mapping: Arc<Mutex<OrderToAlgoMap>>,
 
+    /// Cached risk context per symbol supplied by the portfolio.
+    risk_contexts: Arc<Mutex<HashMap<String, RiskContext>>>,
+
     /// Underlying execution engine for placing child orders.
     execution_engine: Arc<ExecutionEngine>,
 
@@ -44,10 +47,12 @@ impl OrderOrchestrator {
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
         let order_mapping = Arc::new(Mutex::new(HashMap::new()));
+        let risk_contexts = Arc::new(Mutex::new(HashMap::new()));
 
         let orchestrator = Self {
             algorithms,
             order_mapping,
+            risk_contexts,
             execution_engine,
             state_repo,
         };
@@ -97,6 +102,17 @@ impl OrderOrchestrator {
         Ok(())
     }
 
+    /// Update the latest risk context for a symbol.
+    pub fn update_risk_context(&self, symbol: impl Into<String>, ctx: RiskContext) {
+        let mut contexts = self.risk_contexts.lock().unwrap();
+        contexts.insert(symbol.into(), ctx);
+    }
+
+    fn cached_risk_context(&self, symbol: &str) -> Option<RiskContext> {
+        let contexts = self.risk_contexts.lock().unwrap();
+        contexts.get(symbol).copied()
+    }
+
     /// Handle a signal from a strategy.
     pub async fn on_signal(&self, signal: &Signal, ctx: &RiskContext) -> Result<()> {
         match &signal.execution_hint {
@@ -129,6 +145,7 @@ impl OrderOrchestrator {
         duration: Duration,
         ctx: &RiskContext,
     ) -> Result<()> {
+        self.update_risk_context(signal.symbol.clone(), *ctx);
         // Calculate total quantity using the execution engine's sizer
         let total_quantity =
             self.execution_engine
@@ -170,7 +187,7 @@ impl OrderOrchestrator {
 
         // Send initial orders (if any)
         for child_req in initial_orders {
-            self.send_child_order(child_req, ctx).await?;
+            self.send_child_order(child_req, Some(*ctx)).await?;
         }
 
         Ok(())
@@ -180,23 +197,34 @@ impl OrderOrchestrator {
     async fn send_child_order(
         &self,
         child_req: ChildOrderRequest,
-        ctx: &RiskContext,
+        ctx: Option<RiskContext>,
     ) -> Result<Order> {
+        let ChildOrderRequest {
+            parent_algo_id,
+            order_request,
+        } = child_req;
+        let symbol = order_request.symbol.clone();
+        let resolved_ctx = ctx
+            .or_else(|| self.cached_risk_context(&symbol))
+            .ok_or_else(|| anyhow!("missing risk context for symbol {}", symbol))?;
+        // Keep cache warm with the latest context.
+        self.update_risk_context(symbol.clone(), resolved_ctx);
+
         let order = self
             .execution_engine
-            .send_order(child_req.order_request, ctx)
+            .send_order(order_request, &resolved_ctx)
             .await?;
 
         // Track the mapping from order ID to parent algorithm
         {
             let mut mapping = self.order_mapping.lock().unwrap();
-            mapping.insert(order.id.clone(), child_req.parent_algo_id);
+            mapping.insert(order.id.clone(), parent_algo_id);
         }
 
         // Notify the algorithm that the order was placed
         {
             let mut algorithms = self.algorithms.lock().unwrap();
-            if let Some(algo) = algorithms.get_mut(&child_req.parent_algo_id) {
+            if let Some(algo) = algorithms.get_mut(&parent_algo_id) {
                 algo.on_child_order_placed(&order);
                 // Note: We don't persist state here as it's not critical
             }
@@ -254,10 +282,8 @@ impl OrderOrchestrator {
         }
 
         // Send new child orders if any
-        // TODO: We need a way to get RiskContext here
-        let dummy_ctx = RiskContext::default();
         for child_req in &new_child_orders {
-            if let Err(e) = self.send_child_order(child_req.clone(), &dummy_ctx).await {
+            if let Err(e) = self.send_child_order(child_req.clone(), None).await {
                 tracing::error!(
                     algo_id = %algo_id,
                     error = %e,
@@ -319,9 +345,8 @@ impl OrderOrchestrator {
 
             // Send new child orders
             let has_orders = !new_child_orders.is_empty();
-            let dummy_ctx = RiskContext::default();
             for child_req in new_child_orders {
-                if let Err(e) = self.send_child_order(child_req, &dummy_ctx).await {
+                if let Err(e) = self.send_child_order(child_req, None).await {
                     tracing::error!(
                         algo_id = %algo_id,
                         error = %e,
@@ -384,9 +409,7 @@ impl OrderOrchestrator {
         // Send new child orders (outside the lock)
         for (id, requests) in new_child_orders {
             for req in requests {
-                // TODO: We need a way to get the current RiskContext here
-                let dummy_ctx = RiskContext::default();
-                if let Err(e) = self.send_child_order(req, &dummy_ctx).await {
+                if let Err(e) = self.send_child_order(req, None).await {
                     tracing::error!(id = %id, error = %e, "Failed to send child order");
                 }
             }
