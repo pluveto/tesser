@@ -430,6 +430,21 @@ impl LiveRuntime {
             "market stream ready"
         );
 
+        for symbol in &symbols {
+            let last_price = market
+                .get(symbol)
+                .and_then(|snapshot| snapshot.price())
+                .or_else(|| persisted.last_prices.get(symbol).copied())
+                .unwrap_or(0.0);
+            let ctx = RiskContext {
+                signed_position_qty: portfolio.signed_position_qty(symbol),
+                portfolio_equity: portfolio.equity(),
+                last_price,
+                liquidate_only: portfolio.liquidate_only(),
+            };
+            orchestrator.update_risk_context(symbol.clone(), ctx);
+        }
+
         Ok(Self {
             stream,
             strategy,
@@ -583,6 +598,7 @@ impl LiveRuntime {
             .insert(tick.symbol.clone(), tick.price);
         self.portfolio.mark_price(&tick.symbol, tick.price);
         self.metrics.update_price(&tick.symbol, tick.price);
+        self.refresh_risk_context(&tick.symbol);
 
         // Update price in paper trading client if using paper mode
         if let Some(paper_client) = self
@@ -617,6 +633,7 @@ impl LiveRuntime {
         self.metrics.update_price(&candle.symbol, candle.close);
         self.metrics.update_staleness(0.0);
         self.alerts.heartbeat().await;
+        self.refresh_risk_context(&candle.symbol);
 
         // Update price in paper trading client if using paper mode
         if let Some(paper_client) = self
@@ -652,6 +669,26 @@ impl LiveRuntime {
         self.process_signals().await?;
         Ok(())
     }
+    fn current_risk_context(&self, symbol: &str) -> RiskContext {
+        let last_price = self
+            .market
+            .get(symbol)
+            .and_then(|snapshot| snapshot.price())
+            .or_else(|| self.persisted.last_prices.get(symbol).copied())
+            .unwrap_or(0.0);
+        RiskContext {
+            signed_position_qty: self.portfolio.signed_position_qty(symbol),
+            portfolio_equity: self.portfolio.equity(),
+            last_price,
+            liquidate_only: self.portfolio.liquidate_only(),
+        }
+    }
+
+    fn refresh_risk_context(&self, symbol: &str) {
+        let ctx = self.current_risk_context(symbol);
+        self.orchestrator
+            .update_risk_context(symbol.to_string(), ctx);
+    }
 
     async fn process_signals(&mut self) -> Result<()> {
         let signals = self.strategy.drain_signals();
@@ -660,18 +697,9 @@ impl LiveRuntime {
         }
         self.metrics.inc_signals(signals.len());
         for signal in signals {
-            let last_price = self
-                .market
-                .get(&signal.symbol)
-                .and_then(|s| s.price())
-                .unwrap_or(0.0);
-
-            let ctx = RiskContext {
-                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
-                portfolio_equity: self.portfolio.equity(),
-                last_price,
-                liquidate_only: self.portfolio.liquidate_only(),
-            };
+            let ctx = self.current_risk_context(&signal.symbol);
+            self.orchestrator
+                .update_risk_context(signal.symbol.clone(), ctx);
             match self.orchestrator.on_signal(&signal, &ctx).await {
                 Ok(()) => {
                     // The orchestrator handles order submission internally
@@ -729,16 +757,18 @@ impl LiveRuntime {
             "Processing real fill"
         );
 
-        // Route fill to orchestrator first (for algorithmic orders)
-        if let Err(e) = self.orchestrator.on_fill(&fill).await {
-            warn!(error = %e, "Orchestrator failed to process fill");
-        }
-
         self.portfolio
             .apply_fill(&fill)
             .context("Failed to apply real fill to portfolio")?;
         self.strategy_ctx
             .update_positions(self.portfolio.positions());
+        self.refresh_risk_context(&fill.symbol);
+
+        // Route fill to orchestrator after portfolio state refresh
+        if let Err(e) = self.orchestrator.on_fill(&fill).await {
+            warn!(error = %e, "Orchestrator failed to process fill");
+        }
+
         self.strategy
             .on_fill(&self.strategy_ctx, &fill)
             .context("Strategy failed on real fill event")?;
