@@ -2,11 +2,12 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
+use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{AlgoStatus, ChildOrderRequest, ExecutionAlgorithm};
-use tesser_core::{Fill, Order, OrderRequest, OrderType, Signal, Tick};
+use tesser_core::{Fill, Order, OrderRequest, OrderType, Quantity, Signal, Tick};
 
 /// Persistent state for the TWAP algorithm.
 #[derive(Debug, Deserialize, Serialize)]
@@ -18,8 +19,8 @@ struct TwapState {
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
 
-    total_quantity: f64,
-    filled_quantity: f64,
+    total_quantity: Quantity,
+    filled_quantity: Quantity,
 
     num_slices: u32,
     executed_slices: u32,
@@ -47,7 +48,7 @@ impl TwapAlgorithm {
     /// * `num_slices` - Number of smaller orders to break the total into
     pub fn new(
         signal: Signal,
-        total_quantity: f64,
+        total_quantity: Quantity,
         duration: Duration,
         num_slices: u32,
     ) -> Result<Self> {
@@ -55,7 +56,7 @@ impl TwapAlgorithm {
             return Err(anyhow!("TWAP duration and slices must be positive"));
         }
 
-        if total_quantity <= 0.0 {
+        if total_quantity <= Decimal::ZERO {
             return Err(anyhow!("TWAP total quantity must be positive"));
         }
 
@@ -71,7 +72,7 @@ impl TwapAlgorithm {
                 start_time: now,
                 end_time: now + duration,
                 total_quantity,
-                filled_quantity: 0.0,
+                filled_quantity: Decimal::ZERO,
                 num_slices,
                 executed_slices: 0,
                 next_slice_time: now,
@@ -89,22 +90,27 @@ impl TwapAlgorithm {
     }
 
     /// Calculate the quantity for the next slice.
-    fn calculate_slice_quantity(&self) -> f64 {
+    fn calculate_slice_quantity(&self) -> Quantity {
         let remaining_qty = self.state.total_quantity - self.state.filled_quantity;
-        if remaining_qty <= 0.0 {
-            return 0.0;
+        if remaining_qty <= Decimal::ZERO {
+            return Decimal::ZERO;
         }
 
         let remaining_slices = self.state.num_slices - self.state.executed_slices;
         if remaining_slices == 0 {
-            return 0.0;
+            return Decimal::ZERO;
         }
 
-        remaining_qty / remaining_slices as f64
+        let divisor = Decimal::from_u32(remaining_slices).unwrap_or(Decimal::ONE);
+        if divisor.is_zero() {
+            Decimal::ZERO
+        } else {
+            remaining_qty / divisor
+        }
     }
 
     /// Generate a child order request for the next slice.
-    fn create_slice_order(&self, slice_qty: f64) -> ChildOrderRequest {
+    fn create_slice_order(&self, slice_qty: Quantity) -> ChildOrderRequest {
         ChildOrderRequest {
             parent_algo_id: self.state.id,
             order_request: OrderRequest {
@@ -141,8 +147,8 @@ impl TwapAlgorithm {
             self.state.status = "Completed".to_string();
             tracing::info!(
                 id = %self.state.id,
-                filled = self.state.filled_quantity,
-                total = self.state.total_quantity,
+                filled = %self.state.filled_quantity,
+                total = %self.state.total_quantity,
                 "TWAP completed due to reaching total quantity"
             );
         }
@@ -174,7 +180,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
             id = %self.state.id,
             duration_secs = self.state.end_time.signed_duration_since(self.state.start_time).num_seconds(),
             slices = self.state.num_slices,
-            total_qty = self.state.total_quantity,
+            total_qty = %self.state.total_quantity,
             "TWAP algorithm started"
         );
         Ok(vec![])
@@ -184,7 +190,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         tracing::debug!(
             id = %self.state.id,
             order_id = %order.id,
-            qty = order.request.quantity,
+            qty = %order.request.quantity,
             "TWAP child order placed"
         );
         // For a simple TWAP, we don't need special handling when orders are placed
@@ -194,8 +200,8 @@ impl ExecutionAlgorithm for TwapAlgorithm {
     fn on_fill(&mut self, fill: &Fill) -> Result<Vec<ChildOrderRequest>> {
         tracing::debug!(
             id = %self.state.id,
-            fill_qty = fill.fill_quantity,
-            fill_price = fill.fill_price,
+            fill_qty = %fill.fill_quantity,
+            fill_price = %fill.fill_price,
             "TWAP received fill"
         );
 
@@ -224,7 +230,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         }
 
         let slice_qty = self.calculate_slice_quantity();
-        if slice_qty <= 0.0 {
+        if slice_qty <= Decimal::ZERO {
             return Ok(vec![]);
         }
 
@@ -235,7 +241,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         tracing::debug!(
             id = %self.state.id,
             slice = self.state.executed_slices,
-            qty = slice_qty,
+            qty = %slice_qty,
             next_slice_time = %self.state.next_slice_time,
             "Executing TWAP slice"
         );
@@ -272,9 +278,9 @@ mod tests {
     fn test_twap_creation() {
         let signal = Signal::new("BTCUSDT", SignalKind::EnterLong, 0.8);
         let duration = Duration::minutes(30);
-        let twap = TwapAlgorithm::new(signal, 1.0, duration, 10).unwrap();
+        let twap = TwapAlgorithm::new(signal, Decimal::ONE, duration, 10).unwrap();
 
-        assert_eq!(twap.state.total_quantity, 1.0);
+        assert_eq!(twap.state.total_quantity, Decimal::ONE);
         assert_eq!(twap.state.num_slices, 10);
         assert_eq!(twap.status(), AlgoStatus::Working);
     }
@@ -284,21 +290,26 @@ mod tests {
         let signal = Signal::new("BTCUSDT", SignalKind::EnterLong, 0.8);
 
         // Zero duration should fail
-        let result = TwapAlgorithm::new(signal.clone(), 1.0, Duration::zero(), 10);
+        let result = TwapAlgorithm::new(signal.clone(), Decimal::ONE, Duration::zero(), 10);
         assert!(result.is_err());
 
         // Zero slices should fail
-        let result = TwapAlgorithm::new(signal, 1.0, Duration::minutes(30), 0);
+        let result = TwapAlgorithm::new(signal, Decimal::ONE, Duration::minutes(30), 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_slice_quantity_calculation() {
         let signal = Signal::new("BTCUSDT", SignalKind::EnterLong, 0.8);
-        let twap = TwapAlgorithm::new(signal, 10.0, Duration::minutes(30), 5).unwrap();
+        let twap = TwapAlgorithm::new(
+            signal,
+            Decimal::from_i32(10).unwrap(),
+            Duration::minutes(30),
+            5,
+        )
+        .unwrap();
 
-        // Initially should be total_qty / num_slices
         let slice_qty = twap.calculate_slice_quantity();
-        assert_eq!(slice_qty, 2.0);
+        assert_eq!(slice_qty, Decimal::from_i32(2).unwrap());
     }
 }

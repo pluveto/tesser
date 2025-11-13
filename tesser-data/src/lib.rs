@@ -5,6 +5,8 @@ pub mod download;
 /// Data distribution utilities that consume [`tesser_broker::MarketStream`].
 use anyhow::Context;
 use async_trait::async_trait;
+#[cfg(test)]
+use rust_decimal::Decimal;
 use tokio::time::{sleep, Duration};
 use tracing::instrument;
 
@@ -173,8 +175,8 @@ mod tests {
     async fn distributor_pumps_events() {
         let ticks = vec![Tick {
             symbol: Symbol::from("BTCUSDT"),
-            price: 1.0,
-            size: 1.0,
+            price: Decimal::ONE,
+            size: Decimal::ONE,
             side: Side::Buy,
             exchange_timestamp: chrono::Utc::now(),
             received_at: chrono::Utc::now(),
@@ -182,11 +184,11 @@ mod tests {
         let candles = vec![Candle {
             symbol: Symbol::from("BTCUSDT"),
             interval: Interval::OneMinute,
-            open: 1.0,
-            high: 1.0,
-            low: 1.0,
-            close: 1.0,
-            volume: 1.0,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
             timestamp: chrono::Utc::now(),
         }];
         let mut distributor = DataDistributor::new(TestStream { ticks, candles });

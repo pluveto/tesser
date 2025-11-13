@@ -46,11 +46,13 @@ api_keys.yml
 logs/
 
 # Ignore market data, which can be very large and should not be version controlled.
-# This includes historical data downloads in various formats.
-data/
+# This includes historical data downloads in various formats, except for curated examples.
+/data/
 .venv/
 research/.venv/
+# Allow small checked-in datasets for documentation purposes.
 *.csv
+!examples/data/*.csv
 *.parquet
 *.jsonl
 *.db

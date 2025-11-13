@@ -1,16 +1,17 @@
 use anyhow::{bail, Result};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tesser_core::{Order, OrderRequest, OrderType, Side, Signal, Tick, TimeInForce};
+use tesser_core::{
+    Order, OrderRequest, OrderType, Price, Quantity, Side, Signal, Tick, TimeInForce,
+};
 use uuid::Uuid;
 
 use super::{AlgoStatus, ChildOrderRequest, ExecutionAlgorithm};
 
-const EPS: f64 = 1e-9;
-
 #[derive(Debug, Deserialize, Serialize)]
 struct ActiveChild {
     order_id: String,
-    remaining: f64,
+    remaining: Quantity,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -18,11 +19,11 @@ struct IcebergState {
     id: Uuid,
     parent_signal: Signal,
     status: String,
-    total_quantity: f64,
-    filled_quantity: f64,
-    display_quantity: f64,
-    limit_price: f64,
-    limit_offset_bps: Option<f64>,
+    total_quantity: Quantity,
+    filled_quantity: Quantity,
+    display_quantity: Quantity,
+    limit_price: Price,
+    limit_offset_bps: Option<Decimal>,
     next_child_seq: u32,
     active_child: Option<ActiveChild>,
 }
@@ -34,18 +35,18 @@ pub struct IcebergAlgorithm {
 impl IcebergAlgorithm {
     pub fn new(
         signal: Signal,
-        total_quantity: f64,
-        display_quantity: f64,
-        limit_price: f64,
-        limit_offset_bps: Option<f64>,
+        total_quantity: Quantity,
+        display_quantity: Quantity,
+        limit_price: Price,
+        limit_offset_bps: Option<Decimal>,
     ) -> Result<Self> {
-        if total_quantity <= 0.0 {
+        if total_quantity <= Decimal::ZERO {
             bail!("iceberg total quantity must be positive");
         }
-        if display_quantity <= 0.0 {
+        if display_quantity <= Decimal::ZERO {
             bail!("iceberg display quantity must be positive");
         }
-        if limit_price <= 0.0 {
+        if limit_price <= Decimal::ZERO {
             bail!("iceberg limit price must be positive");
         }
         Ok(Self {
@@ -54,7 +55,7 @@ impl IcebergAlgorithm {
                 parent_signal: signal,
                 status: "Working".into(),
                 total_quantity,
-                filled_quantity: 0.0,
+                filled_quantity: Decimal::ZERO,
                 display_quantity,
                 limit_price,
                 limit_offset_bps,
@@ -64,11 +65,11 @@ impl IcebergAlgorithm {
         })
     }
 
-    fn remaining_parent(&self) -> f64 {
-        (self.state.total_quantity - self.state.filled_quantity).max(0.0)
+    fn remaining_parent(&self) -> Quantity {
+        (self.state.total_quantity - self.state.filled_quantity).max(Decimal::ZERO)
     }
 
-    fn build_limit_child(&mut self, quantity: f64) -> ChildOrderRequest {
+    fn build_limit_child(&mut self, quantity: Quantity) -> ChildOrderRequest {
         self.state.next_child_seq += 1;
         let price = self.adjusted_limit_price();
         ChildOrderRequest {
@@ -92,12 +93,17 @@ impl IcebergAlgorithm {
         }
     }
 
-    fn adjusted_limit_price(&self) -> f64 {
+    fn adjusted_limit_price(&self) -> Price {
         let base = self.state.limit_price;
-        let offset = self.state.limit_offset_bps.unwrap_or(0.0).max(0.0) / 10_000.0;
+        let offset = self
+            .state
+            .limit_offset_bps
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO)
+            / Decimal::from(10_000);
         match self.state.parent_signal.kind.side() {
-            Side::Buy => base * (1.0 + offset),
-            Side::Sell => base * (1.0 - offset),
+            Side::Buy => base * (Decimal::ONE + offset),
+            Side::Sell => base * (Decimal::ONE - offset),
         }
     }
 
@@ -105,21 +111,21 @@ impl IcebergAlgorithm {
         if !matches!(self.status(), AlgoStatus::Working) {
             return Vec::new();
         }
-        if self.remaining_parent() <= EPS || self.state.active_child.is_some() {
+        if self.remaining_parent() <= Decimal::ZERO || self.state.active_child.is_some() {
             return Vec::new();
         }
         let qty = self
             .remaining_parent()
             .min(self.state.display_quantity)
-            .max(0.0);
-        if qty <= EPS {
+            .max(Decimal::ZERO);
+        if qty <= Decimal::ZERO {
             return Vec::new();
         }
         vec![self.build_limit_child(qty)]
     }
 
     fn complete_if_needed(&mut self) {
-        if self.remaining_parent() <= EPS {
+        if self.remaining_parent() <= Decimal::ZERO {
             self.state.status = "Completed".into();
         }
     }
@@ -160,7 +166,7 @@ impl ExecutionAlgorithm for IcebergAlgorithm {
             if active.order_id == fill.order_id {
                 active.remaining -= fill.fill_quantity;
             }
-            if active.remaining <= EPS {
+            if active.remaining <= Decimal::ZERO {
                 self.state.active_child = None;
             }
         }

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde_json::json;
 use tesser_config::AlertingConfig;
 use tokio::sync::Mutex;
@@ -37,7 +38,7 @@ impl AlertDispatcher {
 struct AlertState {
     last_data: Instant,
     consecutive_failures: u32,
-    peak_equity: f64,
+    peak_equity: Decimal,
     drawdown_triggered: bool,
     data_gap_triggered: bool,
 }
@@ -53,7 +54,7 @@ impl AlertManager {
         let state = AlertState {
             last_data: Instant::now(),
             consecutive_failures: 0,
-            peak_equity: 0.0,
+            peak_equity: Decimal::ZERO,
             drawdown_triggered: false,
             data_gap_triggered: false,
         };
@@ -96,8 +97,8 @@ impl AlertManager {
         self.dispatcher.notify(title, message).await;
     }
 
-    pub async fn update_equity(&self, equity: f64) {
-        if equity <= 0.0 {
+    pub async fn update_equity(&self, equity: Decimal) {
+        if equity <= Decimal::ZERO {
             return;
         }
         let mut state = self.state.lock().await;
@@ -106,7 +107,7 @@ impl AlertManager {
             state.drawdown_triggered = false;
             return;
         }
-        if state.peak_equity <= 0.0 {
+        if state.peak_equity <= Decimal::ZERO {
             state.peak_equity = equity;
             return;
         }
@@ -115,14 +116,15 @@ impl AlertManager {
             state.drawdown_triggered = true;
             let peak = state.peak_equity;
             drop(state);
+            let equity_val = equity.to_f64().unwrap_or(0.0);
+            let peak_val = peak.to_f64().unwrap_or(0.0);
+            let drawdown_pct = drawdown.to_f64().unwrap_or(0.0) * 100.0;
             self.dispatcher
                 .notify(
                     "Drawdown limit breached",
                     &format!(
                         "Current equity {:.2} vs peak {:.2} (drawdown {:.2}%)",
-                        equity,
-                        peak,
-                        drawdown * 100.0
+                        equity_val, peak_val, drawdown_pct
                     ),
                 )
                 .await;

@@ -1,7 +1,5 @@
 //! Order management and signal execution helpers.
 
-use std::sync::Arc;
-
 pub mod algorithm;
 pub mod orchestrator;
 pub mod repository;
@@ -11,7 +9,9 @@ pub use algorithm::{AlgoStatus, ChildOrderRequest, ExecutionAlgorithm};
 pub use orchestrator::OrderOrchestrator;
 pub use repository::{AlgoStateRepository, SqliteAlgoStateRepository};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
+use rust_decimal::Decimal;
+use std::sync::Arc;
 use tesser_broker::{BrokerError, BrokerResult, ExecutionClient};
 use tesser_bybit::{BybitClient, BybitCredentials};
 use tesser_core::{
@@ -26,8 +26,8 @@ pub trait OrderSizer: Send + Sync {
     fn size(
         &self,
         signal: &Signal,
-        portfolio_equity: f64,
-        last_price: f64,
+        portfolio_equity: Price,
+        last_price: Price,
     ) -> anyhow::Result<Quantity>;
 }
 
@@ -40,8 +40,8 @@ impl OrderSizer for FixedOrderSizer {
     fn size(
         &self,
         _signal: &Signal,
-        _portfolio_equity: f64,
-        _last_price: f64,
+        _portfolio_equity: Price,
+        _last_price: Price,
     ) -> anyhow::Result<Quantity> {
         Ok(self.quantity)
     }
@@ -50,18 +50,21 @@ impl OrderSizer for FixedOrderSizer {
 /// Sizes orders based on a fixed percentage of portfolio equity.
 pub struct PortfolioPercentSizer {
     /// The fraction of equity to allocate per trade (e.g., 0.02 for 2%).
-    pub percent: f64,
+    pub percent: Decimal,
 }
 
 impl OrderSizer for PortfolioPercentSizer {
     fn size(
         &self,
         _signal: &Signal,
-        portfolio_equity: f64,
-        last_price: f64,
+        portfolio_equity: Price,
+        last_price: Price,
     ) -> anyhow::Result<Quantity> {
-        if last_price <= 0.0 {
-            anyhow::bail!("cannot size order with zero or negative price");
+        if last_price <= Decimal::ZERO {
+            bail!("cannot size order with zero or negative price");
+        }
+        if self.percent <= Decimal::ZERO {
+            return Ok(Decimal::ZERO);
         }
         let notional = portfolio_equity * self.percent;
         Ok(notional / last_price)
@@ -72,22 +75,30 @@ impl OrderSizer for PortfolioPercentSizer {
 #[derive(Default)]
 pub struct RiskAdjustedSizer {
     /// Target risk contribution per trade, as a fraction of equity (e.g., 0.002 for 0.2%).
-    pub risk_fraction: f64,
+    pub risk_fraction: Decimal,
 }
 
 impl OrderSizer for RiskAdjustedSizer {
     fn size(
         &self,
         _signal: &Signal,
-        portfolio_equity: f64,
-        last_price: f64,
+        portfolio_equity: Price,
+        last_price: Price,
     ) -> anyhow::Result<Quantity> {
-        // In a real implementation, you would calculate the instrument's volatility here.
-        // For now, we'll use a fixed placeholder volatility of 2%.
-        let volatility = 0.02; // Placeholder
+        if last_price <= Decimal::ZERO {
+            bail!("cannot size order with zero or negative price");
+        }
+        if self.risk_fraction <= Decimal::ZERO {
+            return Ok(Decimal::ZERO);
+        }
+        // Placeholder volatility; replace with instrument-specific estimator.
+        let volatility = Decimal::new(2, 2); // 0.02
+        let denom = last_price * volatility;
+        if denom <= Decimal::ZERO {
+            bail!("volatility multiplier produced an invalid denominator");
+        }
         let dollars_at_risk = portfolio_equity * self.risk_fraction;
-        let quantity = dollars_at_risk / (last_price * volatility);
-        Ok(quantity)
+        Ok(dollars_at_risk / denom)
     }
 }
 
@@ -95,7 +106,7 @@ impl OrderSizer for RiskAdjustedSizer {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RiskContext {
     /// Signed quantity of the current open position (long positive, short negative).
-    pub signed_position_qty: f64,
+    pub signed_position_qty: Quantity,
     /// Total current portfolio equity.
     pub portfolio_equity: Price,
     /// Last known price for the signal's symbol.
@@ -122,16 +133,16 @@ impl PreTradeRiskChecker for NoopRiskChecker {
 /// Upper bounds enforced by the [`BasicRiskChecker`].
 #[derive(Clone, Copy, Debug)]
 pub struct RiskLimits {
-    pub max_order_quantity: f64,
-    pub max_position_quantity: f64,
+    pub max_order_quantity: Quantity,
+    pub max_position_quantity: Quantity,
 }
 
 impl RiskLimits {
     /// Ensure limits are non-negative and default to zero (disabled) when NaN.
     pub fn sanitized(self) -> Self {
         Self {
-            max_order_quantity: self.max_order_quantity.max(0.0),
-            max_position_quantity: self.max_position_quantity.max(0.0),
+            max_order_quantity: self.max_order_quantity.max(Decimal::ZERO),
+            max_position_quantity: self.max_position_quantity.max(Decimal::ZERO),
         }
     }
 }
@@ -153,10 +164,11 @@ impl BasicRiskChecker {
 impl PreTradeRiskChecker for BasicRiskChecker {
     fn check(&self, request: &OrderRequest, ctx: &RiskContext) -> Result<(), RiskError> {
         let qty = request.quantity.abs();
-        if self.limits.max_order_quantity > 0.0 && qty > self.limits.max_order_quantity {
+        let max_order = self.limits.max_order_quantity;
+        if max_order > Decimal::ZERO && qty > max_order {
             return Err(RiskError::MaxOrderSize {
                 quantity: qty,
-                limit: self.limits.max_order_quantity,
+                limit: max_order,
             });
         }
 
@@ -165,26 +177,25 @@ impl PreTradeRiskChecker for BasicRiskChecker {
             Side::Sell => ctx.signed_position_qty - qty,
         };
 
-        if self.limits.max_position_quantity > 0.0
-            && projected_position.abs() > self.limits.max_position_quantity
-        {
+        let max_position = self.limits.max_position_quantity;
+        if max_position > Decimal::ZERO && projected_position.abs() > max_position {
             return Err(RiskError::MaxPositionExposure {
                 projected: projected_position,
-                limit: self.limits.max_position_quantity,
+                limit: max_position,
             });
         }
 
         if ctx.liquidate_only {
             let position = ctx.signed_position_qty;
-            if position.abs() < f64::EPSILON {
+            if position.is_zero() {
                 return Err(RiskError::LiquidateOnly);
             }
-            let reduces = (position > 0.0 && request.side == Side::Sell)
-                || (position < 0.0 && request.side == Side::Buy);
+            let reduces = (position > Decimal::ZERO && request.side == Side::Sell)
+                || (position < Decimal::ZERO && request.side == Side::Buy);
             if !reduces {
                 return Err(RiskError::LiquidateOnly);
             }
-            if qty > position.abs() + f64::EPSILON {
+            if qty > position.abs() {
                 return Err(RiskError::LiquidateOnly);
             }
         }
@@ -193,13 +204,53 @@ impl PreTradeRiskChecker for BasicRiskChecker {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tesser_core::SignalKind;
+
+    fn dummy_signal() -> Signal {
+        Signal::new("BTCUSDT", SignalKind::EnterLong, 1.0)
+    }
+
+    #[test]
+    fn portfolio_percent_sizer_matches_decimal_math() {
+        let signal = dummy_signal();
+        let sizer = PortfolioPercentSizer {
+            percent: Decimal::new(5, 2),
+        };
+        let qty = sizer
+            .size(&signal, Decimal::from(25_000), Decimal::from(50_000))
+            .unwrap();
+        assert_eq!(qty, Decimal::new(25, 3)); // 0.025
+    }
+
+    #[test]
+    fn risk_adjusted_sizer_respects_zero_price_guard() {
+        let signal = dummy_signal();
+        let sizer = RiskAdjustedSizer {
+            risk_fraction: Decimal::new(1, 2),
+        };
+        let err = sizer
+            .size(&signal, Decimal::from(10_000), Decimal::ZERO)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zero or negative price"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
 /// Errors surfaced by pre-trade risk checks.
 #[derive(Debug, Error)]
 pub enum RiskError {
-    #[error("order quantity {quantity:.4} exceeds limit {limit:.4}")]
-    MaxOrderSize { quantity: f64, limit: f64 },
-    #[error("projected position {projected:.4} exceeds limit {limit:.4}")]
-    MaxPositionExposure { projected: f64, limit: f64 },
+    #[error("order quantity {quantity} exceeds limit {limit}")]
+    MaxOrderSize { quantity: Quantity, limit: Quantity },
+    #[error("projected position {projected} exceeds limit {limit}")]
+    MaxPositionExposure {
+        projected: Quantity,
+        limit: Quantity,
+    },
     #[error("liquidate-only mode active")]
     LiquidateOnly,
 }
@@ -237,7 +288,7 @@ impl ExecutionEngine {
             .context("failed to determine order size")
             .map_err(|err| BrokerError::Other(err.to_string()))?;
 
-        if qty <= 0.0 {
+        if qty <= Decimal::ZERO {
             warn!(signal = ?signal.id, "order size is zero, skipping");
             return Ok(None);
         }
@@ -346,7 +397,11 @@ impl ExecutionEngine {
             .check(&request, ctx)
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
         let order = self.client.place_order(request).await?;
-        info!(order_id = %order.id, qty = order.request.quantity, "order sent to broker");
+        info!(
+            order_id = %order.id,
+            qty = %order.request.quantity,
+            "order sent to broker"
+        );
         Ok(order)
     }
 

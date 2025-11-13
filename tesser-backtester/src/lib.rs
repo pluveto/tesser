@@ -7,6 +7,7 @@ use std::{collections::VecDeque, sync::Arc};
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use reporting::{PerformanceReport, Reporter};
+use rust_decimal::Decimal;
 use tesser_core::{
     Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
 };
@@ -23,7 +24,7 @@ pub struct BacktestConfig {
     pub lob_events: Vec<MarketEvent>,
     pub order_quantity: Quantity,
     pub history: usize,
-    pub initial_equity: f64,
+    pub initial_equity: Decimal,
     pub execution: ExecutionModel,
     pub mode: BacktestMode,
 }
@@ -35,9 +36,9 @@ impl BacktestConfig {
             symbol,
             candles,
             lob_events: Vec::new(),
-            order_quantity: 1.0,
+            order_quantity: Decimal::ONE,
             history: 512,
-            initial_equity: 10_000.0,
+            initial_equity: Decimal::new(10_000, 0),
             execution: ExecutionModel::default(),
             mode: BacktestMode::Candle,
         }
@@ -50,21 +51,21 @@ pub struct ExecutionModel {
     /// Number of candles to wait before an order is eligible for execution (minimum 1).
     pub latency_candles: usize,
     /// Symmetric slippage applied in basis points (1 bp = 0.01%).
-    pub slippage_bps: f64,
+    pub slippage_bps: Decimal,
     /// Trading fee in basis points applied to notional.
-    pub fee_bps: f64,
+    pub fee_bps: Decimal,
     /// Pessimism factor within the OHLC range when simulating fills (0.0-1.0).
     /// For buys, simulate closer to the high; for sells, closer to the low.
-    pub pessimism_factor: f64,
+    pub pessimism_factor: Decimal,
 }
 
 impl Default for ExecutionModel {
     fn default() -> Self {
         Self {
             latency_candles: 1,
-            slippage_bps: 0.0,
-            fee_bps: 0.0,
-            pessimism_factor: 0.25,
+            slippage_bps: Decimal::ZERO,
+            fee_bps: Decimal::ZERO,
+            pessimism_factor: Decimal::new(25, 2), // 0.25
         }
     }
 }
@@ -148,7 +149,7 @@ impl Backtester {
     }
 
     async fn run_candle(&mut self) -> anyhow::Result<PerformanceReport> {
-        let mut equity_curve = Vec::new();
+        let mut equity_curve: Vec<(DateTime<Utc>, Decimal)> = Vec::new();
         let mut all_fills = Vec::new();
 
         for idx in 0..self.config.candles.len() {
@@ -167,7 +168,7 @@ impl Backtester {
                 for fill in triggered_fills {
                     info!(
                         order_id = %fill.order_id,
-                        price = fill.fill_price,
+                        price = %fill.fill_price,
                         "triggered paper conditional order"
                     );
                     self.record_fill(&fill, &mut all_fills)?;
@@ -204,7 +205,8 @@ impl Backtester {
                 }
             }
 
-            equity_curve.push((candle.timestamp, self.portfolio.equity()));
+            let equity = self.portfolio.equity();
+            equity_curve.push((candle.timestamp, equity));
         }
 
         let reporter = Reporter::new(self.config.initial_equity, equity_curve, all_fills);
@@ -232,27 +234,34 @@ impl Backtester {
 
     fn build_fill(&self, order: &Order, candle: &Candle) -> Fill {
         // Price within the candle's OHLC band, biased pessimistically
-        let factor = self.config.execution.pessimism_factor.clamp(0.0, 1.0);
+        let factor = self
+            .config
+            .execution
+            .pessimism_factor
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
         let mut price = match order.request.side {
             Side::Buy => {
-                let band = (candle.high - candle.open).max(0.0);
+                let band = (candle.high - candle.open).max(Decimal::ZERO);
                 candle.open + band * factor
             }
             Side::Sell => {
-                let band = (candle.open - candle.low).max(0.0);
+                let band = (candle.open - candle.low).max(Decimal::ZERO);
                 candle.open - band * factor
             }
         };
-        let slippage_rate = self.config.execution.slippage_bps / 10_000.0;
-        if slippage_rate > 0.0 {
-            price *= match order.request.side {
-                Side::Buy => 1.0 + slippage_rate,
-                Side::Sell => 1.0 - slippage_rate,
+        let slippage_rate =
+            self.config.execution.slippage_bps.max(Decimal::ZERO) / Decimal::from(10_000);
+        if slippage_rate > Decimal::ZERO {
+            let multiplier = match order.request.side {
+                Side::Buy => Decimal::ONE + slippage_rate,
+                Side::Sell => Decimal::ONE - slippage_rate,
             };
+            price *= multiplier;
         }
-        let fee_rate = self.config.execution.fee_bps / 10_000.0;
+        let fee_rate = self.config.execution.fee_bps.max(Decimal::ZERO) / Decimal::from(10_000);
         let notional = price * order.request.quantity.abs();
-        let fee = if fee_rate > 0.0 {
+        let fee = if fee_rate > Decimal::ZERO {
             Some(notional * fee_rate)
         } else {
             None
@@ -273,7 +282,7 @@ impl Backtester {
             .matching_engine
             .clone()
             .ok_or_else(|| anyhow!("tick mode requires a matching engine"))?;
-        let mut equity_curve = Vec::new();
+        let mut equity_curve: Vec<(DateTime<Utc>, Decimal)> = Vec::new();
         let mut all_fills = Vec::new();
         let mut last_trade_price: Option<Price> = None;
 
@@ -307,7 +316,8 @@ impl Backtester {
             self.process_signals_tick(last_trade_price.or_else(|| matching.mid_price()))
                 .await?;
             self.consume_matching_fills(&mut all_fills).await?;
-            equity_curve.push((event.timestamp, self.portfolio.equity()));
+            let equity = self.portfolio.equity();
+            equity_curve.push((event.timestamp, equity));
         }
 
         let reporter = Reporter::new(self.config.initial_equity, equity_curve, all_fills);
@@ -320,7 +330,7 @@ impl Backtester {
             let reference_price = self
                 .last_tick_price(&signal.symbol)
                 .or(fallback_price)
-                .unwrap_or(0.0);
+                .unwrap_or(Decimal::ZERO);
             let ctx = RiskContext {
                 signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
                 portfolio_equity: self.portfolio.equity(),

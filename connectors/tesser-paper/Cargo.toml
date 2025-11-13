@@ -14,3 +14,4 @@ tracing.workspace = true
 tesser-broker = { path = "../../tesser-broker" }
 tesser-core = { path = "../../tesser-core" }
 uuid.workspace = true
+rust_decimal.workspace = true

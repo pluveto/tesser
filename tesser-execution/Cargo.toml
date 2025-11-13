@@ -18,6 +18,7 @@ tesser-core = { path = "../tesser-core" }
 tesser-strategy = { path = "../tesser-strategy" }
 thiserror.workspace = true
 uuid.workspace = true
+rust_decimal.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"

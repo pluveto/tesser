@@ -4,6 +4,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json, Value};
 use sha2::Sha256;
@@ -636,7 +637,7 @@ impl BybitWsOrder {
                         Side::Sell
                     },
                     order_type: OrderType::Market,
-                    quantity: 0.0,
+                    quantity: Decimal::ZERO,
                     price: None,
                     trigger_price: None,
                     time_in_force: None,
@@ -646,7 +647,7 @@ impl BybitWsOrder {
                     display_quantity: None,
                 }),
             status: crate::BybitClient::map_order_status(&self.order_status),
-            filled_quantity: existing.map(|o| o.filled_quantity).unwrap_or(0.0),
+            filled_quantity: existing.map(|o| o.filled_quantity).unwrap_or(Decimal::ZERO),
             avg_fill_price: existing.and_then(|o| o.avg_fill_price),
             created_at: existing.map(|o| o.created_at).unwrap_or_else(Utc::now),
             updated_at: Utc::now(),
@@ -656,16 +657,16 @@ impl BybitWsOrder {
 
 impl BybitWsExecution {
     pub fn to_tesser_fill(&self) -> Result<Fill, BrokerError> {
-        let fill_price = self.exec_price.parse().map_err(|e| {
+        let fill_price = self.exec_price.parse::<Decimal>().map_err(|e| {
             BrokerError::Serialization(format!(
                 "failed to parse exec price {}: {e}",
                 self.exec_price
             ))
         })?;
-        let fill_quantity = self.exec_qty.parse().map_err(|e| {
+        let fill_quantity = self.exec_qty.parse::<Decimal>().map_err(|e| {
             BrokerError::Serialization(format!("failed to parse exec qty {}: {e}", self.exec_qty))
         })?;
-        let fee = self.exec_fee.parse().ok();
+        let fee = self.exec_fee.parse::<Decimal>().ok();
         let timestamp = parse_millis(&self.exec_time);
         let side = match self.side.as_str() {
             "Buy" => Side::Buy,

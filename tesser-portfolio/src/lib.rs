@@ -1,13 +1,15 @@
 //! Portfolio accounting primitives.
 
+use std::cmp;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tesser_core::{AccountBalance, Fill, Order, Position, Price, Side, Symbol};
+use tesser_core::{AccountBalance, Fill, Order, Position, Price, Quantity, Side, Symbol};
 use thiserror::Error;
 
 /// Result alias for portfolio operations.
@@ -28,13 +30,13 @@ pub enum PortfolioError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PortfolioConfig {
     pub initial_equity: Price,
-    pub max_drawdown: Option<f64>,
+    pub max_drawdown: Option<Decimal>,
 }
 
 impl Default for PortfolioConfig {
     fn default() -> Self {
         Self {
-            initial_equity: 10_000.0,
+            initial_equity: Decimal::from(10_000),
             max_drawdown: None,
         }
     }
@@ -46,7 +48,7 @@ pub struct Portfolio {
     cash: Price,
     realized_pnl: Price,
     initial_equity: Price,
-    drawdown_limit: Option<f64>,
+    drawdown_limit: Option<Decimal>,
     peak_equity: Price,
     liquidate_only: bool,
 }
@@ -54,13 +56,11 @@ pub struct Portfolio {
 impl Portfolio {
     /// Instantiate a new portfolio with default configuration.
     pub fn new(config: PortfolioConfig) -> Self {
-        let limit = config
-            .max_drawdown
-            .filter(|value| value.is_finite() && *value > 0.0);
+        let limit = config.max_drawdown.filter(|value| *value > Decimal::ZERO);
         Self {
             cash: config.initial_equity,
             positions: HashMap::new(),
-            realized_pnl: 0.0,
+            realized_pnl: Decimal::ZERO,
             initial_equity: config.initial_equity,
             drawdown_limit: limit,
             peak_equity: config.initial_equity,
@@ -74,12 +74,10 @@ impl Portfolio {
         balances: Vec<AccountBalance>,
         config: PortfolioConfig,
     ) -> Self {
-        let drawdown_limit = config
-            .max_drawdown
-            .filter(|value| value.is_finite() && *value > 0.0);
+        let drawdown_limit = config.max_drawdown.filter(|value| *value > Decimal::ZERO);
         let mut position_map = HashMap::new();
         for position in positions.into_iter() {
-            if position.quantity.abs() < f64::EPSILON {
+            if position.quantity.is_zero() {
                 continue;
             }
             let symbol = position.symbol.clone();
@@ -89,10 +87,10 @@ impl Portfolio {
         let mut portfolio = Self {
             cash,
             positions: position_map,
-            realized_pnl: 0.0,
+            realized_pnl: Decimal::ZERO,
             initial_equity: config.initial_equity,
             drawdown_limit,
-            peak_equity: config.initial_equity.max(cash),
+            peak_equity: cmp::max(config.initial_equity, cash),
             liquidate_only: false,
         };
         portfolio.update_drawdown_state();
@@ -107,9 +105,9 @@ impl Portfolio {
             .or_insert(Position {
                 symbol: fill.symbol.clone(),
                 side: Some(fill.side),
-                quantity: 0.0,
+                quantity: Decimal::ZERO,
                 entry_price: Some(fill.fill_price),
-                unrealized_pnl: 0.0,
+                unrealized_pnl: Decimal::ZERO,
                 updated_at: fill.timestamp,
             });
 
@@ -125,7 +123,11 @@ impl Portfolio {
                     .map(|price| price * entry.quantity)
                     .unwrap_or_default();
                 let new_cost = fill.fill_price * fill.fill_quantity;
-                entry.entry_price = Some((prev_cost + new_cost) / total_qty.max(f64::EPSILON));
+                entry.entry_price = if total_qty.is_zero() {
+                    Some(fill.fill_price)
+                } else {
+                    Some((prev_cost + new_cost) / total_qty)
+                };
                 entry.quantity = total_qty;
             }
             Some(_) => {
@@ -139,14 +141,14 @@ impl Portfolio {
                     self.realized_pnl += delta * fill.fill_quantity;
                 }
                 entry.quantity = remaining.abs();
-                entry.side = if remaining > 0.0 {
+                entry.side = if remaining > Decimal::ZERO {
                     entry.side
-                } else if remaining < 0.0 {
+                } else if remaining < Decimal::ZERO {
                     Some(fill.side)
                 } else {
                     None
                 };
-                entry.entry_price = if entry.quantity > 0.0 {
+                entry.entry_price = if entry.quantity > Decimal::ZERO {
                     Some(fill.fill_price)
                 } else {
                     None
@@ -159,7 +161,8 @@ impl Portfolio {
             }
         }
 
-        self.cash -= fill.fill_price * fill.fill_quantity * fill.side.as_i8() as f64;
+        let direction = Decimal::from(fill.side.as_i8());
+        self.cash -= fill.fill_price * fill.fill_quantity * direction;
         if let Some(fee) = fill.fee {
             self.cash -= fee;
         }
@@ -208,15 +211,15 @@ impl Portfolio {
 
     /// Signed position quantity helper (long positive, short negative).
     #[must_use]
-    pub fn signed_position_qty(&self, symbol: &str) -> f64 {
+    pub fn signed_position_qty(&self, symbol: &str) -> Quantity {
         self.positions
             .get(symbol)
             .map(|position| match position.side {
                 Some(Side::Buy) => position.quantity,
                 Some(Side::Sell) => -position.quantity,
-                None => 0.0,
+                None => Decimal::ZERO,
             })
-            .unwrap_or(0.0)
+            .unwrap_or(Decimal::ZERO)
     }
 
     /// Whether the portfolio currently allows only exposure-reducing orders.
@@ -243,18 +246,16 @@ impl Portfolio {
     pub fn from_state(state: PortfolioState, config: PortfolioConfig) -> Self {
         let drawdown_limit = config
             .max_drawdown
-            .or(state.drawdown_limit)
-            .filter(|value| value.is_finite() && *value > 0.0);
+            .filter(|value| *value > Decimal::ZERO)
+            .or(state.drawdown_limit);
+        let peak_against_state = cmp::max(state.peak_equity, state.initial_equity);
         let mut portfolio = Self {
             positions: state.positions,
             cash: state.cash,
             realized_pnl: state.realized_pnl,
             initial_equity: state.initial_equity,
             drawdown_limit,
-            peak_equity: state
-                .peak_equity
-                .max(state.initial_equity)
-                .max(config.initial_equity),
+            peak_equity: cmp::max(peak_against_state, config.initial_equity),
             liquidate_only: state.liquidate_only,
         };
         portfolio.update_drawdown_state();
@@ -278,7 +279,7 @@ impl Portfolio {
             self.peak_equity = equity;
         }
         if let Some(limit) = self.drawdown_limit {
-            if self.peak_equity > 0.0 {
+            if self.peak_equity > Decimal::ZERO {
                 let drawdown = (self.peak_equity - equity) / self.peak_equity;
                 if drawdown >= limit {
                     self.liquidate_only = true;
@@ -295,7 +296,7 @@ pub struct PortfolioState {
     pub cash: Price,
     pub realized_pnl: Price,
     pub initial_equity: Price,
-    pub drawdown_limit: Option<f64>,
+    pub drawdown_limit: Option<Decimal>,
     pub peak_equity: Price,
     pub liquidate_only: bool,
 }
@@ -305,7 +306,7 @@ pub struct PortfolioState {
 pub struct LiveState {
     pub portfolio: Option<PortfolioState>,
     pub open_orders: Vec<Order>,
-    pub last_prices: HashMap<String, f64>,
+    pub last_prices: HashMap<String, Price>,
     pub last_candle_ts: Option<DateTime<Utc>>,
 }
 
@@ -407,7 +408,7 @@ mod tests {
     use chrono::Utc;
     use tesser_core::{Side, Symbol};
 
-    fn sample_fill(side: Side, price: Price, qty: f64) -> Fill {
+    fn sample_fill(side: Side, price: Price, qty: Quantity) -> Fill {
         Fill {
             order_id: uuid::Uuid::new_v4().to_string(),
             symbol: Symbol::from("BTCUSDT"),
@@ -422,8 +423,8 @@ mod tests {
     #[test]
     fn portfolio_updates_equity() {
         let mut portfolio = Portfolio::new(PortfolioConfig::default());
-        let buy = sample_fill(Side::Buy, 50_000.0, 0.1);
+        let buy = sample_fill(Side::Buy, Decimal::from(50_000), Decimal::new(1, 1));
         portfolio.apply_fill(&buy).unwrap();
-        assert!(portfolio.cash() < 10_000.0);
+        assert!(portfolio.cash() < Decimal::from(10_000));
     }
 }

@@ -19,3 +19,4 @@ tesser-portfolio = { path = "../tesser-portfolio" }
 tesser-strategy = { path = "../tesser-strategy" }
 tesser-paper = { path = "../connectors/tesser-paper" }
 itertools = "0.13"
+rust_decimal.workspace = true

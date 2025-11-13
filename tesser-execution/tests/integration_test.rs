@@ -1,4 +1,5 @@
 use chrono::Duration;
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tesser_core::{ExecutionHint, Signal, SignalKind};
@@ -16,7 +17,7 @@ async fn test_twap_algorithm_basic() {
     // Create TWAP algorithm directly with very short duration for testing
     let mut twap = TwapAlgorithm::new(
         signal.clone(),
-        1.0,                  // total quantity
+        Decimal::ONE,         // total quantity
         Duration::seconds(2), // Very short duration
         2,                    // Only 2 slices for simplicity
     )
@@ -35,7 +36,7 @@ async fn test_twap_algorithm_basic() {
     // Trigger timer event to get first slice
     let orders = twap.on_timer().unwrap();
     assert_eq!(orders.len(), 1);
-    assert_eq!(orders[0].order_request.quantity, 0.5); // 1.0 / 2 slices
+    assert_eq!(orders[0].order_request.quantity, Decimal::new(5, 1)); // 0.5
 
     // Wait for the next slice interval (1 second for 2 slices over 2 seconds)
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -44,7 +45,7 @@ async fn test_twap_algorithm_basic() {
     // the second slice gets all remaining quantity
     let orders = twap.on_timer().unwrap();
     assert_eq!(orders.len(), 1);
-    assert_eq!(orders[0].order_request.quantity, 1.0); // All remaining quantity
+    assert_eq!(orders[0].order_request.quantity, Decimal::ONE); // All remaining quantity
 
     // After all slices are executed, no more orders should be generated
     let orders = twap.on_timer().unwrap();
@@ -59,7 +60,9 @@ async fn test_orchestrator_integration() {
 
     // Create execution engine with paper client
     let client = Arc::new(PaperExecutionClient::default());
-    let sizer = Box::new(FixedOrderSizer { quantity: 1.0 });
+    let sizer = Box::new(FixedOrderSizer {
+        quantity: Decimal::ONE,
+    });
     let risk_checker = Arc::new(NoopRiskChecker);
     let execution_engine = Arc::new(ExecutionEngine::new(client, sizer, risk_checker));
 
@@ -78,9 +81,9 @@ async fn test_orchestrator_integration() {
         });
 
     let ctx = RiskContext {
-        signed_position_qty: 0.0,
-        portfolio_equity: 10000.0,
-        last_price: 50000.0,
+        signed_position_qty: Decimal::ZERO,
+        portfolio_equity: Decimal::from(10_000),
+        last_price: Decimal::from(50_000),
         liquidate_only: false,
     };
 
@@ -100,7 +103,7 @@ async fn test_orchestrator_integration() {
 #[test]
 fn test_twap_state_persistence() {
     let signal = Signal::new("BTCUSDT", SignalKind::EnterLong, 0.8);
-    let twap = TwapAlgorithm::new(signal, 1.0, Duration::minutes(5), 5).unwrap();
+    let twap = TwapAlgorithm::new(signal, Decimal::ONE, Duration::minutes(5), 5).unwrap();
 
     // Serialize state
     let state = twap.state();

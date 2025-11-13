@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tesser-core = { path = "../tesser-core" }
+rust_decimal.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true

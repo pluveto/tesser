@@ -22,3 +22,4 @@ hmac.workspace = true
 sha2.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true
+rust_decimal.workspace = true

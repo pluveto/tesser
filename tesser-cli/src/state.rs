@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use chrono::SecondsFormat;
+use rust_decimal::Decimal;
 use serde_json::to_string_pretty;
 use tesser_core::Side;
 use tesser_portfolio::{LiveState, PortfolioState, SqliteStateRepository, StateRepository};
@@ -69,7 +70,7 @@ fn print_summary(path: &Path, state: &LiveState) {
         let mut entries: Vec<_> = state.last_prices.iter().collect();
         entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
         for (symbol, price) in entries.into_iter().take(MAX_PRICE_ROWS) {
-            println!("  {symbol}: {price:.6}");
+            println!("  {symbol}: {price}");
         }
         if state.last_prices.len() > MAX_PRICE_ROWS {
             println!(
@@ -87,7 +88,7 @@ fn print_portfolio(portfolio: &PortfolioState) {
             .positions
             .values()
             .map(|pos| pos.unrealized_pnl)
-            .sum::<f64>();
+            .sum::<Decimal>();
     println!("Portfolio snapshot:");
     println!("  Cash: {:.2}", portfolio.cash);
     println!("  Realized PnL: {:.2}", portfolio.realized_pnl);
@@ -97,7 +98,7 @@ fn print_portfolio(portfolio: &PortfolioState) {
         portfolio.peak_equity, portfolio.liquidate_only
     );
     if let Some(limit) = portfolio.drawdown_limit {
-        println!("  Drawdown limit: {:.2}%", limit * 100.0);
+        println!("  Drawdown limit: {:.2}%", limit * Decimal::from(100));
     }
 
     if portfolio.positions.is_empty() {

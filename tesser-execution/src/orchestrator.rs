@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Duration;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use crate::algorithm::{
 };
 use crate::repository::AlgoStateRepository;
 use crate::{ExecutionEngine, RiskContext};
-use tesser_core::{ExecutionHint, Fill, Order, Signal, Tick};
+use tesser_core::{ExecutionHint, Fill, Order, Quantity, Signal, Tick};
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
 type OrderToAlgoMap = HashMap<String, Uuid>;
@@ -194,7 +195,7 @@ impl OrderOrchestrator {
                 .sizer()
                 .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
 
-        if total_quantity <= 0.0 {
+        if total_quantity <= Decimal::ZERO {
             tracing::warn!("TWAP order size is zero, skipping");
             return Ok(());
         }
@@ -209,7 +210,7 @@ impl OrderOrchestrator {
 
         tracing::info!(
             id = %algo_id,
-            total_qty = total_quantity,
+            total_qty = %total_quantity,
             duration_mins = duration.num_minutes(),
             slices = num_slices,
             "Starting new TWAP algorithm"
@@ -239,7 +240,7 @@ impl OrderOrchestrator {
         &self,
         signal: Signal,
         duration: Duration,
-        participation_rate: Option<f64>,
+        participation_rate: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
         self.update_risk_context(signal.symbol.clone(), *ctx);
@@ -247,16 +248,15 @@ impl OrderOrchestrator {
             self.execution_engine
                 .sizer()
                 .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
-        if total_quantity <= 0.0 {
+        if total_quantity <= Decimal::ZERO {
             tracing::warn!("VWAP order size is zero, skipping");
             return Ok(());
         }
-
         let mut algo = VwapAlgorithm::new(signal, total_quantity, duration, participation_rate)?;
         let algo_id = *algo.id();
         tracing::info!(
             id = %algo_id,
-            qty = total_quantity,
+            qty = %total_quantity,
             duration_mins = duration.num_minutes(),
             participation = ?participation_rate,
             "Starting new VWAP algorithm"
@@ -277,8 +277,8 @@ impl OrderOrchestrator {
     async fn handle_iceberg_signal(
         &self,
         signal: Signal,
-        display_size: f64,
-        limit_offset_bps: Option<f64>,
+        display_size: Quantity,
+        limit_offset_bps: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
         self.update_risk_context(signal.symbol.clone(), *ctx);
@@ -286,18 +286,18 @@ impl OrderOrchestrator {
             self.execution_engine
                 .sizer()
                 .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
-        if total_quantity <= 0.0 {
+        if total_quantity <= Decimal::ZERO {
             tracing::warn!("Iceberg order size is zero, skipping");
             return Ok(());
         }
-        let limit_price = if ctx.last_price > 0.0 {
+        let limit_price = if ctx.last_price > Decimal::ZERO {
             ctx.last_price
         } else {
             tracing::warn!(
                 "last price unavailable for iceberg order; defaulting to 1.0 for {}",
                 signal.symbol
             );
-            1.0
+            Decimal::ONE
         };
 
         let mut algo = IcebergAlgorithm::new(
@@ -310,8 +310,8 @@ impl OrderOrchestrator {
         let algo_id = *algo.id();
         tracing::info!(
             id = %algo_id,
-            qty = total_quantity,
-            display = display_size,
+            qty = %total_quantity,
+            display = %display_size,
             "Starting new Iceberg algorithm"
         );
 
@@ -383,7 +383,7 @@ impl OrderOrchestrator {
         tracing::debug!(
             algo_id = %algo_id,
             order_id = %fill.order_id,
-            fill_qty = fill.fill_quantity,
+            fill_qty = %fill.fill_quantity,
             "Routing fill to algorithm"
         );
 

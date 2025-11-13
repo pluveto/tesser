@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
+use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use sha2::Sha256;
 use tesser_broker::{BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult, ExecutionClient};
 use tesser_core::{
-    AccountBalance, Fill, Order, OrderRequest, OrderStatus, Position, Side, TimeInForce,
+    AccountBalance, Fill, Order, OrderRequest, OrderStatus, Position, Quantity, Side, TimeInForce,
 };
 use tracing::warn;
 
@@ -219,8 +220,8 @@ impl BybitClient {
         }
     }
 
-    fn qty_string(qty: f64) -> String {
-        format!("{}", qty)
+    fn qty_string(qty: Quantity) -> String {
+        qty.normalize().to_string()
     }
 
     pub(crate) fn map_order_status(status: &str) -> OrderStatus {
@@ -268,15 +269,15 @@ impl BybitClient {
                 if item.exec_qty.is_empty() {
                     continue;
                 }
-                let exec_qty: f64 = item.exec_qty.parse().unwrap_or(0.0);
-                if exec_qty == 0.0 {
+                let exec_qty: Decimal = item.exec_qty.parse().unwrap_or(Decimal::ZERO);
+                if exec_qty.is_zero() {
                     continue;
                 }
-                let price: f64 = item.exec_price.parse().unwrap_or(0.0);
-                let fee: Option<f64> = if item.exec_fee.is_empty() {
+                let price: Decimal = item.exec_price.parse().unwrap_or(Decimal::ZERO);
+                let fee: Option<Decimal> = if item.exec_fee.is_empty() {
                     None
                 } else {
-                    item.exec_fee.parse().ok()
+                    item.exec_fee.parse::<Decimal>().ok()
                 };
                 let ts = millis_to_datetime(&item.exec_time);
                 let side = match item.side.as_str() {
@@ -344,7 +345,7 @@ impl ExecutionClient for BybitClient {
             id: resp.result.order_id,
             request,
             status: OrderStatus::PendingNew,
-            filled_quantity: 0.0,
+            filled_quantity: Decimal::ZERO,
             avg_fill_price: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -391,12 +392,12 @@ impl ExecutionClient for BybitClient {
                     } else {
                         tesser_core::OrderType::Limit
                     },
-                    quantity: item.qty.parse().unwrap_or(0.0),
-                    price: item.price.parse().ok(),
+                    quantity: item.qty.parse().unwrap_or(Decimal::ZERO),
+                    price: item.price.parse::<Decimal>().ok(),
                     trigger_price: item
                         .trigger_price
                         .as_deref()
-                        .and_then(|value| value.parse().ok()),
+                        .and_then(|value| value.parse::<Decimal>().ok()),
                     time_in_force: None,
                     client_order_id: Some(item.order_link_id),
                     take_profit: None,
@@ -404,8 +405,8 @@ impl ExecutionClient for BybitClient {
                     display_quantity: None,
                 },
                 status: Self::map_order_status(&item.order_status),
-                filled_quantity: item.cum_exec_qty.parse().unwrap_or(0.0),
-                avg_fill_price: item.avg_price.parse().ok(),
+                filled_quantity: item.cum_exec_qty.parse().unwrap_or(Decimal::ZERO),
+                avg_fill_price: item.avg_price.parse::<Decimal>().ok(),
                 created_at: millis_to_datetime(&item.created_time),
                 updated_at: millis_to_datetime(&item.updated_time),
             })
@@ -426,13 +427,13 @@ impl ExecutionClient for BybitClient {
         let mut balances = Vec::new();
         for account in resp.result.list {
             for coin in account.coin {
-                let total = coin.wallet_balance.parse().unwrap_or(0.0);
+                let total = coin.wallet_balance.parse().unwrap_or(Decimal::ZERO);
                 let available = coin
                     .available_to_withdraw
                     .as_deref()
                     .unwrap_or("0")
                     .parse()
-                    .unwrap_or(0.0);
+                    .unwrap_or(Decimal::ZERO);
                 balances.push(AccountBalance {
                     currency: coin.coin,
                     total,
@@ -451,14 +452,14 @@ impl ExecutionClient for BybitClient {
             .await?;
         let mut positions = Vec::new();
         for item in resp.result.list {
-            let quantity = item
+            let quantity: Decimal = item
                 .size
-                .parse::<f64>()
+                .parse()
                 .map_err(|err| BrokerError::from_display(err, BrokerErrorKind::Serialization))?;
-            if quantity.abs() < f64::EPSILON {
+            if quantity.is_zero() {
                 continue;
             }
-            let entry_price = item.avg_price.parse::<f64>().ok();
+            let entry_price = item.avg_price.parse().ok();
             positions.push(Position {
                 symbol: item.symbol,
                 side: match item.side.as_str() {
@@ -468,7 +469,7 @@ impl ExecutionClient for BybitClient {
                 },
                 quantity,
                 entry_price,
-                unrealized_pnl: item.unrealised_pnl.parse::<f64>().unwrap_or(0.0),
+                unrealized_pnl: item.unrealised_pnl.parse().unwrap_or(Decimal::ZERO),
                 updated_at: millis_to_datetime(&item.updated_time),
             });
         }

@@ -3,6 +3,7 @@ use std::fmt;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use tesser_core::{Fill, Side};
 
 const TRADING_DAYS_PER_YEAR: f64 = 252.0;
@@ -10,7 +11,7 @@ const RISK_FREE_RATE: f64 = 0.0;
 
 #[derive(Debug)]
 struct Trade {
-    pnl: f64,
+    pnl: Decimal,
     is_win: bool,
 }
 
@@ -58,15 +59,15 @@ impl fmt::Display for PerformanceReport {
 }
 
 pub struct Reporter {
-    initial_equity: f64,
-    equity_curve: Vec<(DateTime<Utc>, f64)>,
+    initial_equity: Decimal,
+    equity_curve: Vec<(DateTime<Utc>, Decimal)>,
     fills: Vec<Fill>,
 }
 
 impl Reporter {
     pub fn new(
-        initial_equity: f64,
-        equity_curve: Vec<(DateTime<Utc>, f64)>,
+        initial_equity: Decimal,
+        equity_curve: Vec<(DateTime<Utc>, Decimal)>,
         fills: Vec<Fill>,
     ) -> Self {
         Self {
@@ -81,11 +82,12 @@ impl Reporter {
             return Err(anyhow!("not enough data points to generate a report"));
         }
 
-        let daily_returns = self.calculate_daily_returns();
+        let daily_returns = self.calculate_daily_returns()?;
         let years = self.duration_years();
 
-        let total_return_pct =
-            (self.equity_curve.last().unwrap().1 / self.initial_equity - 1.0) * 100.0;
+        let ending_equity = self.equity_curve.last().unwrap().1;
+        let total_return = (ending_equity / self.initial_equity) - Decimal::ONE;
+        let total_return_pct = decimal_to_f64(total_return, "total return")? * 100.0;
         let annualized_return_pct = if years > 0.0 {
             ((1.0 + total_return_pct / 100.0).powf(1.0 / years) - 1.0) * 100.0
         } else {
@@ -93,7 +95,8 @@ impl Reporter {
         };
 
         let (sharpe_ratio, sortino_ratio) = self.calculate_risk_ratios(&daily_returns);
-        let max_drawdown_pct = self.calculate_max_drawdown() * 100.0;
+        let max_drawdown = self.calculate_max_drawdown();
+        let max_drawdown_pct = decimal_to_f64(max_drawdown, "max drawdown")? * 100.0;
         let calmar_ratio = if max_drawdown_pct.abs() > 0.01 {
             annualized_return_pct / max_drawdown_pct.abs()
         } else {
@@ -109,23 +112,25 @@ impl Reporter {
             0.0
         };
 
-        let total_win_pnl: f64 = trades.iter().filter(|t| t.is_win).map(|t| t.pnl).sum();
-        let total_loss_pnl: f64 = trades.iter().filter(|t| !t.is_win).map(|t| t.pnl).sum();
+        let total_win_pnl: Decimal = trades.iter().filter(|t| t.is_win).map(|t| t.pnl).sum();
+        let total_loss_pnl: Decimal = trades.iter().filter(|t| !t.is_win).map(|t| t.pnl).sum();
         let losses = total_trades - wins;
 
         let avg_win_pct = if wins > 0 {
-            total_win_pnl / wins as f64
+            total_win_pnl / Decimal::from(wins as i64)
         } else {
-            0.0
+            Decimal::ZERO
         };
         let avg_loss_pct = if losses > 0 {
-            total_loss_pnl / losses as f64
+            total_loss_pnl / Decimal::from(losses as i64)
         } else {
-            0.0
+            Decimal::ZERO
         };
 
-        let profit_loss_ratio = if avg_loss_pct.abs() > 1e-9 {
-            -avg_win_pct / avg_loss_pct
+        let avg_win_pct_f64 = decimal_to_f64(avg_win_pct, "avg win pct")? * 100.0;
+        let avg_loss_pct_f64 = decimal_to_f64(avg_loss_pct, "avg loss pct")? * 100.0;
+        let profit_loss_ratio = if avg_loss_pct.abs() > Decimal::ZERO {
+            decimal_to_f64(-(avg_win_pct / avg_loss_pct), "profit/loss ratio")?
         } else {
             f64::INFINITY
         };
@@ -139,24 +144,31 @@ impl Reporter {
             calmar_ratio,
             total_trades,
             win_rate_pct,
-            avg_win_pct: avg_win_pct * 100.0,
-            avg_loss_pct: avg_loss_pct * 100.0,
+            avg_win_pct: avg_win_pct_f64,
+            avg_loss_pct: avg_loss_pct_f64,
             profit_loss_ratio,
-            ending_equity: self.equity_curve.last().unwrap().1,
+            ending_equity: decimal_to_f64(ending_equity, "ending equity")?,
         })
     }
 
-    fn calculate_daily_returns(&self) -> Vec<f64> {
-        self.equity_curve
+    fn calculate_daily_returns(&self) -> Result<Vec<f64>> {
+        let closes: Vec<Decimal> = self
+            .equity_curve
             .iter()
             .chunk_by(|(ts, _)| ts.date_naive())
             .into_iter()
-            .filter_map(|(_, group)| group.last())
-            .map(|(_, equity)| *equity)
-            .collect::<Vec<_>>()
-            .windows(2)
-            .map(|w| (w[1] / w[0]) - 1.0)
-            .collect()
+            .filter_map(|(_, group)| group.last().map(|(_, equity)| *equity))
+            .collect();
+        let mut returns = Vec::new();
+        for window in closes.windows(2) {
+            let prev = decimal_to_f64(window[0], "daily equity")?;
+            let curr = decimal_to_f64(window[1], "daily equity")?;
+            if prev.abs() < f64::EPSILON {
+                continue;
+            }
+            returns.push((curr / prev) - 1.0);
+        }
+        Ok(returns)
     }
 
     fn duration_years(&self) -> f64 {
@@ -204,16 +216,18 @@ impl Reporter {
         (sharpe, sortino)
     }
 
-    fn calculate_max_drawdown(&self) -> f64 {
+    fn calculate_max_drawdown(&self) -> Decimal {
         let mut peak = self.initial_equity;
-        let mut max_drawdown = 0.0;
+        let mut max_drawdown = Decimal::ZERO;
         for &(_, equity) in &self.equity_curve {
             if equity > peak {
                 peak = equity;
             }
-            let drawdown = (peak - equity) / peak;
-            if drawdown > max_drawdown {
-                max_drawdown = drawdown;
+            if peak > Decimal::ZERO {
+                let drawdown = (peak - equity) / peak;
+                if drawdown > max_drawdown {
+                    max_drawdown = drawdown;
+                }
             }
         }
         max_drawdown
@@ -231,9 +245,13 @@ impl Reporter {
                         Side::Buy => close.fill_price - open.fill_price,
                         Side::Sell => open.fill_price - close.fill_price,
                     };
+                    if open.fill_price.is_zero() {
+                        return None;
+                    }
+                    let pnl_ratio = pnl / open.fill_price;
                     Some(Trade {
-                        pnl: pnl / open.fill_price,
-                        is_win: pnl > 0.0,
+                        pnl: pnl_ratio,
+                        is_win: pnl > Decimal::ZERO,
                     })
                 } else {
                     None
@@ -241,4 +259,10 @@ impl Reporter {
             })
             .collect()
     }
+}
+
+fn decimal_to_f64(value: Decimal, label: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .ok_or_else(|| anyhow!("{label} ({value}) is out of range for f64"))
 }

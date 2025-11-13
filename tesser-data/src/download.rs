@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tesser_core::{Candle, Interval, Symbol};
 use tracing::debug;
@@ -160,11 +161,11 @@ fn parse_entry(entry: &[String], symbol: &str, interval: Interval) -> Option<Can
     }
     let ts = entry.first()?.parse::<i64>().ok()?;
     let timestamp = DateTime::<Utc>::from_timestamp_millis(ts)?;
-    let open = entry.get(1)?.parse::<f64>().ok()?;
-    let high = entry.get(2)?.parse::<f64>().ok()?;
-    let low = entry.get(3)?.parse::<f64>().ok()?;
-    let close = entry.get(4)?.parse::<f64>().ok()?;
-    let volume = entry.get(5)?.parse::<f64>().ok()?;
+    let open = entry.get(1)?.parse::<Decimal>().ok()?;
+    let high = entry.get(2)?.parse::<Decimal>().ok()?;
+    let low = entry.get(3)?.parse::<Decimal>().ok()?;
+    let close = entry.get(4)?.parse::<Decimal>().ok()?;
+    let volume = entry.get(5)?.parse::<Decimal>().ok()?;
     Some(Candle {
         symbol: Symbol::from(symbol),
         interval,

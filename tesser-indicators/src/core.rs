@@ -26,7 +26,7 @@ impl Input for f64 {
 
 impl Input for Candle {
     fn value(&self) -> Decimal {
-        decimal_from_f64(self.close)
+        self.close
     }
 }
 
@@ -133,11 +133,11 @@ mod tests {
         let candle = Candle {
             symbol: Symbol::from("BTCUSDT"),
             interval: Interval::OneMinute,
-            open: 10.0,
-            high: 15.0,
-            low: 9.5,
-            close: 12.5,
-            volume: 100.0,
+            open: Decimal::from(10),
+            high: Decimal::from(15),
+            low: decimal_from_f64(9.5),
+            close: decimal_from_f64(12.5),
+            volume: Decimal::from(100),
             timestamp: Utc::now(),
         };
 

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 /// Root application configuration deserialized from layered sources.
@@ -27,7 +28,7 @@ pub struct AppConfig {
 #[derive(Debug, Deserialize)]
 pub struct BacktestConfig {
     #[serde(default = "default_equity")]
-    pub initial_equity: f64,
+    pub initial_equity: Decimal,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -61,17 +62,17 @@ pub struct AlertingConfig {
     #[serde(default = "default_order_failure_limit")]
     pub max_order_failures: u32,
     #[serde(default = "default_drawdown_limit")]
-    pub max_drawdown: f64,
+    pub max_drawdown: Decimal,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RiskManagementConfig {
     #[serde(default = "default_max_order_quantity")]
-    pub max_order_quantity: f64,
+    pub max_order_quantity: Decimal,
     #[serde(default = "default_max_position_quantity")]
-    pub max_position_quantity: f64,
+    pub max_position_quantity: Decimal,
     #[serde(default = "default_risk_drawdown_limit")]
-    pub max_drawdown: f64,
+    pub max_drawdown: Decimal,
 }
 
 impl Default for BacktestConfig {
@@ -122,8 +123,8 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_equity() -> f64 {
-    10_000.0
+fn default_equity() -> Decimal {
+    Decimal::new(10_000, 0)
 }
 
 fn default_state_path() -> PathBuf {
@@ -146,20 +147,20 @@ fn default_order_failure_limit() -> u32 {
     3
 }
 
-fn default_drawdown_limit() -> f64 {
-    0.03
+fn default_drawdown_limit() -> Decimal {
+    Decimal::new(3, 2)
 }
 
-fn default_max_order_quantity() -> f64 {
-    1.0
+fn default_max_order_quantity() -> Decimal {
+    Decimal::ONE
 }
 
-fn default_max_position_quantity() -> f64 {
-    2.0
+fn default_max_position_quantity() -> Decimal {
+    Decimal::from(2u8)
 }
 
-fn default_risk_drawdown_limit() -> f64 {
-    0.05
+fn default_risk_drawdown_limit() -> Decimal {
+    Decimal::new(5, 2)
 }
 
 /// Loads configuration by merging files and environment variables.

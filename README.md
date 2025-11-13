@@ -138,26 +138,23 @@ tesser/
 
 ### Example: Running a Backtest
 
-1.  Generate a strategy parameter file (see the `research/` section below). Example `research/strategies/sma_cross_optimal.toml`:
-    ```toml
-    strategy_name = "SmaCross"
+The repository now ships with a minimal end-to-end bundle under `examples/`:
 
-    [params]
-    symbol = "BTCUSDT"
-    fast_period = 12
-    slow_period = 30
-    min_samples = 40
-    ```
-2.  Run a mock backtest with the CLI:
-    ```sh
-    cargo run -p tesser-cli -- \
-        backtest run \
-        --strategy-config research/strategies/sma_cross_optimal.toml \
-        --data data/bybit_testnet/BTCUSDT/1m_20231201-20240201.csv \
-        --candles 500 \
-        --quantity 0.02
-    ```
-    (Omit `--data` to fall back to synthetic candles; supply one or more CSVs to replay exchange data produced by `tesser-cli data download`.)
+- `examples/data/btcusdt_1m_sample.csv` – 6h of deterministic BTCUSDT 1m candles.
+- `examples/strategies/sma_cross.toml` – double moving-average crossover tuned for the sample data.
+- `examples/strategies/rsi_reversion.toml` – RSI mean-reversion variant for the same symbol.
+
+Use them to exercise the entire pipeline without downloading external data:
+
+```sh
+cargo run -p tesser-cli -- \
+    backtest run \
+    --strategy-config examples/strategies/sma_cross.toml \
+    --data examples/data/btcusdt_1m_sample.csv \
+    --quantity 0.01
+```
+
+Swap in `examples/strategies/rsi_reversion.toml` (or any file under `research/`) to compare behaviors. Omit `--data` to fall back to synthetic candles, or add multiple CSV paths to stitch larger datasets.
 
 ### CLI Overview
 

@@ -1,18 +1,18 @@
 //! Fundamental data types shared across the entire workspace.
 
-use ordered_float::OrderedFloat;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Alias for price precision.
-pub type Price = f64;
+pub type Price = Decimal;
 /// Alias for quantity precision.
-pub type Quantity = f64;
+pub type Quantity = Decimal;
 /// Alias used for human-readable market symbols (e.g., `BTCUSDT`).
 pub type Symbol = String;
 
@@ -28,13 +28,13 @@ pub enum ExecutionHint {
     Vwap {
         duration: Duration,
         #[serde(default)]
-        participation_rate: Option<f64>,
+        participation_rate: Option<Decimal>,
     },
     /// Iceberg order (simulated in software).
     IcebergSimulated {
         display_size: Quantity,
         #[serde(default)]
-        limit_offset_bps: Option<f64>,
+        limit_offset_bps: Option<Decimal>,
     },
 }
 
@@ -200,12 +200,12 @@ impl OrderBook {
 
     /// Calculates bid/ask imbalance for the top `depth` levels.
     #[must_use]
-    pub fn imbalance(&self, depth: usize) -> Option<f64> {
+    pub fn imbalance(&self, depth: usize) -> Option<Decimal> {
         let depth = depth.max(1);
-        let bid_vol: f64 = self.bids.iter().take(depth).map(|level| level.size).sum();
-        let ask_vol: f64 = self.asks.iter().take(depth).map(|level| level.size).sum();
+        let bid_vol: Decimal = self.bids.iter().take(depth).map(|level| level.size).sum();
+        let ask_vol: Decimal = self.asks.iter().take(depth).map(|level| level.size).sum();
         let denom = bid_vol + ask_vol;
-        if denom.abs() < f64::EPSILON {
+        if denom.is_zero() {
             None
         } else {
             Some((bid_vol - ask_vol) / denom)
@@ -225,8 +225,8 @@ pub struct DepthUpdate {
 /// Local view of an order book backed by sorted price levels.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LocalOrderBook {
-    bids: BTreeMap<Reverse<OrderedFloat<Price>>, Quantity>,
-    asks: BTreeMap<OrderedFloat<Price>, Quantity>,
+    bids: BTreeMap<Reverse<Price>, Quantity>,
+    asks: BTreeMap<Price, Quantity>,
 }
 
 impl LocalOrderBook {
@@ -250,17 +250,17 @@ impl LocalOrderBook {
 
     /// Insert or update a price level.
     pub fn add_order(&mut self, side: Side, price: Price, quantity: Quantity) {
-        if quantity <= 0.0 {
+        if quantity <= Decimal::ZERO {
             return;
         }
         match side {
             Side::Buy => {
-                let key = Reverse(OrderedFloat(price));
-                let entry = self.bids.entry(key).or_insert(0.0);
+                let key = Reverse(price);
+                let entry = self.bids.entry(key).or_insert(Decimal::ZERO);
                 *entry += quantity;
             }
             Side::Sell => {
-                let entry = self.asks.entry(OrderedFloat(price)).or_insert(0.0);
+                let entry = self.asks.entry(price).or_insert(Decimal::ZERO);
                 *entry += quantity;
             }
         }
@@ -268,26 +268,24 @@ impl LocalOrderBook {
 
     /// Remove quantity from a price level, deleting the level when depleted.
     pub fn remove_order(&mut self, side: Side, price: Price, quantity: Quantity) {
-        if quantity <= 0.0 {
+        if quantity <= Decimal::ZERO {
             return;
         }
-        let eps = f64::EPSILON;
         match side {
             Side::Buy => {
-                let key = Reverse(OrderedFloat(price));
+                let key = Reverse(price);
                 if let Some(level) = self.bids.get_mut(&key) {
                     *level -= quantity;
-                    if level.abs() <= eps || *level <= 0.0 {
+                    if *level <= Decimal::ZERO {
                         self.bids.remove(&key);
                     }
                 }
             }
             Side::Sell => {
-                let key = OrderedFloat(price);
-                if let Some(level) = self.asks.get_mut(&key) {
+                if let Some(level) = self.asks.get_mut(&price) {
                     *level -= quantity;
-                    if level.abs() <= eps || *level <= 0.0 {
-                        self.asks.remove(&key);
+                    if *level <= Decimal::ZERO {
+                        self.asks.remove(&price);
                     }
                 }
             }
@@ -298,10 +296,10 @@ impl LocalOrderBook {
     pub fn clear_level(&mut self, side: Side, price: Price) {
         match side {
             Side::Buy => {
-                self.bids.remove(&Reverse(OrderedFloat(price)));
+                self.bids.remove(&Reverse(price));
             }
             Side::Sell => {
-                self.asks.remove(&OrderedFloat(price));
+                self.asks.remove(&price);
             }
         }
     }
@@ -309,33 +307,23 @@ impl LocalOrderBook {
     /// Best bid price/quantity currently stored.
     #[must_use]
     pub fn best_bid(&self) -> Option<(Price, Quantity)> {
-        self.bids
-            .iter()
-            .next()
-            .map(|(price, qty)| (price.0.into_inner(), *qty))
+        self.bids.iter().next().map(|(price, qty)| (price.0, *qty))
     }
 
     /// Best ask price/quantity currently stored.
     #[must_use]
     pub fn best_ask(&self) -> Option<(Price, Quantity)> {
-        self.asks
-            .iter()
-            .next()
-            .map(|(price, qty)| (price.into_inner(), *qty))
+        self.asks.iter().next().map(|(price, qty)| (*price, *qty))
     }
 
     /// Iterate bids in descending price order.
     pub fn bids(&self) -> impl Iterator<Item = (Price, Quantity)> + '_ {
-        self.bids
-            .iter()
-            .map(|(price, qty)| (price.0.into_inner(), *qty))
+        self.bids.iter().map(|(price, qty)| (price.0, *qty))
     }
 
     /// Iterate asks in ascending price order.
     pub fn asks(&self) -> impl Iterator<Item = (Price, Quantity)> + '_ {
-        self.asks
-            .iter()
-            .map(|(price, qty)| (price.into_inner(), *qty))
+        self.asks.iter().map(|(price, qty)| (*price, *qty))
     }
 
     /// Consume liquidity from the opposite side of an aggressive order.
@@ -345,8 +333,7 @@ impl LocalOrderBook {
         mut quantity: Quantity,
     ) -> Vec<(Price, Quantity)> {
         let mut fills = Vec::new();
-        let eps = f64::EPSILON;
-        while quantity > eps {
+        while quantity > Decimal::ZERO {
             let (price, available) = match aggressive_side {
                 Side::Buy => match self.best_ask() {
                     Some(level) => level,
@@ -535,6 +522,7 @@ impl Signal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::prelude::FromPrimitive;
 
     #[test]
     fn interval_duration_matches_definition() {
@@ -547,28 +535,44 @@ mod tests {
         let mut position = Position {
             symbol: "BTCUSDT".to_string(),
             side: Some(Side::Buy),
-            quantity: 0.5,
-            entry_price: Some(60_000.0),
-            unrealized_pnl: 0.0,
+            quantity: Decimal::from_f64(0.5).unwrap(),
+            entry_price: Some(Decimal::from(60_000)),
+            unrealized_pnl: Decimal::ZERO,
             updated_at: Utc::now(),
         };
-        position.mark_price(60_500.0);
-        assert!((position.unrealized_pnl - 250.0).abs() < f64::EPSILON);
+        position.mark_price(Decimal::from(60_500));
+        assert_eq!(position.unrealized_pnl, Decimal::from(250));
     }
 
     #[test]
     fn local_order_book_tracks_best_levels() {
         let mut lob = LocalOrderBook::new();
-        lob.add_order(Side::Buy, 10.0, 2.0);
-        lob.add_order(Side::Buy, 11.0, 1.0);
-        lob.add_order(Side::Sell, 12.0, 1.5);
-        lob.add_order(Side::Sell, 13.0, 3.0);
+        lob.add_order(Side::Buy, Decimal::from(10), Decimal::from(2));
+        lob.add_order(Side::Buy, Decimal::from(11), Decimal::from(1));
+        lob.add_order(
+            Side::Sell,
+            Decimal::from(12),
+            Decimal::from_f64(1.5).unwrap(),
+        );
+        lob.add_order(Side::Sell, Decimal::from(13), Decimal::from(3));
 
-        assert_eq!(lob.best_bid(), Some((11.0, 1.0)));
-        assert_eq!(lob.best_ask(), Some((12.0, 1.5)));
+        assert_eq!(lob.best_bid(), Some((Decimal::from(11), Decimal::from(1))));
+        assert_eq!(
+            lob.best_ask(),
+            Some((Decimal::from(12), Decimal::from_f64(1.5).unwrap()))
+        );
 
-        let fills = lob.take_liquidity(Side::Buy, 2.0);
-        assert_eq!(fills, vec![(12.0, 1.5), (13.0, 0.5)]);
-        assert_eq!(lob.best_ask(), Some((13.0, 2.5)));
+        let fills = lob.take_liquidity(Side::Buy, Decimal::from(2));
+        assert_eq!(
+            fills,
+            vec![
+                (Decimal::from(12), Decimal::from_f64(1.5).unwrap()),
+                (Decimal::from(13), Decimal::from_f64(0.5).unwrap())
+            ]
+        );
+        assert_eq!(
+            lob.best_ask(),
+            Some((Decimal::from(13), Decimal::from_f64(2.5).unwrap()))
+        );
     }
 }

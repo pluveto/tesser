@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient, MarketStream};
 use tesser_core::{
     AccountBalance, Candle, DepthUpdate, Fill, LocalOrderBook, Order, OrderBook, OrderId,
@@ -28,19 +29,29 @@ pub struct PaperExecutionClient {
     /// Latest market prices for each symbol
     last_prices: Arc<Mutex<HashMap<Symbol, Price>>>,
     /// Simulation parameters
-    slippage_bps: f64,
-    fee_bps: f64,
+    slippage_bps: Decimal,
+    fee_bps: Decimal,
 }
 
 impl Default for PaperExecutionClient {
     fn default() -> Self {
-        Self::new("paper".into(), vec!["BTCUSDT".into()], 0.0, 0.0)
+        Self::new(
+            "paper".into(),
+            vec!["BTCUSDT".into()],
+            Decimal::ZERO,
+            Decimal::ZERO,
+        )
     }
 }
 
 impl PaperExecutionClient {
     /// Create a new paper execution client configurable with instrument metadata.
-    pub fn new(name: String, markets: Vec<String>, slippage_bps: f64, fee_bps: f64) -> Self {
+    pub fn new(
+        name: String,
+        markets: Vec<String>,
+        slippage_bps: Decimal,
+        fee_bps: Decimal,
+    ) -> Self {
         Self {
             info: BrokerInfo {
                 name,
@@ -50,8 +61,8 @@ impl PaperExecutionClient {
             orders: Arc::new(AsyncMutex::new(Vec::new())),
             balances: Arc::new(AsyncMutex::new(vec![AccountBalance {
                 currency: "USDT".into(),
-                total: 10_000.0,
-                available: 10_000.0,
+                total: Decimal::from(10_000),
+                available: Decimal::from(10_000),
                 updated_at: Utc::now(),
             }])),
             positions: Arc::new(AsyncMutex::new(Vec::new())),
@@ -75,8 +86,8 @@ impl PaperExecutionClient {
         fill_price: Price,
         timestamp: DateTime<Utc>,
     ) -> Fill {
-        let fee = if self.fee_bps > 0.0 {
-            let fee_rate = self.fee_bps / 10_000.0;
+        let fee = if self.fee_bps > Decimal::ZERO {
+            let fee_rate = (self.fee_bps.max(Decimal::ZERO)) / Decimal::from(10_000);
             Some(fill_price.abs() * order.request.quantity.abs() * fee_rate)
         } else {
             None
@@ -103,6 +114,7 @@ impl PaperExecutionClient {
         };
 
         // Determine the base fill price
+        let fallback_price = Decimal::ONE;
         let base_price = match request.order_type {
             tesser_core::OrderType::Market => {
                 // For market orders, use the last known market price or fallback to request price
@@ -111,7 +123,7 @@ impl PaperExecutionClient {
                         symbol = %request.symbol,
                         "No market price available for market order, using fallback price of 1.0"
                     );
-                    1.0 // Emergency fallback
+                    fallback_price
                 })
             }
             tesser_core::OrderType::Limit | tesser_core::OrderType::StopMarket => {
@@ -121,17 +133,21 @@ impl PaperExecutionClient {
                         symbol = %request.symbol,
                         "No price specified for limit/stop order, using fallback price of 1.0"
                     );
-                    1.0 // Emergency fallback
+                    fallback_price
                 })
             }
         };
 
         // Apply slippage
-        let slippage_rate = self.slippage_bps / 10_000.0;
-        let fill_price = if slippage_rate > 0.0 {
+        let slippage_rate = if self.slippage_bps > Decimal::ZERO {
+            Some((self.slippage_bps.max(Decimal::ZERO)) / Decimal::from(10_000))
+        } else {
+            None
+        };
+        let fill_price = if let Some(rate) = slippage_rate {
             match request.side {
-                Side::Buy => base_price * (1.0 + slippage_rate), // Buy at higher price
-                Side::Sell => base_price * (1.0 - slippage_rate), // Sell at lower price
+                Side::Buy => base_price * (Decimal::ONE + rate), // Buy at higher price
+                Side::Sell => base_price * (Decimal::ONE - rate), // Sell at lower price
             }
         } else {
             base_price
@@ -268,7 +284,7 @@ impl ExecutionClient for MatchingEngine {
             id: Uuid::new_v4().to_string(),
             request: request.clone(),
             status: OrderStatus::PendingNew,
-            filled_quantity: 0.0,
+            filled_quantity: Decimal::ZERO,
             avg_fill_price: None,
             created_at: now,
             updated_at: now,
@@ -309,11 +325,7 @@ impl ExecutionClient for MatchingEngine {
         let mut open = self.open_orders.lock().await;
         if let Some(resting) = open.remove(&order_id) {
             let mut book = self.resting_depth.lock().unwrap();
-            book.remove_order(
-                resting.order.request.side,
-                resting.price,
-                resting.remaining.max(f64::EPSILON),
-            );
+            book.remove_order(resting.order.request.side, resting.price, resting.remaining);
             Ok(())
         } else {
             Err(BrokerError::InvalidRequest(format!(
@@ -413,7 +425,7 @@ impl MatchingEngine {
     pub fn upsert_market_level(&self, side: Side, price: Price, quantity: Quantity) {
         let mut depth = self.market_depth.lock().unwrap();
         depth.clear_level(side, price);
-        if quantity > 0.0 {
+        if quantity > Decimal::ZERO {
             depth.add_order(side, price, quantity);
         }
     }
@@ -421,7 +433,7 @@ impl MatchingEngine {
     /// Update the resting book maintained for our own limit orders (used when backfills occur).
     pub fn force_resting_level(&self, side: Side, price: Price, quantity: Quantity) {
         let mut book = self.resting_depth.lock().unwrap();
-        if quantity <= 0.0 {
+        if quantity <= Decimal::ZERO {
             book.remove_order(side, price, quantity.abs());
         } else {
             book.add_order(side, price, quantity);
@@ -443,7 +455,7 @@ impl MatchingEngine {
     pub fn mid_price(&self) -> Option<Price> {
         let depth = self.market_depth.lock().unwrap();
         match (depth.best_bid(), depth.best_ask()) {
-            (Some((bid, _)), Some((ask, _))) => Some((bid + ask) / 2.0),
+            (Some((bid, _)), Some((ask, _))) => Some((bid + ask) / Decimal::from(2)),
             (Some((bid, _)), None) => Some(bid),
             (None, Some((ask, _))) => Some(ask),
             _ => None,
@@ -458,15 +470,14 @@ impl MatchingEngine {
         mut quantity: Quantity,
     ) -> Vec<Fill> {
         let mut generated = Vec::new();
-        let eps = f64::EPSILON;
-        if quantity <= eps {
+        if quantity <= Decimal::ZERO {
             return generated;
         }
 
         let mut open = self.open_orders.lock().await;
         let mut finished = Vec::new();
         for (order_id, resting) in open.iter_mut() {
-            if quantity <= eps {
+            if quantity <= Decimal::ZERO {
                 break;
             }
             if !Self::trade_crosses_order(aggressor_side, price, resting) {
@@ -489,18 +500,21 @@ impl MatchingEngine {
             generated.push(fill.clone());
             let prev_qty = resting.order.filled_quantity;
             resting.order.filled_quantity += trade_qty;
-            let prev_notional = resting.order.avg_fill_price.unwrap_or(0.0) * prev_qty;
+            let prev_notional = resting.order.avg_fill_price.unwrap_or(Decimal::ZERO) * prev_qty;
             let new_notional = prev_notional + price * trade_qty;
-            resting.order.avg_fill_price =
-                Some(new_notional / resting.order.filled_quantity.max(f64::EPSILON));
+            resting.order.avg_fill_price = if resting.order.filled_quantity.is_zero() {
+                Some(price)
+            } else {
+                Some(new_notional / resting.order.filled_quantity)
+            };
             resting.order.updated_at = fill.timestamp;
-            resting.order.status = if resting.remaining <= eps {
+            resting.order.status = if resting.remaining <= Decimal::ZERO {
                 OrderStatus::Filled
             } else {
                 OrderStatus::PartiallyFilled
             };
             self.apply_fill_accounting(&fill).await;
-            if resting.remaining <= eps {
+            if resting.remaining <= Decimal::ZERO {
                 finished.push(order_id.clone());
             }
         }
@@ -567,9 +581,9 @@ impl MatchingEngine {
         let position = positions.entry(fill.symbol.clone()).or_insert(Position {
             symbol: fill.symbol.clone(),
             side: Some(fill.side),
-            quantity: 0.0,
+            quantity: Decimal::ZERO,
             entry_price: Some(fill.fill_price),
-            unrealized_pnl: 0.0,
+            unrealized_pnl: Decimal::ZERO,
             updated_at: fill.timestamp,
         });
         match position.side {
@@ -580,15 +594,19 @@ impl MatchingEngine {
                     .map(|price| price * position.quantity)
                     .unwrap_or_default();
                 let new_cost = fill.fill_price * fill.fill_quantity;
-                position.entry_price = Some((prev_cost + new_cost) / total_qty.max(f64::EPSILON));
+                position.entry_price = if total_qty.is_zero() {
+                    Some(fill.fill_price)
+                } else {
+                    Some((prev_cost + new_cost) / total_qty)
+                };
                 position.quantity = total_qty;
             }
             Some(_) => {
                 position.quantity -= fill.fill_quantity;
-                if position.quantity <= f64::EPSILON {
+                if position.quantity <= Decimal::ZERO {
                     position.side = None;
                     position.entry_price = None;
-                    position.quantity = 0.0;
+                    position.quantity = Decimal::ZERO;
                 }
             }
             None => {
@@ -624,8 +642,12 @@ impl MatchingEngine {
         let total_qty: Quantity = slices.iter().map(|(_, qty)| qty).sum();
         let notional: Price = slices.iter().map(|(price, qty)| price * qty).sum();
         order.filled_quantity = total_qty;
-        order.avg_fill_price = Some(notional / total_qty.max(f64::EPSILON));
-        order.status = if (order.request.quantity - total_qty).abs() <= f64::EPSILON {
+        order.avg_fill_price = if total_qty.is_zero() {
+            None
+        } else {
+            Some(notional / total_qty)
+        };
+        order.status = if order.request.quantity == total_qty {
             OrderStatus::Filled
         } else {
             OrderStatus::PartiallyFilled
@@ -678,17 +700,18 @@ impl ExecutionClient for PaperExecutionClient {
                 self.orders.lock().await.push(order.clone());
 
                 // Calculate fee if applicable
-                let fee = if self.fee_bps > 0.0 && order.avg_fill_price.is_some() {
-                    let fill_price = order.avg_fill_price.unwrap();
-                    let fee_rate = self.fee_bps / 10_000.0;
-                    Some(fill_price * order.request.quantity * fee_rate)
+                let fee = if self.fee_bps > Decimal::ZERO {
+                    let rate = self.fee_bps.max(Decimal::ZERO) / Decimal::from(10_000);
+                    order
+                        .avg_fill_price
+                        .map(|fill_price| fill_price * order.request.quantity.abs() * rate)
                 } else {
                     None
                 };
 
                 info!(
                     symbol = %order.request.symbol,
-                    qty = order.request.quantity,
+                    qty = %order.request.quantity,
                     price = ?order.avg_fill_price,
                     fee = ?fee,
                     side = ?order.request.side,
@@ -702,13 +725,13 @@ impl ExecutionClient for PaperExecutionClient {
                 })?;
                 let mut order = self.fill_order(&request);
                 order.status = OrderStatus::PendingNew;
-                order.filled_quantity = 0.0;
+                order.filled_quantity = Decimal::ZERO;
                 order.avg_fill_price = None;
                 self.pending_orders.lock().await.push(order.clone());
                 info!(
                     symbol = %order.request.symbol,
-                    qty = order.request.quantity,
-                    trigger = trigger_price,
+                    qty = %order.request.quantity,
+                    trigger = %trigger_price,
                     "paper conditional order placed"
                 );
                 Ok(order)
