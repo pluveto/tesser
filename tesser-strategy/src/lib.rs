@@ -7,12 +7,17 @@ pub use toml::Value;
 
 use chrono::Duration;
 use once_cell::sync::Lazy;
+use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::{Arc, RwLock};
 use tesser_core::{
     Candle, ExecutionHint, Fill, OrderBook, Position, Signal, SignalKind, Symbol, Tick,
+};
+use tesser_indicators::{
+    indicators::{BollingerBands, Rsi, Sma},
+    Indicator,
 };
 use thiserror::Error;
 
@@ -310,64 +315,12 @@ fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: &str, limit: usize)
     values
 }
 
-fn sma_series(values: &[f64], period: usize) -> StrategyResult<Vec<f64>> {
-    if period == 0 {
-        return Err(StrategyError::InvalidConfig(
-            "period must be greater than zero".into(),
-        ));
-    }
-    if values.len() < period {
-        return Err(StrategyError::NotEnoughData);
-    }
-    let mut series = Vec::with_capacity(values.len() - period + 1);
-    for window in values.windows(period) {
-        let mean = window.iter().sum::<f64>() / period as f64;
-        series.push(mean);
-    }
-    Ok(series)
-}
-
-fn bollinger_bands(values: &[f64], period: usize, std_mult: f64) -> Option<(f64, f64, f64)> {
-    if period == 0 || values.len() < period {
-        return None;
-    }
-    let window = &values[values.len() - period..];
-    let mean = window.iter().sum::<f64>() / period as f64;
-    let variance = window
-        .iter()
-        .map(|price| {
-            let diff = price - mean;
-            diff * diff
-        })
-        .sum::<f64>()
-        / period as f64;
-    let std = variance.sqrt();
-    Some((mean - std_mult * std, mean + std_mult * std, mean))
-}
-
-fn calculate_rsi(values: &[f64], period: usize) -> Option<f64> {
-    if period == 0 || values.len() < period + 1 {
-        return None;
-    }
-    let slice = &values[values.len() - (period + 1)..];
-    let mut gains = 0.0;
-    let mut losses = 0.0;
-    for window in slice.windows(2) {
-        let change = window[1] - window[0];
-        if change >= 0.0 {
-            gains += change;
-        } else {
-            losses -= change;
-        }
-    }
-    let avg_gain = gains / period as f64;
-    let avg_loss = losses / period as f64;
-    if avg_loss.abs() < f64::EPSILON {
-        Some(100.0)
-    } else {
-        let rs = avg_gain / avg_loss;
-        Some(100.0 - 100.0 / (1.0 + rs))
-    }
+fn decimal_from_f64_config(value: f64, field: &str) -> StrategyResult<Decimal> {
+    Decimal::from_f64(value).ok_or_else(|| {
+        StrategyError::InvalidConfig(format!(
+            "unable to represent {field}={value} as a high-precision decimal"
+        ))
+    })
 }
 
 fn z_score(values: &[f64]) -> Option<f64> {
@@ -431,40 +384,75 @@ impl TryFrom<toml::Value> for SmaCrossConfig {
 }
 
 /// Very small reference implementation that can be expanded later.
-#[derive(Default)]
 pub struct SmaCross {
     cfg: SmaCrossConfig,
     signals: Vec<Signal>,
+    fast_ma: Sma<f64>,
+    slow_ma: Sma<f64>,
+    fast_prev: Option<Decimal>,
+    fast_last: Option<Decimal>,
+    slow_prev: Option<Decimal>,
+    slow_last: Option<Decimal>,
+    samples: usize,
+}
+
+impl Default for SmaCross {
+    fn default() -> Self {
+        Self::new(SmaCrossConfig::default())
+    }
 }
 
 impl SmaCross {
     /// Instantiate the strategy with the provided configuration.
     pub fn new(cfg: SmaCrossConfig) -> Self {
+        let fast_ma = Sma::new(cfg.fast_period).expect("fast period must be positive");
+        let slow_ma = Sma::new(cfg.slow_period).expect("slow period must be positive");
         Self {
             cfg,
             signals: Vec::new(),
+            fast_ma,
+            slow_ma,
+            fast_prev: None,
+            fast_last: None,
+            slow_prev: None,
+            slow_last: None,
+            samples: 0,
         }
     }
 
-    fn maybe_emit_signal(&mut self, ctx: &StrategyContext) -> StrategyResult<()> {
-        let closes = collect_symbol_closes(
-            ctx.candles(),
-            &self.cfg.symbol,
-            self.cfg.min_samples.max(self.cfg.slow_period + 1),
-        );
-        if closes.len() < self.cfg.slow_period + 1 {
+    fn rebuild_indicators(&mut self) -> StrategyResult<()> {
+        self.fast_ma = Sma::new(self.cfg.fast_period)
+            .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.slow_ma = Sma::new(self.cfg.slow_period)
+            .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.fast_prev = None;
+        self.fast_last = None;
+        self.slow_prev = None;
+        self.slow_last = None;
+        self.samples = 0;
+        Ok(())
+    }
+
+    fn maybe_emit_signal(&mut self, candle: &Candle) -> StrategyResult<()> {
+        if let Some(value) = self.fast_ma.next(candle.close) {
+            self.fast_prev = self.fast_last.replace(value);
+        }
+        if let Some(value) = self.slow_ma.next(candle.close) {
+            self.slow_prev = self.slow_last.replace(value);
+        }
+        self.samples += 1;
+        if self.samples < self.cfg.min_samples {
             return Ok(());
         }
-        let fast = sma_series(&closes, self.cfg.fast_period)?;
-        let slow = sma_series(&closes, self.cfg.slow_period)?;
-        if let (Some(fast_prev), Some(slow_prev)) = (fast.first(), slow.first()) {
-            let fast_last = *fast.last().unwrap_or(fast_prev);
-            let slow_last = *slow.last().unwrap_or(slow_prev);
-            if fast_prev <= slow_prev && fast_last > slow_last {
+        if let (Some(fast_prev), Some(fast_curr), Some(slow_prev), Some(slow_curr)) = (
+            self.fast_prev,
+            self.fast_last,
+            self.slow_prev,
+            self.slow_last,
+        ) {
+            if fast_prev <= slow_prev && fast_curr > slow_curr {
                 let mut signal = Signal::new(self.cfg.symbol.clone(), SignalKind::EnterLong, 0.75);
-                if let Some(last_candle) = ctx.candles().back() {
-                    signal.stop_loss = Some(last_candle.low * 0.98);
-                }
+                signal.stop_loss = Some(candle.low * 0.98);
                 if let Some(duration_secs) = self.cfg.vwap_duration_secs.filter(|v| *v > 0) {
                     let duration = Duration::seconds(duration_secs);
                     let participation = self
@@ -477,7 +465,7 @@ impl SmaCross {
                     });
                 }
                 self.signals.push(signal);
-            } else if fast_prev >= slow_prev && fast_last < slow_last {
+            } else if fast_prev >= slow_prev && fast_curr < slow_curr {
                 self.signals.push(Signal::new(
                     self.cfg.symbol.clone(),
                     SignalKind::ExitLong,
@@ -485,6 +473,7 @@ impl SmaCross {
                 ));
             }
         }
+
         Ok(())
     }
 }
@@ -506,18 +495,18 @@ impl Strategy for SmaCross {
             ));
         }
         self.cfg = cfg;
-        Ok(())
+        self.rebuild_indicators()
     }
 
     fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
         Ok(())
     }
 
-    fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+    fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
         if candle.symbol != self.cfg.symbol {
             return Ok(());
         }
-        self.maybe_emit_signal(ctx)
+        self.maybe_emit_signal(candle)
     }
 
     fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &Fill) -> StrategyResult<()> {
@@ -554,31 +543,67 @@ impl Default for RsiReversionConfig {
     }
 }
 
-#[derive(Default)]
 pub struct RsiReversion {
     cfg: RsiReversionConfig,
     signals: Vec<Signal>,
+    rsi: Rsi<f64>,
+    oversold_level: Decimal,
+    overbought_level: Decimal,
+    samples: usize,
+}
+
+impl Default for RsiReversion {
+    fn default() -> Self {
+        Self::new(RsiReversionConfig::default())
+    }
 }
 
 impl RsiReversion {
-    fn maybe_emit_signal(&mut self, ctx: &StrategyContext) -> StrategyResult<()> {
-        let closes = collect_symbol_closes(ctx.candles(), &self.cfg.symbol, self.cfg.lookback);
-        let rsi = match calculate_rsi(&closes, self.cfg.period) {
-            Some(value) => value,
-            None => return Ok(()),
-        };
-        if rsi <= self.cfg.oversold {
-            self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
-                SignalKind::EnterLong,
-                0.8,
-            ));
-        } else if rsi >= self.cfg.overbought {
-            self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
-                SignalKind::ExitLong,
-                0.8,
-            ));
+    /// Instantiate the strategy with the provided configuration.
+    pub fn new(cfg: RsiReversionConfig) -> Self {
+        let rsi = Rsi::new(cfg.period).expect("period must be positive");
+        let oversold_level = Decimal::from_f64(cfg.oversold).expect("finite oversold");
+        let overbought_level = Decimal::from_f64(cfg.overbought).expect("finite overbought");
+        Self {
+            cfg,
+            signals: Vec::new(),
+            rsi,
+            oversold_level,
+            overbought_level,
+            samples: 0,
+        }
+    }
+
+    fn rebuild_indicator(&mut self) -> StrategyResult<()> {
+        self.rsi = Rsi::new(self.cfg.period)
+            .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.oversold_level = decimal_from_f64_config(self.cfg.oversold, "oversold threshold")?;
+        self.overbought_level =
+            decimal_from_f64_config(self.cfg.overbought, "overbought threshold")?;
+        self.samples = 0;
+        Ok(())
+    }
+
+    fn maybe_emit_signal(&mut self, candle: &Candle) -> StrategyResult<()> {
+        let value = self.rsi.next(candle.close);
+        self.samples += 1;
+        if self.samples < self.cfg.lookback {
+            return Ok(());
+        }
+        if let Some(rsi_value) = value {
+            if rsi_value <= self.oversold_level {
+                self.signals.push(Signal::new(
+                    self.cfg.symbol.clone(),
+                    SignalKind::EnterLong,
+                    0.8,
+                ));
+            } else if rsi_value >= self.overbought_level {
+                self.signals.push(Signal::new(
+                    self.cfg.symbol.clone(),
+                    SignalKind::ExitLong,
+                    0.8,
+                ));
+            }
         }
         Ok(())
     }
@@ -603,18 +628,18 @@ impl Strategy for RsiReversion {
             ));
         }
         self.cfg = cfg;
-        Ok(())
+        self.rebuild_indicator()
     }
 
     fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
         Ok(())
     }
 
-    fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+    fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
         if candle.symbol != self.cfg.symbol {
             return Ok(());
         }
-        self.maybe_emit_signal(ctx)
+        self.maybe_emit_signal(candle)
     }
 
     fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &Fill) -> StrategyResult<()> {
@@ -649,34 +674,75 @@ impl Default for BollingerBreakoutConfig {
     }
 }
 
-#[derive(Default)]
 pub struct BollingerBreakout {
     cfg: BollingerBreakoutConfig,
     signals: Vec<Signal>,
+    bands: BollingerBands<f64>,
+    std_multiplier: Decimal,
+    neutral_band: Decimal,
+    samples: usize,
+}
+
+impl Default for BollingerBreakout {
+    fn default() -> Self {
+        Self::new(BollingerBreakoutConfig::default())
+    }
 }
 
 impl BollingerBreakout {
-    fn maybe_emit_signal(&mut self, ctx: &StrategyContext) -> StrategyResult<()> {
-        let closes = collect_symbol_closes(ctx.candles(), &self.cfg.symbol, self.cfg.lookback);
-        let (lower, upper, mid) =
-            match bollinger_bands(&closes, self.cfg.period, self.cfg.std_multiplier) {
-                Some(bands) => bands,
-                None => return Ok(()),
-            };
-        let last_close = closes.last().copied().unwrap_or(mid);
-        if last_close > upper {
+    /// Instantiate the strategy with the provided configuration.
+    pub fn new(cfg: BollingerBreakoutConfig) -> Self {
+        let std_multiplier = Decimal::from_f64(cfg.std_multiplier).expect("finite multiplier");
+        let neutral_band =
+            std_multiplier * Decimal::from_f64(0.25).expect("0.25 should convert to Decimal");
+        let bands = BollingerBands::new(cfg.period, std_multiplier)
+            .expect("period and multiplier must be valid");
+        Self {
+            cfg,
+            signals: Vec::new(),
+            bands,
+            std_multiplier,
+            neutral_band,
+            samples: 0,
+        }
+    }
+
+    fn rebuild_indicator(&mut self) -> StrategyResult<()> {
+        self.std_multiplier = decimal_from_f64_config(self.cfg.std_multiplier, "std_multiplier")?;
+        self.neutral_band =
+            self.std_multiplier * Decimal::from_f64(0.25).expect("0.25 should convert");
+        self.bands = BollingerBands::new(self.cfg.period, self.std_multiplier)
+            .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.samples = 0;
+        Ok(())
+    }
+
+    fn maybe_emit_signal(&mut self, candle: &Candle) -> StrategyResult<()> {
+        let bands = match self.bands.next(candle.close) {
+            Some(value) => value,
+            None => {
+                self.samples += 1;
+                return Ok(());
+            }
+        };
+        self.samples += 1;
+        if self.samples < self.cfg.lookback {
+            return Ok(());
+        }
+        let price = decimal_from_f64_config(candle.close, "close price")?;
+        if price > bands.upper {
             self.signals.push(Signal::new(
                 self.cfg.symbol.clone(),
                 SignalKind::EnterLong,
                 0.7,
             ));
-        } else if last_close < lower {
+        } else if price < bands.lower {
             self.signals.push(Signal::new(
                 self.cfg.symbol.clone(),
                 SignalKind::EnterShort,
                 0.7,
             ));
-        } else if (last_close - mid).abs() <= (self.cfg.std_multiplier * 0.25) {
+        } else if (price - bands.middle).abs() <= self.neutral_band {
             self.signals.push(Signal::new(
                 self.cfg.symbol.clone(),
                 SignalKind::Flatten,
@@ -706,18 +772,18 @@ impl Strategy for BollingerBreakout {
             ));
         }
         self.cfg = cfg;
-        Ok(())
+        self.rebuild_indicator()
     }
 
     fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
         Ok(())
     }
 
-    fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+    fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
         if candle.symbol != self.cfg.symbol {
             return Ok(());
         }
-        self.maybe_emit_signal(ctx)
+        self.maybe_emit_signal(candle)
     }
 
     fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &Fill) -> StrategyResult<()> {
@@ -1113,16 +1179,35 @@ mod tests {
 
     #[test]
     fn rsi_handles_constant_input() {
-        let data = vec![1.0; 20];
-        assert_eq!(calculate_rsi(&data, 14), Some(100.0));
+        let mut rsi = Rsi::new(14).unwrap();
+        for _ in 0..=14 {
+            rsi.next(1.0);
+        }
+        assert_eq!(rsi.next(1.0), Some(Decimal::from(100)));
     }
 
     #[test]
     fn bollinger_band_width_decreases_with_low_vol() {
-        let mut data: Vec<f64> = (0..30).map(|i| 100.0 + (i as f64 % 3.0)).collect();
-        let (lower_high, upper_high, _) = bollinger_bands(&data, 20, 2.0).expect("bands present");
-        data.extend((0..30).map(|_| 100.0));
-        let (lower_low, upper_low, _) = bollinger_bands(&data, 20, 2.0).expect("bands present");
+        let mut high_vol = BollingerBands::new(20, Decimal::from(2)).unwrap();
+        let mut high_band = None;
+        for price in (0..30).map(|i| 100.0 + (i as f64 % 3.0)) {
+            high_band = high_vol.next(price);
+        }
+        let (lower_high, upper_high) = {
+            let bands = high_band.expect("high volatility bands present");
+            (bands.lower, bands.upper)
+        };
+
+        let mut low_vol = BollingerBands::new(20, Decimal::from(2)).unwrap();
+        let mut low_band = None;
+        for _ in 0..30 {
+            low_band = low_vol.next(100.0);
+        }
+        let (lower_low, upper_low) = {
+            let bands = low_band.expect("low volatility bands present");
+            (bands.lower, bands.upper)
+        };
+
         assert!((upper_low - lower_low) < (upper_high - lower_high));
     }
 }

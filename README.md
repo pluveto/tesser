@@ -31,6 +31,7 @@ tesser/
 ├── tesser-broker       # The universal API for all exchanges (Traits)
 |
 ├── tesser-strategy     # Your trading algorithms
+├── tesser-indicators   # High-precision, composable technical indicators
 ├── tesser-portfolio    # Position, risk, and PnL management
 |
 ├── tesser-data         # Consumes data via the broker trait
@@ -66,6 +67,11 @@ tesser/
 **Responsibility**: Contains the "brains" of the trading system—your algorithms.
 *   **Contents**: Implementations of a `Strategy` trait. This is where you calculate indicators (e.g., RSI, Moving Averages) and generate `Signal` events (e.g., "go long", "exit position").
 *   **Rule**: Strategy code must be pure and self-contained. It should only depend on `tesser-core` for data types and operate on the data it is given, without any knowledge of where the data comes from (live feed or backtest).
+
+#### `tesser-indicators`
+**Responsibility**: Houses all reusable technical indicators and signal building blocks.
+*   **Contents**: Decimal-native implementations of SMA, EMA, RSI, Bollinger Bands, and the plumbing required to compose them through zero-cost `pipe()` adapters.
+*   **Rule**: Indicators must update in **O(1)** time, avoid `f64` drift by defaulting to `rust_decimal::Decimal`, and never depend on higher-level crates.
 
 #### `tesser-portfolio`
 **Responsibility**: Manages the state of your trading portfolio. It is the system's "accountant."

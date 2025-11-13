@@ -11,6 +11,8 @@ thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tesser-core = { path = "../tesser-core" }
+tesser-indicators.workspace = true
+rust_decimal.workspace = true
 chrono.workspace = true
 once_cell = "1.19"
 ctor = "0.2"

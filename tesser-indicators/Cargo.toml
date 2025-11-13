@@ -1,0 +1,15 @@
+[package]
+name = "tesser-indicators"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+num-traits.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+tesser-core.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
