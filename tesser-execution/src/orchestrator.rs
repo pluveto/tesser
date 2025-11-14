@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::algorithm::{
-    AlgoStatus, ChildOrderRequest, ExecutionAlgorithm, IcebergAlgorithm, TwapAlgorithm,
-    VwapAlgorithm,
+    AlgoStatus, ChildOrderRequest, ExecutionAlgorithm, IcebergAlgorithm, PeggedBestAlgorithm,
+    SniperAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
 use crate::repository::AlgoStateRepository;
 use crate::{ExecutionEngine, RiskContext};
-use tesser_core::{ExecutionHint, Fill, Order, Quantity, Signal, Tick};
+use tesser_core::{ExecutionHint, Fill, Order, Price, Quantity, Signal, Tick};
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
 type OrderToAlgoMap = HashMap<String, Uuid>;
@@ -135,6 +135,8 @@ impl OrderOrchestrator {
             "TWAP" => Ok(Box::new(TwapAlgorithm::from_state(state)?)),
             "VWAP" => Ok(Box::new(VwapAlgorithm::from_state(state)?)),
             "ICEBERG" => Ok(Box::new(IcebergAlgorithm::from_state(state)?)),
+            "PEGGED_BEST" => Ok(Box::new(PeggedBestAlgorithm::from_state(state)?)),
+            "SNIPER" => Ok(Box::new(SniperAlgorithm::from_state(state)?)),
             other => bail!("unsupported algorithm type '{other}'"),
         }
     }
@@ -169,6 +171,27 @@ impl OrderOrchestrator {
                 limit_offset_bps,
             }) => {
                 self.handle_iceberg_signal(signal.clone(), *display_size, *limit_offset_bps, ctx)
+                    .await
+            }
+            Some(ExecutionHint::PeggedBest {
+                offset_bps,
+                clip_size,
+                refresh_secs,
+            }) => {
+                self.handle_pegged_signal(
+                    signal.clone(),
+                    *offset_bps,
+                    *clip_size,
+                    *refresh_secs,
+                    ctx,
+                )
+                .await
+            }
+            Some(ExecutionHint::Sniper {
+                trigger_price,
+                timeout,
+            }) => {
+                self.handle_sniper_signal(signal.clone(), *trigger_price, *timeout, ctx)
                     .await
             }
             None => {
@@ -315,6 +338,77 @@ impl OrderOrchestrator {
             "Starting new Iceberg algorithm"
         );
 
+        let initial_orders = algo.start()?;
+        {
+            let mut algorithms = self.algorithms.lock().unwrap();
+            algorithms.insert(algo_id, Box::new(algo));
+        }
+        self.persist_algo_state(&algo_id).await?;
+        for child in initial_orders {
+            self.send_child_order(child, Some(*ctx)).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_pegged_signal(
+        &self,
+        signal: Signal,
+        offset_bps: Decimal,
+        clip_size: Option<Quantity>,
+        refresh_secs: Option<u64>,
+        ctx: &RiskContext,
+    ) -> Result<()> {
+        self.update_risk_context(signal.symbol.clone(), *ctx);
+        let total_quantity =
+            self.execution_engine
+                .sizer()
+                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        if total_quantity <= Decimal::ZERO {
+            tracing::warn!("Pegged order size is zero, skipping");
+            return Ok(());
+        }
+        let secs = refresh_secs.unwrap_or(1).max(1) as i64;
+        let refresh = Duration::seconds(secs);
+        let mut algo =
+            PeggedBestAlgorithm::new(signal, total_quantity, offset_bps, clip_size, refresh)?;
+        let algo_id = *algo.id();
+        tracing::info!(
+            id = %algo_id,
+            qty = %total_quantity,
+            offset = %offset_bps,
+            "Starting new PeggedBest algorithm"
+        );
+        let initial_orders = algo.start()?;
+        {
+            let mut algorithms = self.algorithms.lock().unwrap();
+            algorithms.insert(algo_id, Box::new(algo));
+        }
+        self.persist_algo_state(&algo_id).await?;
+        for child in initial_orders {
+            self.send_child_order(child, Some(*ctx)).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_sniper_signal(
+        &self,
+        signal: Signal,
+        trigger_price: Price,
+        timeout: Option<Duration>,
+        ctx: &RiskContext,
+    ) -> Result<()> {
+        self.update_risk_context(signal.symbol.clone(), *ctx);
+        let total_quantity =
+            self.execution_engine
+                .sizer()
+                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        if total_quantity <= Decimal::ZERO {
+            tracing::warn!("Sniper order size is zero, skipping");
+            return Ok(());
+        }
+        let mut algo = SniperAlgorithm::new(signal, total_quantity, trigger_price, timeout)?;
+        let algo_id = *algo.id();
+        tracing::info!(id = %algo_id, qty = %total_quantity, "Starting new Sniper algorithm");
         let initial_orders = algo.start()?;
         {
             let mut algorithms = self.algorithms.lock().unwrap();

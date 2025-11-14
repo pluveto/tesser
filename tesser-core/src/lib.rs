@@ -36,6 +36,20 @@ pub enum ExecutionHint {
         #[serde(default)]
         limit_offset_bps: Option<Decimal>,
     },
+    /// Pegged-to-best style trading that refreshes a passive order at the top of book.
+    PeggedBest {
+        offset_bps: Decimal,
+        #[serde(default)]
+        clip_size: Option<Quantity>,
+        #[serde(default)]
+        refresh_secs: Option<u64>,
+    },
+    /// Sits on the sidelines until a target price is reached, then fires aggressively.
+    Sniper {
+        trigger_price: Price,
+        #[serde(default)]
+        timeout: Option<Duration>,
+    },
 }
 
 /// The side of an order or position.

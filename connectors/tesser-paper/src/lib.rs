@@ -1,5 +1,7 @@
 //! Simple paper-trading connector used by the backtester.
 
+mod conditional;
+
 use std::{
     any::Any,
     collections::{HashMap, VecDeque},
@@ -8,11 +10,13 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use conditional::ConditionalOrderManager;
 use rust_decimal::Decimal;
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient, MarketStream};
 use tesser_core::{
     AccountBalance, Candle, DepthUpdate, Fill, LocalOrderBook, Order, OrderBook, OrderId,
     OrderRequest, OrderStatus, OrderType, Position, Price, Quantity, Side, Symbol, Tick,
+    TimeInForce,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -25,7 +29,7 @@ pub struct PaperExecutionClient {
     orders: Arc<AsyncMutex<Vec<Order>>>,
     balances: Arc<AsyncMutex<Vec<AccountBalance>>>,
     positions: Arc<AsyncMutex<Vec<Position>>>,
-    pending_orders: Arc<AsyncMutex<Vec<Order>>>,
+    conditional_orders: Arc<AsyncMutex<ConditionalOrderManager>>,
     /// Latest market prices for each symbol
     last_prices: Arc<Mutex<HashMap<Symbol, Price>>>,
     /// Simulation parameters
@@ -66,7 +70,7 @@ impl PaperExecutionClient {
                 updated_at: Utc::now(),
             }])),
             positions: Arc::new(AsyncMutex::new(Vec::new())),
-            pending_orders: Arc::new(AsyncMutex::new(Vec::new())),
+            conditional_orders: Arc::new(AsyncMutex::new(ConditionalOrderManager::new())),
             last_prices: Arc::new(Mutex::new(HashMap::new())),
             slippage_bps,
             fee_bps,
@@ -164,111 +168,89 @@ impl PaperExecutionClient {
         }
     }
 
+    fn build_pending_order(request: OrderRequest) -> Order {
+        let now = Utc::now();
+        Order {
+            id: Uuid::new_v4().to_string(),
+            request,
+            status: OrderStatus::PendingNew,
+            filled_quantity: Decimal::ZERO,
+            avg_fill_price: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn enqueue_conditional(&self, order: Order) {
+        let mut book = self.conditional_orders.lock().await;
+        book.push(order);
+    }
+
+    async fn spawn_attached_orders(&self, order: &Order) {
+        if order.request.take_profit.is_none() && order.request.stop_loss.is_none() {
+            return;
+        }
+        let qty = order.request.quantity.abs();
+        if qty <= Decimal::ZERO {
+            return;
+        }
+        let exit_side = order.request.side.inverse();
+        let base_cid = order
+            .request
+            .client_order_id
+            .clone()
+            .unwrap_or_else(|| order.id.clone());
+
+        if let Some(price) = order.request.take_profit {
+            let request = OrderRequest {
+                symbol: order.request.symbol.clone(),
+                side: exit_side,
+                order_type: OrderType::StopMarket,
+                quantity: qty,
+                price: None,
+                trigger_price: Some(price),
+                time_in_force: Some(TimeInForce::GoodTilCanceled),
+                client_order_id: Some(format!("{base_cid}-tp")),
+                take_profit: None,
+                stop_loss: None,
+                display_quantity: None,
+            };
+            self.enqueue_conditional(Self::build_pending_order(request))
+                .await;
+        }
+
+        if let Some(price) = order.request.stop_loss {
+            let request = OrderRequest {
+                symbol: order.request.symbol.clone(),
+                side: exit_side,
+                order_type: OrderType::StopMarket,
+                quantity: qty,
+                price: None,
+                trigger_price: Some(price),
+                time_in_force: Some(TimeInForce::GoodTilCanceled),
+                client_order_id: Some(format!("{base_cid}-sl")),
+                take_profit: None,
+                stop_loss: None,
+                display_quantity: None,
+            };
+            self.enqueue_conditional(Self::build_pending_order(request))
+                .await;
+        }
+    }
+
     /// Inspect conditional orders and emit fills for any whose trigger price was reached.
     pub async fn check_triggers(&self, candle: &Candle) -> BrokerResult<Vec<Fill>> {
-        use std::collections::{HashMap, HashSet};
-        let mut triggered_fills = Vec::new();
-        let mut pending = self.pending_orders.lock().await;
-        let mut not_triggered: Vec<Order> = Vec::new();
-
-        // Track pairs of (-sl, -tp) by shared base id
-        #[derive(Default)]
-        struct Pair {
-            sl: Option<Order>,
-            tp: Option<Order>,
-        }
-        let mut pairs: HashMap<String, Pair> = HashMap::new();
-        let mut standalone_triggered: Vec<Order> = Vec::new();
-
-        let suffix_base = |cid: &str| -> Option<(String, &'static str)> {
-            if let Some(stripped) = cid.strip_suffix("-sl") {
-                return Some((stripped.to_string(), "sl"));
-            }
-            if let Some(stripped) = cid.strip_suffix("-tp") {
-                return Some((stripped.to_string(), "tp"));
-            }
-            None
+        let triggered = {
+            let mut book = self.conditional_orders.lock().await;
+            book.trigger_with_candle(candle)
         };
-
-        for order in pending.drain(..) {
-            let triggered = match order.request.side {
-                Side::Buy => order
-                    .request
-                    .trigger_price
-                    .is_some_and(|tp| candle.high >= tp),
-                Side::Sell => order
-                    .request
-                    .trigger_price
-                    .is_some_and(|tp| candle.low <= tp),
-            };
-
-            if triggered {
-                if let Some(cid) = order.request.client_order_id.as_ref() {
-                    if let Some((base, kind)) = suffix_base(cid) {
-                        let entry = pairs.entry(base).or_default();
-                        match kind {
-                            "sl" => entry.sl = Some(order),
-                            "tp" => entry.tp = Some(order),
-                            _ => {}
-                        }
-                        continue;
-                    }
-                }
-                // No recognizable suffix; treat as a standalone triggered conditional
-                standalone_triggered.push(order);
-            } else {
-                not_triggered.push(order);
-            }
-        }
-
-        // Resolve conflicts: if both sl and tp trigger within same candle, choose the more conservative SL
-        let mut remove_bases: HashSet<String> = HashSet::new();
-        for (base, pair) in pairs.into_iter() {
-            match (pair.sl, pair.tp) {
-                (Some(sl), Some(_tp)) => {
-                    let fill_price = sl.request.trigger_price.unwrap_or(candle.open);
-                    let fill = self.create_fill_from_order(&sl, fill_price, candle.timestamp);
-                    triggered_fills.push(fill);
-                    remove_bases.insert(base);
-                }
-                (Some(sl), None) => {
-                    let fill_price = sl.request.trigger_price.unwrap_or(candle.open);
-                    let fill = self.create_fill_from_order(&sl, fill_price, candle.timestamp);
-                    triggered_fills.push(fill);
-                }
-                (None, Some(tp)) => {
-                    let fill_price = tp.request.trigger_price.unwrap_or(candle.open);
-                    let fill = self.create_fill_from_order(&tp, fill_price, candle.timestamp);
-                    triggered_fills.push(fill);
-                }
-                (None, None) => {}
-            }
-        }
-
-        // Standalone triggered orders
-        for order in standalone_triggered.into_iter() {
-            let fill_price = order.request.trigger_price.unwrap_or(candle.open);
-            let fill = self.create_fill_from_order(&order, fill_price, candle.timestamp);
-            triggered_fills.push(fill);
-        }
-
-        // Rebuild pending set, dropping any orders that share the base id of a conflict pair
-        let mut still_pending = Vec::new();
-        for order in not_triggered.into_iter() {
-            let drop_for_conflict = order
-                .request
-                .client_order_id
-                .as_ref()
-                .and_then(|cid| suffix_base(cid))
-                .map(|(base, _)| remove_bases.contains(&base))
-                .unwrap_or(false);
-            if !drop_for_conflict {
-                still_pending.push(order);
-            }
-        }
-
-        *pending = still_pending;
-        Ok(triggered_fills)
+        let fills = triggered
+            .into_iter()
+            .map(|event| {
+                self.create_fill_from_order(&event.order, event.fill_price, event.timestamp)
+            })
+            .collect();
+        Ok(fills)
     }
 }
 
@@ -315,9 +297,18 @@ impl ExecutionClient for MatchingEngine {
                     Ok(order)
                 }
             }
-            OrderType::StopMarket => Err(BrokerError::InvalidRequest(
-                "MatchingEngine does not yet support stop orders".into(),
-            )),
+            OrderType::StopMarket => {
+                let trigger_price = request.trigger_price.ok_or_else(|| {
+                    BrokerError::InvalidRequest("stop-market order missing trigger price".into())
+                })?;
+                let mut request = request.clone();
+                request.price = None;
+                request.trigger_price = Some(trigger_price);
+                request.time_in_force = Some(TimeInForce::GoodTilCanceled);
+                let pending = Self::build_pending_order(request);
+                self.enqueue_conditional(pending.clone()).await;
+                Ok(pending)
+            }
         }
     }
 
@@ -379,6 +370,7 @@ pub struct MatchingEngine {
     positions: Arc<AsyncMutex<HashMap<Symbol, Position>>>,
     open_orders: Arc<AsyncMutex<HashMap<OrderId, RestingOrder>>>,
     fills: Arc<AsyncMutex<Vec<Fill>>>,
+    conditional_orders: Arc<AsyncMutex<ConditionalOrderManager>>,
 }
 
 impl MatchingEngine {
@@ -402,6 +394,7 @@ impl MatchingEngine {
             positions: Arc::new(AsyncMutex::new(HashMap::new())),
             open_orders: Arc::new(AsyncMutex::new(HashMap::new())),
             fills: Arc::new(AsyncMutex::new(Vec::new())),
+            conditional_orders: Arc::new(AsyncMutex::new(ConditionalOrderManager::new())),
         }
     }
 
@@ -440,6 +433,76 @@ impl MatchingEngine {
         }
     }
 
+    fn build_pending_order(request: OrderRequest) -> Order {
+        let now = Utc::now();
+        Order {
+            id: Uuid::new_v4().to_string(),
+            request,
+            status: OrderStatus::PendingNew,
+            filled_quantity: Decimal::ZERO,
+            avg_fill_price: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn enqueue_conditional(&self, order: Order) {
+        let mut book = self.conditional_orders.lock().await;
+        book.push(order);
+    }
+
+    async fn spawn_attached_orders(&self, order: &Order) {
+        if order.request.take_profit.is_none() && order.request.stop_loss.is_none() {
+            return;
+        }
+        let qty = order.request.quantity.abs();
+        if qty <= Decimal::ZERO {
+            return;
+        }
+        let exit_side = order.request.side.inverse();
+        let base_cid = order
+            .request
+            .client_order_id
+            .clone()
+            .unwrap_or_else(|| order.id.clone());
+
+        if let Some(price) = order.request.take_profit {
+            let request = OrderRequest {
+                symbol: order.request.symbol.clone(),
+                side: exit_side,
+                order_type: OrderType::StopMarket,
+                quantity: qty,
+                price: None,
+                trigger_price: Some(price),
+                time_in_force: Some(TimeInForce::GoodTilCanceled),
+                client_order_id: Some(format!("{base_cid}-tp")),
+                take_profit: None,
+                stop_loss: None,
+                display_quantity: None,
+            };
+            self.enqueue_conditional(Self::build_pending_order(request))
+                .await;
+        }
+
+        if let Some(price) = order.request.stop_loss {
+            let request = OrderRequest {
+                symbol: order.request.symbol.clone(),
+                side: exit_side,
+                order_type: OrderType::StopMarket,
+                quantity: qty,
+                price: None,
+                trigger_price: Some(price),
+                time_in_force: Some(TimeInForce::GoodTilCanceled),
+                client_order_id: Some(format!("{base_cid}-sl")),
+                take_profit: None,
+                stop_loss: None,
+                display_quantity: None,
+            };
+            self.enqueue_conditional(Self::build_pending_order(request))
+                .await;
+        }
+    }
+
     /// Apply a depth delta emitted by the historical dataset.
     pub fn apply_depth_update(&self, update: &DepthUpdate) {
         for level in &update.bids {
@@ -468,6 +531,7 @@ impl MatchingEngine {
         aggressor_side: Side,
         price: Price,
         mut quantity: Quantity,
+        timestamp: DateTime<Utc>,
     ) -> Vec<Fill> {
         let mut generated = Vec::new();
         if quantity <= Decimal::ZERO {
@@ -523,13 +587,42 @@ impl MatchingEngine {
         if !finished.is_empty() {
             let mut open = self.open_orders.lock().await;
             for order_id in finished {
-                open.remove(&order_id);
+                if let Some(order) = open.remove(&order_id) {
+                    self.spawn_attached_orders(&order.order).await;
+                }
             }
         }
 
         let mut store = self.fills.lock().await;
         store.extend(generated.clone());
+        drop(store);
+
+        self.trigger_conditionals(price, timestamp).await;
         generated
+    }
+
+    async fn trigger_conditionals(&self, price: Price, timestamp: DateTime<Utc>) {
+        let triggered = {
+            let mut book = self.conditional_orders.lock().await;
+            book.trigger_with_price(price, timestamp)
+        };
+        if triggered.is_empty() {
+            return;
+        }
+        let mut store = self.fills.lock().await;
+        for event in triggered {
+            let fill = Fill {
+                order_id: event.order.id.clone(),
+                symbol: event.order.request.symbol.clone(),
+                side: event.order.request.side,
+                fill_price: event.fill_price,
+                fill_quantity: event.order.request.quantity,
+                fee: None,
+                timestamp: event.timestamp,
+            };
+            self.apply_fill_accounting(&fill).await;
+            store.push(fill);
+        }
     }
 
     fn trade_crosses_order(side: Side, trade_price: Price, order: &RestingOrder) -> bool {
@@ -667,6 +760,11 @@ impl MatchingEngine {
         }
         let mut store = self.fills.lock().await;
         store.extend(realized_fills);
+        drop(store);
+
+        if matches!(order.status, OrderStatus::Filled) {
+            self.spawn_attached_orders(order).await;
+        }
         Ok(())
     }
 
@@ -717,17 +815,19 @@ impl ExecutionClient for PaperExecutionClient {
                     side = ?order.request.side,
                     "paper order filled"
                 );
+                self.spawn_attached_orders(&order).await;
                 Ok(order)
             }
             tesser_core::OrderType::StopMarket => {
                 let trigger_price = request.trigger_price.ok_or_else(|| {
                     BrokerError::InvalidRequest("StopMarket order requires a trigger_price".into())
                 })?;
-                let mut order = self.fill_order(&request);
-                order.status = OrderStatus::PendingNew;
-                order.filled_quantity = Decimal::ZERO;
-                order.avg_fill_price = None;
-                self.pending_orders.lock().await.push(order.clone());
+                let mut request = request.clone();
+                request.price = None;
+                request.time_in_force = Some(TimeInForce::GoodTilCanceled);
+                request.trigger_price = Some(trigger_price);
+                let order = Self::build_pending_order(request);
+                self.enqueue_conditional(order.clone()).await;
                 info!(
                     symbol = %order.request.symbol,
                     qty = %order.request.quantity,

@@ -114,3 +114,38 @@ fn test_twap_state_persistence() {
     // Verify restored algorithm has same properties
     assert_eq!(restored_twap.status(), AlgoStatus::Working);
 }
+
+#[tokio::test]
+async fn orchestrator_restores_from_sqlite() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let temp_path = temp_file.path().to_path_buf();
+    let repo = Arc::new(SqliteAlgoStateRepository::new(&temp_path).unwrap());
+
+    let client = Arc::new(PaperExecutionClient::default());
+    let sizer = Box::new(FixedOrderSizer {
+        quantity: Decimal::ONE,
+    });
+    let risk_checker = Arc::new(NoopRiskChecker);
+    let engine = Arc::new(ExecutionEngine::new(client, sizer, risk_checker));
+
+    let orchestrator = OrderOrchestrator::new(engine.clone(), repo.clone())
+        .await
+        .unwrap();
+    let signal =
+        Signal::new("BTCUSDT", SignalKind::EnterLong, 0.5).with_hint(ExecutionHint::Twap {
+            duration: Duration::minutes(1),
+        });
+    let ctx = RiskContext {
+        signed_position_qty: Decimal::ZERO,
+        portfolio_equity: Decimal::from(10_000),
+        last_price: Decimal::from(25_000),
+        liquidate_only: false,
+    };
+    orchestrator.on_signal(&signal, &ctx).await.unwrap();
+    assert_eq!(orchestrator.active_algorithms_count(), 1);
+
+    drop(orchestrator);
+
+    let restored = OrderOrchestrator::new(engine, repo).await.unwrap();
+    assert_eq!(restored.active_algorithms_count(), 1);
+}

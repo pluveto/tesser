@@ -70,8 +70,12 @@ pub trait ExecutionAlgorithm: Send + Sync {
 }
 
 pub mod iceberg;
+pub mod pegged;
 pub mod twap;
 pub mod vwap;
 pub use iceberg::IcebergAlgorithm;
+pub use pegged::PeggedBestAlgorithm;
 pub use twap::TwapAlgorithm;
 pub use vwap::VwapAlgorithm;
+pub mod sniper;
+pub use sniper::SniperAlgorithm;

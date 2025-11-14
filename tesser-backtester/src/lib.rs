@@ -301,7 +301,7 @@ impl Backtester {
                 }
                 MarketEventKind::Trade(tick) => {
                     matching
-                        .process_trade(tick.side, tick.price, tick.size)
+                        .process_trade(tick.side, tick.price, tick.size, tick.exchange_timestamp)
                         .await;
                     last_trade_price = Some(tick.price);
                     self.portfolio.mark_price(&tick.symbol, tick.price);

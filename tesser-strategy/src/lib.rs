@@ -20,7 +20,7 @@ use tesser_core::{
     Candle, ExecutionHint, Fill, OrderBook, Position, Signal, SignalKind, Symbol, Tick,
 };
 use tesser_indicators::{
-    indicators::{BollingerBands, Rsi, Sma},
+    indicators::{Atr, BollingerBands, Ichimoku, IchimokuOutput, Macd, Rsi, Sma},
     Indicator,
 };
 use thiserror::Error;
@@ -1205,6 +1205,468 @@ impl Strategy for OrderBookImbalance {
 }
 
 register_strategy!(OrderBookImbalance, "OrderBookImbalance", aliases = ["OBI"]);
+
+// -------------------------------------------------------------------------------------------------
+// Advanced Strategies
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OrderBookScalperConfig {
+    pub symbol: Symbol,
+    pub depth: usize,
+    pub imbalance_threshold: f64,
+    pub neutral_zone: f64,
+    pub peg_offset_bps: Decimal,
+    pub clip_size: Decimal,
+    pub refresh_secs: u64,
+    pub macd_fast: usize,
+    pub macd_slow: usize,
+    pub macd_signal: usize,
+    pub min_tick_size: Decimal,
+}
+
+impl Default for OrderBookScalperConfig {
+    fn default() -> Self {
+        Self {
+            symbol: "BTCUSDT".to_string(),
+            depth: 10,
+            imbalance_threshold: 0.25,
+            neutral_zone: 0.05,
+            peg_offset_bps: Decimal::new(5, 1),
+            clip_size: Decimal::from(5),
+            refresh_secs: 1,
+            macd_fast: 12,
+            macd_slow: 26,
+            macd_signal: 9,
+            min_tick_size: Decimal::ONE,
+        }
+    }
+}
+
+pub struct OrderBookScalper {
+    cfg: OrderBookScalperConfig,
+    signals: Vec<Signal>,
+    macd: Macd,
+    last_tick_size: Decimal,
+    last_histogram: Option<Decimal>,
+}
+
+impl Default for OrderBookScalper {
+    fn default() -> Self {
+        Self::new(OrderBookScalperConfig::default())
+    }
+}
+
+impl OrderBookScalper {
+    pub fn new(cfg: OrderBookScalperConfig) -> Self {
+        let macd =
+            Macd::new(cfg.macd_fast, cfg.macd_slow, cfg.macd_signal).expect("valid MACD periods");
+        Self {
+            cfg,
+            signals: Vec::new(),
+            macd,
+            last_tick_size: Decimal::ZERO,
+            last_histogram: None,
+        }
+    }
+
+    fn imbalance_supports_entry(&self, imbalance: f64, histogram: Decimal) -> SignalKind {
+        if imbalance >= self.cfg.imbalance_threshold && histogram > Decimal::ZERO {
+            SignalKind::EnterLong
+        } else if imbalance <= -self.cfg.imbalance_threshold && histogram < Decimal::ZERO {
+            SignalKind::EnterShort
+        } else {
+            SignalKind::Flatten
+        }
+    }
+}
+
+impl Strategy for OrderBookScalper {
+    fn name(&self) -> &str {
+        "orderbook-scalper"
+    }
+
+    fn symbol(&self) -> &str {
+        &self.cfg.symbol
+    }
+
+    fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
+        let cfg: OrderBookScalperConfig = params.try_into().map_err(|err: toml::de::Error| {
+            StrategyError::InvalidConfig(format!("failed to parse OrderBookScalper config: {err}"))
+        })?;
+        if cfg.depth == 0 {
+            return Err(StrategyError::InvalidConfig(
+                "depth must be greater than zero".into(),
+            ));
+        }
+        self.macd = Macd::new(cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
+            .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.cfg = cfg;
+        self.last_histogram = None;
+        Ok(())
+    }
+
+    fn on_tick(&mut self, _ctx: &StrategyContext, tick: &Tick) -> StrategyResult<()> {
+        if tick.symbol == self.cfg.symbol {
+            self.last_tick_size = tick.size.abs();
+        }
+        Ok(())
+    }
+
+    fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+        if candle.symbol == self.cfg.symbol {
+            if let Some(output) = self.macd.next(candle.close) {
+                self.last_histogram = Some(output.histogram);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_order_book(&mut self, _ctx: &StrategyContext, book: &OrderBook) -> StrategyResult<()> {
+        if book.symbol != self.cfg.symbol {
+            return Ok(());
+        }
+        if self.last_tick_size < self.cfg.min_tick_size {
+            return Ok(());
+        }
+        let macd = match self.last_histogram {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        if let Some(balance) = book.imbalance(self.cfg.depth) {
+            if let Some(im) = balance.to_f64() {
+                let kind = self.imbalance_supports_entry(im, macd);
+                if !matches!(kind, SignalKind::Flatten) || im.abs() <= self.cfg.neutral_zone {
+                    let mut signal = Signal::new(self.cfg.symbol.clone(), kind, 0.9);
+                    signal.execution_hint = Some(ExecutionHint::PeggedBest {
+                        offset_bps: self.cfg.peg_offset_bps,
+                        clip_size: Some(self.cfg.clip_size.max(Decimal::ONE)),
+                        refresh_secs: Some(self.cfg.refresh_secs),
+                    });
+                    self.signals.push(signal);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &Fill) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn drain_signals(&mut self) -> Vec<Signal> {
+        std::mem::take(&mut self.signals)
+    }
+}
+
+register_strategy!(OrderBookScalper, "OrderBookScalper");
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CrossExchangeArbConfig {
+    pub symbol_a: Symbol,
+    pub symbol_b: Symbol,
+    pub spread_bps: Decimal,
+    pub exit_bps: Decimal,
+    pub ichimoku_conversion: usize,
+    pub ichimoku_base: usize,
+    pub ichimoku_span_b: usize,
+}
+
+impl Default for CrossExchangeArbConfig {
+    fn default() -> Self {
+        Self {
+            symbol_a: "BTCUSDT".into(),
+            symbol_b: "BTCUSDC".into(),
+            spread_bps: Decimal::new(50, 2),
+            exit_bps: Decimal::new(10, 2),
+            ichimoku_conversion: 9,
+            ichimoku_base: 26,
+            ichimoku_span_b: 52,
+        }
+    }
+}
+
+pub struct CrossExchangeArb {
+    cfg: CrossExchangeArbConfig,
+    signals: Vec<Signal>,
+    last_price_a: Option<Decimal>,
+    last_price_b: Option<Decimal>,
+    ichimoku: Ichimoku,
+    last_cloud: Option<IchimokuOutput>,
+}
+
+impl Default for CrossExchangeArb {
+    fn default() -> Self {
+        Self::new(CrossExchangeArbConfig::default())
+    }
+}
+
+impl CrossExchangeArb {
+    pub fn new(cfg: CrossExchangeArbConfig) -> Self {
+        let ichimoku = Ichimoku::new(
+            cfg.ichimoku_conversion,
+            cfg.ichimoku_base,
+            cfg.ichimoku_span_b,
+        )
+        .expect("valid ichimoku periods");
+        Self {
+            cfg,
+            signals: Vec::new(),
+            last_price_a: None,
+            last_price_b: None,
+            ichimoku,
+            last_cloud: None,
+        }
+    }
+
+    fn emit_pair_trade(&mut self, long_a: bool) {
+        let duration = Duration::seconds(30);
+        let mut signal_a = Signal::new(
+            self.cfg.symbol_a.clone(),
+            if long_a {
+                SignalKind::EnterLong
+            } else {
+                SignalKind::EnterShort
+            },
+            0.85,
+        );
+        signal_a.execution_hint = Some(ExecutionHint::Twap { duration });
+        let mut signal_b = Signal::new(
+            self.cfg.symbol_b.clone(),
+            if long_a {
+                SignalKind::EnterShort
+            } else {
+                SignalKind::EnterLong
+            },
+            0.85,
+        );
+        signal_b.execution_hint = Some(ExecutionHint::Twap { duration });
+        self.signals.push(signal_a);
+        self.signals.push(signal_b);
+    }
+}
+
+impl Strategy for CrossExchangeArb {
+    fn name(&self) -> &str {
+        "cross-exchange-arb"
+    }
+
+    fn symbol(&self) -> &str {
+        &self.cfg.symbol_a
+    }
+
+    fn subscriptions(&self) -> Vec<Symbol> {
+        vec![self.cfg.symbol_a.clone(), self.cfg.symbol_b.clone()]
+    }
+
+    fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
+        let cfg: CrossExchangeArbConfig = params.try_into().map_err(|err: toml::de::Error| {
+            StrategyError::InvalidConfig(format!("failed to parse CrossExchangeArb config: {err}"))
+        })?;
+        self.ichimoku = Ichimoku::new(
+            cfg.ichimoku_conversion,
+            cfg.ichimoku_base,
+            cfg.ichimoku_span_b,
+        )
+        .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.cfg = cfg;
+        Ok(())
+    }
+
+    fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+        if candle.symbol == self.cfg.symbol_a {
+            self.last_price_a = Some(candle.close);
+            if let Some(cloud) = self.ichimoku.next(candle.clone()) {
+                self.last_cloud = Some(cloud);
+            }
+        } else if candle.symbol == self.cfg.symbol_b {
+            self.last_price_b = Some(candle.close);
+        }
+        if let (Some(a), Some(b)) = (self.last_price_a, self.last_price_b) {
+            if b.is_zero() {
+                return Ok(());
+            }
+            let spread = (a - b) / b;
+            let is_trending = self
+                .last_cloud
+                .map(|cloud| (cloud.conversion_line - cloud.base_line).abs() > Decimal::new(5, 2))
+                .unwrap_or(false);
+            if is_trending {
+                return Ok(());
+            }
+            if spread >= self.cfg.spread_bps / Decimal::from(10_000) {
+                self.emit_pair_trade(false);
+            } else if spread <= -(self.cfg.spread_bps / Decimal::from(10_000)) {
+                self.emit_pair_trade(true);
+            } else if spread.abs() <= self.cfg.exit_bps / Decimal::from(10_000) {
+                self.signals.push(Signal::new(
+                    self.cfg.symbol_a.clone(),
+                    SignalKind::Flatten,
+                    0.6,
+                ));
+                self.signals.push(Signal::new(
+                    self.cfg.symbol_b.clone(),
+                    SignalKind::Flatten,
+                    0.6,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn on_order_book(&mut self, _ctx: &StrategyContext, _book: &OrderBook) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &Fill) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn drain_signals(&mut self) -> Vec<Signal> {
+        std::mem::take(&mut self.signals)
+    }
+}
+
+register_strategy!(CrossExchangeArb, "CrossExchangeArb");
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VolatilitySkewConfig {
+    pub underlying: Symbol,
+    pub vol_symbol: Symbol,
+    pub atr_period: usize,
+    pub implied_premium: Decimal,
+    pub realized_multiplier: Decimal,
+    pub sniper_timeout_secs: u64,
+}
+
+impl Default for VolatilitySkewConfig {
+    fn default() -> Self {
+        Self {
+            underlying: "BTCUSDT".into(),
+            vol_symbol: "BVOLUSDT".into(),
+            atr_period: 14,
+            implied_premium: Decimal::new(15, 2),
+            realized_multiplier: Decimal::ONE,
+            sniper_timeout_secs: 300,
+        }
+    }
+}
+
+pub struct VolatilitySkew {
+    cfg: VolatilitySkewConfig,
+    signals: Vec<Signal>,
+    atr: Atr,
+    last_implied_vol: Option<Decimal>,
+}
+
+impl Default for VolatilitySkew {
+    fn default() -> Self {
+        Self::new(VolatilitySkewConfig::default())
+    }
+}
+
+impl VolatilitySkew {
+    pub fn new(cfg: VolatilitySkewConfig) -> Self {
+        let atr = Atr::new(cfg.atr_period).expect("valid ATR");
+        Self {
+            cfg,
+            signals: Vec::new(),
+            atr,
+            last_implied_vol: None,
+        }
+    }
+}
+
+impl Strategy for VolatilitySkew {
+    fn name(&self) -> &str {
+        "volatility-skew"
+    }
+
+    fn symbol(&self) -> &str {
+        &self.cfg.underlying
+    }
+
+    fn subscriptions(&self) -> Vec<Symbol> {
+        vec![self.cfg.underlying.clone(), self.cfg.vol_symbol.clone()]
+    }
+
+    fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
+        let cfg: VolatilitySkewConfig = params.try_into().map_err(|err: toml::de::Error| {
+            StrategyError::InvalidConfig(format!("failed to parse VolatilitySkew config: {err}"))
+        })?;
+        self.atr = Atr::new(cfg.atr_period)
+            .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
+        self.cfg = cfg;
+        Ok(())
+    }
+
+    fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+        if candle.symbol == self.cfg.vol_symbol {
+            self.last_implied_vol = Some(candle.close.max(Decimal::ZERO));
+            return Ok(());
+        }
+        if candle.symbol != self.cfg.underlying {
+            return Ok(());
+        }
+        if let Some(realized) = self.atr.next(candle.clone()) {
+            if let Some(implied) = self.last_implied_vol {
+                if candle.close.is_zero() {
+                    return Ok(());
+                }
+                let realized_vol = realized / candle.close.max(Decimal::ONE);
+                let threshold = realized_vol * self.cfg.realized_multiplier;
+                let premium =
+                    threshold * (Decimal::ONE + self.cfg.implied_premium / Decimal::from(100));
+                let discount =
+                    threshold * (Decimal::ONE - self.cfg.implied_premium / Decimal::from(100));
+                let timeout = Some(Duration::seconds(self.cfg.sniper_timeout_secs as i64));
+                if implied >= premium {
+                    let mut signal =
+                        Signal::new(self.cfg.underlying.clone(), SignalKind::EnterShort, 0.8);
+                    signal.execution_hint = Some(ExecutionHint::Sniper {
+                        trigger_price: candle.close,
+                        timeout,
+                    });
+                    self.signals.push(signal);
+                } else if implied <= discount {
+                    let mut signal =
+                        Signal::new(self.cfg.underlying.clone(), SignalKind::EnterLong, 0.8);
+                    signal.execution_hint = Some(ExecutionHint::Sniper {
+                        trigger_price: candle.close,
+                        timeout,
+                    });
+                    self.signals.push(signal);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_order_book(&mut self, _ctx: &StrategyContext, _book: &OrderBook) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &Fill) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn drain_signals(&mut self) -> Vec<Signal> {
+        std::mem::take(&mut self.signals)
+    }
+}
+
+register_strategy!(VolatilitySkew, "VolatilitySkew");
 
 #[cfg(test)]
 mod tests {

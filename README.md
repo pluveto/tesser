@@ -156,6 +156,28 @@ cargo run -p tesser-cli -- \
 
 Swap in `examples/strategies/rsi_reversion.toml` (or any file under `research/`) to compare behaviors. Omit `--data` to fall back to synthetic candles, or add multiple CSV paths to stitch larger datasets.
 
+### Tick-Level Backtests & Advanced Execution
+
+The CLI now understands both candle- and tick-driven simulations. Pass `--mode tick` to `tesser-cli backtest run` alongside one or more Level 2 / trade JSONL files:
+
+```sh
+cargo run -p tesser-cli -- \
+  backtest run \
+  --strategy-config research/strategies/orderbook_scalper.toml \
+  --mode tick \
+  --lob-data data/btcusdt/orderbook.jsonl data/btcusdt/trades.jsonl
+```
+
+In tick mode the backtester replays historical depth snapshots through the high-fidelity `MatchingEngine`, honoring your strategy's limit prices, conditional orders, and latency requirements. This path is ideal for testing microstructure-sensitive strategies and validating slippage assumptions.
+
+Execution hints now support specialized algorithms (configured through your strategies):
+
+- `ExecutionHint::PeggedBest` – refreshes IOC slices at the top of book (used by the new `OrderBookScalper`).
+- `ExecutionHint::Sniper` – waits for a target price before sweeping liquidity (used by the `VolatilitySkew` playbook).
+- Existing hints (`Twap`, `Vwap`, `IcebergSimulated`) continue to work unchanged, and their state is persisted via SQLite so in-flight schedules recover from process restarts.
+
+Additional indicators (ATR, MACD, Ichimoku Cloud) and reference strategies (`OrderBookScalper`, `CrossExchangeArb`, `VolatilitySkew`) ship with the workspace to showcase how these hints and the matching engine interact end to end.
+
 ### CLI Overview
 
 `tesser-cli` is the single entry point for local research and operations:
