@@ -36,6 +36,7 @@ tesser/
 |
 ├── tesser-data         # Consumes data via the broker trait
 ├── tesser-execution    # Sends orders via the broker trait
+├── tesser-events       # In-process pub/sub event bus
 |
 ├── tesser-backtester   # The simulation engine
 ├── tesser-cli          # The command-line user interface
@@ -58,6 +59,11 @@ tesser/
 **Responsibility**: The API Unification Layer. It defines the abstract interface for interacting with any exchange.
 *   **Contents**: `trait`s (interfaces) like `MarketStream` (for subscribing to live data) and `ExecutionClient` (for placing orders and managing accounts). It contains **no concrete implementations**.
 *   **Rule**: If you are defining a behavior that an exchange must provide (e.g., "fetch open orders"), the trait for it belongs here.
+
+#### `tesser-events`
+**Responsibility**: Encapsulates every framework-level event type (ticks, candles, order-book deltas, signals, fills, order updates) plus the publish/subscribe bus used across the CLI, backtester, and future services.
+*   **Contents**: A `tokio::broadcast`-powered `EventBus` and typed wrappers (`TickEvent`, `SignalEvent`, etc.) that decouple producers from consumers.
+*   **Rule**: Emit and consume runtime activity via the bus instead of calling modules directly; this keeps the event flow extensible (risk daemons, telemetry sinks, notification services) without rewriting the core loop.
 
 ---
 

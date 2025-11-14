@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use futures::StreamExt;
 use rust_decimal::{prelude::ToPrimitive, Decimal};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
@@ -23,7 +23,13 @@ use tesser_bybit::{
     BybitClient, BybitConfig, BybitCredentials, BybitMarketStream, BybitSubscription, PublicChannel,
 };
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
-use tesser_core::{Candle, Fill, Interval, Order, OrderBook, OrderStatus, Price, Quantity, Side};
+use tesser_core::{
+    Candle, Fill, Interval, Order, OrderBook, OrderStatus, Price, Quantity, Side, Signal, Tick,
+};
+use tesser_events::{
+    CandleEvent, Event, EventBus, FillEvent, OrderBookEvent, OrderUpdateEvent, SignalEvent,
+    TickEvent,
+};
 use tesser_execution::{
     BasicRiskChecker, ExecutionEngine, FixedOrderSizer, OrderOrchestrator, PreTradeRiskChecker,
     RiskContext, RiskLimits, SqliteAlgoStateRepository,
@@ -199,15 +205,12 @@ fn build_execution_client(
 
 struct LiveRuntime {
     stream: BybitMarketStream,
-    strategy: Box<dyn Strategy>,
-    strategy_ctx: StrategyContext,
-    orchestrator: OrderOrchestrator,
-    portfolio: Portfolio,
-    metrics: LiveMetrics,
-    alerts: AlertManager,
-    market: HashMap<String, MarketSnapshot>,
+    orchestrator: Arc<OrderOrchestrator>,
+    portfolio: Arc<Mutex<Portfolio>>,
+    alerts: Arc<AlertManager>,
     state_repo: Arc<dyn StateRepository>,
-    persisted: LiveState,
+    persisted: Arc<Mutex<LiveState>>,
+    event_bus: Arc<EventBus>,
     shutdown: ShutdownSignal,
     metrics_task: JoinHandle<()>,
     alert_task: Option<JoinHandle<()>>,
@@ -215,6 +218,7 @@ struct LiveRuntime {
     exec_backend: ExecutionBackend,
     #[allow(dead_code)]
     last_private_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
+    subscriber_handles: Vec<JoinHandle<()>>,
 }
 
 impl LiveRuntime {
@@ -296,9 +300,11 @@ impl LiveRuntime {
         let metrics_task = spawn_metrics_server(metrics.registry(), settings.metrics_addr);
         let dispatcher = AlertDispatcher::new(settings.alerting.webhook_url.clone());
         let alerts = AlertManager::new(settings.alerting, dispatcher);
-        let alert_task = alerts.spawn_watchdog();
         let (private_event_tx, private_event_rx) = mpsc::channel(1024);
         let last_private_sync = Arc::new(tokio::sync::Mutex::new(persisted.last_candle_ts));
+        let alerts = Arc::new(alerts);
+        let alert_task = alerts.spawn_watchdog();
+        let metrics = Arc::new(metrics);
 
         if !settings.exec_backend.is_paper() {
             let execution_engine = orchestrator.execution_engine();
@@ -435,6 +441,27 @@ impl LiveRuntime {
             });
         }
 
+        let strategy = Arc::new(Mutex::new(strategy));
+        let strategy_ctx = Arc::new(Mutex::new(strategy_ctx));
+        let portfolio = Arc::new(Mutex::new(portfolio));
+        let market = Arc::new(Mutex::new(market));
+        let persisted = Arc::new(Mutex::new(persisted));
+        let orchestrator = Arc::new(orchestrator);
+        let event_bus = Arc::new(EventBus::new(2048));
+        let subscriber_handles = spawn_event_subscribers(
+            event_bus.clone(),
+            strategy.clone(),
+            strategy_ctx.clone(),
+            orchestrator.clone(),
+            portfolio.clone(),
+            metrics.clone(),
+            alerts.clone(),
+            market.clone(),
+            state_repo.clone(),
+            persisted.clone(),
+            settings.exec_backend,
+        );
+
         info!(
             symbols = ?symbols,
             category = ?settings.category,
@@ -445,37 +472,25 @@ impl LiveRuntime {
         );
 
         for symbol in &symbols {
-            let last_price = market
-                .get(symbol)
-                .and_then(|snapshot| snapshot.price())
-                .or_else(|| persisted.last_prices.get(symbol).copied())
-                .unwrap_or(Decimal::ZERO);
-            let ctx = RiskContext {
-                signed_position_qty: portfolio.signed_position_qty(symbol),
-                portfolio_equity: portfolio.equity(),
-                last_price,
-                liquidate_only: portfolio.liquidate_only(),
-            };
+            let ctx = shared_risk_context(symbol, &portfolio, &market, &persisted).await;
             orchestrator.update_risk_context(symbol.clone(), ctx);
         }
 
         Ok(Self {
             stream,
-            strategy,
-            strategy_ctx,
             orchestrator,
             portfolio,
-            metrics,
             alerts,
-            market,
             state_repo,
             persisted,
+            event_bus,
             shutdown,
             metrics_task,
             alert_task,
             private_event_rx,
             exec_backend: settings.exec_backend,
             last_private_sync,
+            subscriber_handles,
         })
     }
 
@@ -493,17 +508,19 @@ impl LiveRuntime {
 
             if let Some(tick) = self.stream.next_tick().await? {
                 progressed = true;
-                self.handle_tick(tick).await?;
+                self.event_bus.publish(Event::Tick(TickEvent { tick }));
             }
 
             if let Some(candle) = self.stream.next_candle().await? {
                 progressed = true;
-                self.handle_candle(candle).await?;
+                self.event_bus
+                    .publish(Event::Candle(CandleEvent { candle }));
             }
 
             if let Some(book) = self.stream.next_order_book().await? {
                 progressed = true;
-                self.handle_order_book(book).await?;
+                self.event_bus
+                    .publish(Event::OrderBook(OrderBookEvent { order_book: book }));
             }
 
             tokio::select! {
@@ -512,10 +529,11 @@ impl LiveRuntime {
                     progressed = true;
                     match event {
                         BrokerEvent::OrderUpdate(order) => {
-                            self.handle_order_update(order).await?;
+                            self.event_bus
+                                .publish(Event::OrderUpdate(OrderUpdateEvent { order }));
                         }
                         BrokerEvent::Fill(fill) => {
-                            self.handle_real_fill(fill).await?;
+                            self.event_bus.publish(Event::Fill(FillEvent { fill }));
                         }
                     }
                 }
@@ -542,6 +560,9 @@ impl LiveRuntime {
         if let Some(handle) = self.alert_task.take() {
             handle.abort();
         }
+        for handle in self.subscriber_handles.drain(..) {
+            handle.abort();
+        }
         if let Err(err) = self.save_state().await {
             warn!(error = %err, "failed to persist shutdown state");
         }
@@ -557,7 +578,10 @@ impl LiveRuntime {
         let client = self.orchestrator.execution_engine().client();
         match client.positions().await {
             Ok(remote_positions) => {
-                let local_positions = self.portfolio.positions();
+                let local_positions = {
+                    let guard = self.portfolio.lock().await;
+                    guard.positions()
+                };
                 if remote_positions.len() != local_positions.len() {
                     warn!(
                         remote = remote_positions.len(),
@@ -575,7 +599,10 @@ impl LiveRuntime {
         match client.account_balances().await {
             Ok(remote_balances) => {
                 if let Some(usdt) = remote_balances.iter().find(|b| b.currency == "USDT") {
-                    let local_cash = self.portfolio.cash();
+                    let local_cash = {
+                        let guard = self.portfolio.lock().await;
+                        guard.cash()
+                    };
                     let diff = (usdt.available - local_cash).abs();
                     if diff > Decimal::ONE {
                         warn!(
@@ -599,228 +626,8 @@ impl LiveRuntime {
         Ok(())
     }
 
-    async fn handle_tick(&mut self, tick: tesser_core::Tick) -> Result<()> {
-        self.metrics.inc_tick();
-        self.metrics.update_staleness(0.0);
-        self.alerts.heartbeat().await;
-        if let Some(snapshot) = self.market.get_mut(&tick.symbol) {
-            snapshot.last_trade = Some(tick.price);
-            snapshot.last_trade_ts = Some(tick.exchange_timestamp);
-        }
-        self.persisted
-            .last_prices
-            .insert(tick.symbol.clone(), tick.price);
-        self.portfolio.mark_price(&tick.symbol, tick.price);
-        if let Some(price) = tick.price.to_f64() {
-            self.metrics.update_price(&tick.symbol, price);
-        }
-        self.refresh_risk_context(&tick.symbol);
-
-        // Update price in paper trading client if using paper mode
-        if let Some(paper_client) = self
-            .orchestrator
-            .execution_engine()
-            .client()
-            .as_any()
-            .downcast_ref::<PaperExecutionClient>()
-        {
-            paper_client.update_price(&tick.symbol, tick.price);
-        }
-
-        // Route tick to orchestrator for algorithmic orders
-        if let Err(e) = self.orchestrator.on_tick(&tick).await {
-            tracing::warn!(error = %e, "Orchestrator failed to process tick");
-        }
-
-        self.strategy_ctx.push_tick(tick.clone());
-        self.strategy
-            .on_tick(&self.strategy_ctx, &tick)
-            .context("strategy failure on tick")?;
-        self.process_signals().await?;
-        Ok(())
-    }
-
-    async fn handle_candle(&mut self, candle: Candle) -> Result<()> {
-        if let Some(snapshot) = self.market.get_mut(&candle.symbol) {
-            snapshot.last_candle = Some(candle.clone());
-            snapshot.last_trade = Some(candle.close);
-        }
-        self.metrics.inc_candle();
-        if let Some(price) = candle.close.to_f64() {
-            self.metrics.update_price(&candle.symbol, price);
-        }
-        self.metrics.update_staleness(0.0);
-        self.alerts.heartbeat().await;
-        self.refresh_risk_context(&candle.symbol);
-
-        // Update price in paper trading client if using paper mode
-        if let Some(paper_client) = self
-            .orchestrator
-            .execution_engine()
-            .client()
-            .as_any()
-            .downcast_ref::<PaperExecutionClient>()
-        {
-            paper_client.update_price(&candle.symbol, candle.close);
-        }
-
-        self.strategy_ctx.push_candle(candle.clone());
-        self.strategy
-            .on_candle(&self.strategy_ctx, &candle)
-            .context("strategy failure on candle")?;
-        self.persisted.last_candle_ts = Some(candle.timestamp);
-        self.persisted
-            .last_prices
-            .insert(candle.symbol.clone(), candle.close);
-        self.save_state().await?;
-        self.process_signals().await?;
-        Ok(())
-    }
-
-    async fn handle_order_book(&mut self, book: OrderBook) -> Result<()> {
-        self.metrics.update_staleness(0.0);
-        self.alerts.heartbeat().await;
-        self.strategy_ctx.push_order_book(book.clone());
-        self.strategy
-            .on_order_book(&self.strategy_ctx, &book)
-            .context("strategy failure on order book")?;
-        self.process_signals().await?;
-        Ok(())
-    }
-    fn current_risk_context(&self, symbol: &str) -> RiskContext {
-        let last_price = self
-            .market
-            .get(symbol)
-            .and_then(|snapshot| snapshot.price())
-            .or_else(|| self.persisted.last_prices.get(symbol).copied())
-            .unwrap_or(Decimal::ZERO);
-        RiskContext {
-            signed_position_qty: self.portfolio.signed_position_qty(symbol),
-            portfolio_equity: self.portfolio.equity(),
-            last_price,
-            liquidate_only: self.portfolio.liquidate_only(),
-        }
-    }
-
-    fn refresh_risk_context(&self, symbol: &str) {
-        let ctx = self.current_risk_context(symbol);
-        self.orchestrator
-            .update_risk_context(symbol.to_string(), ctx);
-    }
-
-    async fn process_signals(&mut self) -> Result<()> {
-        let signals = self.strategy.drain_signals();
-        if signals.is_empty() {
-            return Ok(());
-        }
-        self.metrics.inc_signals(signals.len());
-        for signal in signals {
-            let ctx = self.current_risk_context(&signal.symbol);
-            self.orchestrator
-                .update_risk_context(signal.symbol.clone(), ctx);
-            match self.orchestrator.on_signal(&signal, &ctx).await {
-                Ok(()) => {
-                    // The orchestrator handles order submission internally
-                    // Metrics and alerts are handled when fills are received
-                    self.alerts.reset_order_failures().await;
-                }
-                Err(err) => {
-                    warn!(error = %err, "orchestrator rejected signal");
-                    self.metrics.inc_order_failure();
-                    self.alerts
-                        .order_failure(&format!("orchestrator error: {err}"))
-                        .await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_order_update(&mut self, order: Order) -> Result<()> {
-        info!(
-            order_id = %order.id,
-            status = ?order.status,
-            "Received real-time order update"
-        );
-        let mut found = false;
-        for existing in &mut self.persisted.open_orders {
-            if existing.id == order.id {
-                existing.status = order.status;
-                existing.updated_at = order.updated_at;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            self.persisted.open_orders.push(order.clone());
-        }
-
-        if matches!(
-            order.status,
-            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
-        ) {
-            self.persisted.open_orders.retain(|o| o.id != order.id);
-        }
-
-        self.save_state().await?;
-        Ok(())
-    }
-
-    async fn handle_real_fill(&mut self, fill: Fill) -> Result<()> {
-        info!(
-            order_id = %fill.order_id,
-            symbol = %fill.symbol,
-            price = %fill.fill_price,
-            qty = %fill.fill_quantity,
-            "Processing real fill"
-        );
-
-        self.portfolio
-            .apply_fill(&fill)
-            .context("Failed to apply real fill to portfolio")?;
-        self.strategy_ctx
-            .update_positions(self.portfolio.positions());
-        self.refresh_risk_context(&fill.symbol);
-
-        // Route fill to orchestrator after portfolio state refresh
-        if let Err(e) = self.orchestrator.on_fill(&fill).await {
-            warn!(error = %e, "Orchestrator failed to process fill");
-        }
-
-        self.strategy
-            .on_fill(&self.strategy_ctx, &fill)
-            .context("Strategy failed on real fill event")?;
-        let equity = self.portfolio.equity();
-        if let Some(value) = equity.to_f64() {
-            self.metrics.update_equity(value);
-        }
-        self.alerts.update_equity(equity).await;
-        self.metrics.inc_order(); // Count the fill as a completed order
-        self.alerts
-            .notify(
-                "Order Filled",
-                &format!(
-                    "order filled: {}@{} ({})",
-                    fill.fill_quantity,
-                    fill.fill_price,
-                    match fill.side {
-                        Side::Buy => "buy",
-                        Side::Sell => "sell",
-                    }
-                ),
-            )
-            .await;
-        self.persisted.portfolio = Some(self.portfolio.snapshot());
-        self.save_state().await
-    }
-
     async fn save_state(&self) -> Result<()> {
-        let repo = self.state_repo.clone();
-        let snapshot = self.persisted.clone();
-        tokio::task::spawn_blocking(move || repo.save(&snapshot))
-            .await
-            .map_err(|err| anyhow!("state persistence task failed: {err}"))?
-            .map_err(|err| anyhow!(err.to_string()))
+        persist_state(self.state_repo.clone(), self.persisted.clone()).await
     }
 }
 
@@ -879,5 +686,498 @@ impl ShutdownSignal {
 impl Default for ShutdownSignal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_event_subscribers(
+    bus: Arc<EventBus>,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    strategy_ctx: Arc<Mutex<StrategyContext>>,
+    orchestrator: Arc<OrderOrchestrator>,
+    portfolio: Arc<Mutex<Portfolio>>,
+    metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
+    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    state_repo: Arc<dyn StateRepository>,
+    persisted: Arc<Mutex<LiveState>>,
+    exec_backend: ExecutionBackend,
+) -> Vec<JoinHandle<()>> {
+    let mut handles = Vec::new();
+
+    let market_bus = bus.clone();
+    let market_strategy = strategy.clone();
+    let market_ctx = strategy_ctx.clone();
+    let market_metrics = metrics.clone();
+    let market_alerts = alerts.clone();
+    let market_state = state_repo.clone();
+    let market_persisted = persisted.clone();
+    let market_portfolio = portfolio.clone();
+    let market_snapshot = market.clone();
+    let orchestrator_clone = orchestrator.clone();
+    handles.push(tokio::spawn(async move {
+        let mut stream = market_bus.subscribe();
+        loop {
+            match stream.recv().await {
+                Ok(Event::Tick(evt)) => {
+                    if let Err(err) = process_tick_event(
+                        evt.tick,
+                        market_strategy.clone(),
+                        market_ctx.clone(),
+                        market_metrics.clone(),
+                        market_alerts.clone(),
+                        market_snapshot.clone(),
+                        market_persisted.clone(),
+                        market_bus.clone(),
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "tick handler failed");
+                    }
+                }
+                Ok(Event::Candle(evt)) => {
+                    if let Err(err) = process_candle_event(
+                        evt.candle,
+                        market_strategy.clone(),
+                        market_ctx.clone(),
+                        market_metrics.clone(),
+                        market_alerts.clone(),
+                        market_snapshot.clone(),
+                        market_portfolio.clone(),
+                        orchestrator_clone.clone(),
+                        exec_backend,
+                        market_state.clone(),
+                        market_persisted.clone(),
+                        market_bus.clone(),
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "candle handler failed");
+                    }
+                }
+                Ok(Event::OrderBook(evt)) => {
+                    if let Err(err) = process_order_book_event(
+                        evt.order_book,
+                        market_strategy.clone(),
+                        market_ctx.clone(),
+                        market_metrics.clone(),
+                        market_alerts.clone(),
+                        market_snapshot.clone(),
+                        market_bus.clone(),
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "order book handler failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(lag)) => {
+                    warn!(lag = lag, "market subscriber lagged");
+                    continue;
+                }
+            }
+        }
+    }));
+
+    let exec_bus = bus.clone();
+    let exec_portfolio = portfolio.clone();
+    let exec_market = market.clone();
+    let exec_persisted = persisted.clone();
+    let exec_alerts = alerts.clone();
+    let exec_metrics = metrics.clone();
+    let exec_orchestrator = orchestrator.clone();
+    handles.push(tokio::spawn(async move {
+        let orchestrator = exec_orchestrator.clone();
+        let mut stream = exec_bus.subscribe();
+        loop {
+            match stream.recv().await {
+                Ok(Event::Signal(evt)) => {
+                    if let Err(err) = process_signal_event(
+                        evt.signal,
+                        orchestrator.clone(),
+                        exec_portfolio.clone(),
+                        exec_market.clone(),
+                        exec_persisted.clone(),
+                        exec_alerts.clone(),
+                        exec_metrics.clone(),
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "signal handler failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(lag)) => {
+                    warn!(lag = lag, "signal subscriber lagged");
+                    continue;
+                }
+            }
+        }
+    }));
+
+    let fill_bus = bus.clone();
+    let fill_state = state_repo.clone();
+    let fill_orchestrator = orchestrator.clone();
+    let fill_persisted = persisted.clone();
+    handles.push(tokio::spawn(async move {
+        let orchestrator = fill_orchestrator.clone();
+        let persisted = fill_persisted.clone();
+        let mut stream = fill_bus.subscribe();
+        loop {
+            match stream.recv().await {
+                Ok(Event::Fill(evt)) => {
+                    if let Err(err) = process_fill_event(
+                        evt.fill,
+                        portfolio.clone(),
+                        strategy.clone(),
+                        strategy_ctx.clone(),
+                        orchestrator.clone(),
+                        metrics.clone(),
+                        alerts.clone(),
+                        fill_state.clone(),
+                        persisted.clone(),
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "fill handler failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(lag)) => {
+                    warn!(lag = lag, "fill subscriber lagged");
+                    continue;
+                }
+            }
+        }
+    }));
+
+    let order_bus = bus.clone();
+    let order_persisted = persisted.clone();
+    handles.push(tokio::spawn(async move {
+        let persisted = order_persisted.clone();
+        let mut stream = order_bus.subscribe();
+        loop {
+            match stream.recv().await {
+                Ok(Event::OrderUpdate(evt)) => {
+                    if let Err(err) =
+                        process_order_update_event(evt.order, state_repo.clone(), persisted.clone())
+                            .await
+                    {
+                        warn!(error = %err, "order update handler failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(lag)) => {
+                    warn!(lag = lag, "order subscriber lagged");
+                    continue;
+                }
+            }
+        }
+    }));
+
+    handles
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_tick_event(
+    tick: Tick,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    strategy_ctx: Arc<Mutex<StrategyContext>>,
+    metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
+    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    persisted: Arc<Mutex<LiveState>>,
+    bus: Arc<EventBus>,
+) -> Result<()> {
+    metrics.inc_tick();
+    metrics.update_staleness(0.0);
+    alerts.heartbeat().await;
+    {
+        let mut guard = market.lock().await;
+        if let Some(snapshot) = guard.get_mut(&tick.symbol) {
+            snapshot.last_trade = Some(tick.price);
+            snapshot.last_trade_ts = Some(tick.exchange_timestamp);
+        }
+    }
+    {
+        let mut state = persisted.lock().await;
+        state.last_prices.insert(tick.symbol.clone(), tick.price);
+    }
+    {
+        let mut ctx = strategy_ctx.lock().await;
+        ctx.push_tick(tick.clone());
+        let mut strat = strategy.lock().await;
+        strat
+            .on_tick(&ctx, &tick)
+            .context("strategy failure on tick event")?;
+    }
+    emit_signals(strategy.clone(), bus.clone(), metrics.clone()).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_candle_event(
+    candle: Candle,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    strategy_ctx: Arc<Mutex<StrategyContext>>,
+    metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
+    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    portfolio: Arc<Mutex<Portfolio>>,
+    orchestrator: Arc<OrderOrchestrator>,
+    exec_backend: ExecutionBackend,
+    state_repo: Arc<dyn StateRepository>,
+    persisted: Arc<Mutex<LiveState>>,
+    bus: Arc<EventBus>,
+) -> Result<()> {
+    metrics.inc_candle();
+    metrics.update_staleness(0.0);
+    alerts.heartbeat().await;
+    metrics.update_price(&candle.symbol, candle.close.to_f64().unwrap_or(0.0));
+    {
+        let mut guard = market.lock().await;
+        if let Some(snapshot) = guard.get_mut(&candle.symbol) {
+            snapshot.last_candle = Some(candle.clone());
+            snapshot.last_trade = Some(candle.close);
+        }
+    }
+    if exec_backend.is_paper() {
+        let client = orchestrator.execution_engine().client();
+        if let Some(paper) = client.as_any().downcast_ref::<PaperExecutionClient>() {
+            paper.update_price(&candle.symbol, candle.close);
+        }
+    }
+    {
+        let mut ctx = strategy_ctx.lock().await;
+        ctx.push_candle(candle.clone());
+        let mut strat = strategy.lock().await;
+        strat
+            .on_candle(&ctx, &candle)
+            .context("strategy failure on candle event")?;
+    }
+    {
+        let mut snapshot = persisted.lock().await;
+        snapshot.last_candle_ts = Some(candle.timestamp);
+        snapshot
+            .last_prices
+            .insert(candle.symbol.clone(), candle.close);
+    }
+    persist_state(state_repo.clone(), persisted.clone()).await?;
+    let ctx = shared_risk_context(&candle.symbol, &portfolio, &market, &persisted).await;
+    orchestrator.update_risk_context(candle.symbol.clone(), ctx);
+    emit_signals(strategy.clone(), bus.clone(), metrics.clone()).await;
+    Ok(())
+}
+
+async fn process_order_book_event(
+    book: OrderBook,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    strategy_ctx: Arc<Mutex<StrategyContext>>,
+    metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
+    _market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    bus: Arc<EventBus>,
+) -> Result<()> {
+    metrics.update_staleness(0.0);
+    alerts.heartbeat().await;
+    {
+        let mut ctx = strategy_ctx.lock().await;
+        ctx.push_order_book(book.clone());
+        let mut strat = strategy.lock().await;
+        strat
+            .on_order_book(&ctx, &book)
+            .context("strategy failure on order book")?;
+    }
+    emit_signals(strategy.clone(), bus.clone(), metrics.clone()).await;
+    Ok(())
+}
+
+async fn process_signal_event(
+    signal: Signal,
+    orchestrator: Arc<OrderOrchestrator>,
+    portfolio: Arc<Mutex<Portfolio>>,
+    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    persisted: Arc<Mutex<LiveState>>,
+    alerts: Arc<AlertManager>,
+    metrics: Arc<LiveMetrics>,
+) -> Result<()> {
+    let ctx = shared_risk_context(&signal.symbol, &portfolio, &market, &persisted).await;
+    orchestrator.update_risk_context(signal.symbol.clone(), ctx);
+    match orchestrator.on_signal(&signal, &ctx).await {
+        Ok(()) => {
+            alerts.reset_order_failures().await;
+        }
+        Err(err) => {
+            metrics.inc_order_failure();
+            alerts
+                .order_failure(&format!("orchestrator error: {err}"))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_fill_event(
+    fill: Fill,
+    portfolio: Arc<Mutex<Portfolio>>,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    strategy_ctx: Arc<Mutex<StrategyContext>>,
+    orchestrator: Arc<OrderOrchestrator>,
+    metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
+    state_repo: Arc<dyn StateRepository>,
+    persisted: Arc<Mutex<LiveState>>,
+) -> Result<()> {
+    {
+        let mut guard = portfolio.lock().await;
+        guard
+            .apply_fill(&fill)
+            .context("Failed to apply fill to portfolio")?;
+        let snapshot = guard.snapshot();
+        let mut persisted_guard = persisted.lock().await;
+        persisted_guard.portfolio = Some(snapshot);
+    }
+    {
+        let positions = {
+            let guard = portfolio.lock().await;
+            guard.positions()
+        };
+        let mut ctx = strategy_ctx.lock().await;
+        ctx.update_positions(positions);
+    }
+    orchestrator.on_fill(&fill).await.ok();
+    {
+        let mut strat = strategy.lock().await;
+        let ctx = strategy_ctx.lock().await;
+        strat
+            .on_fill(&ctx, &fill)
+            .context("Strategy failed on fill event")?;
+    }
+    let equity = {
+        let guard = portfolio.lock().await;
+        guard.equity()
+    };
+    if let Some(value) = equity.to_f64() {
+        metrics.update_equity(value);
+    }
+    alerts.update_equity(equity).await;
+    metrics.inc_order();
+    alerts
+        .notify(
+            "Order Filled",
+            &format!(
+                "order filled: {}@{} ({})",
+                fill.fill_quantity,
+                fill.fill_price,
+                match fill.side {
+                    Side::Buy => "buy",
+                    Side::Sell => "sell",
+                }
+            ),
+        )
+        .await;
+    persist_state(state_repo.clone(), persisted.clone()).await?;
+    Ok(())
+}
+
+async fn process_order_update_event(
+    order: Order,
+    state_repo: Arc<dyn StateRepository>,
+    persisted: Arc<Mutex<LiveState>>,
+) -> Result<()> {
+    {
+        let mut snapshot = persisted.lock().await;
+        let mut found = false;
+        for existing in &mut snapshot.open_orders {
+            if existing.id == order.id {
+                *existing = order.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            snapshot.open_orders.push(order.clone());
+        }
+        if matches!(
+            order.status,
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+        ) {
+            snapshot.open_orders.retain(|o| o.id != order.id);
+        }
+    }
+    persist_state(state_repo, persisted).await?;
+    Ok(())
+}
+
+async fn emit_signals(
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    bus: Arc<EventBus>,
+    metrics: Arc<LiveMetrics>,
+) {
+    let signals = {
+        let mut strat = strategy.lock().await;
+        strat.drain_signals()
+    };
+    if signals.is_empty() {
+        return;
+    }
+    metrics.inc_signals(signals.len());
+    for signal in signals {
+        bus.publish(Event::Signal(SignalEvent { signal }));
+    }
+}
+
+async fn persist_state(
+    repo: Arc<dyn StateRepository>,
+    persisted: Arc<Mutex<LiveState>>,
+) -> Result<()> {
+    let snapshot = {
+        let guard = persisted.lock().await;
+        guard.clone()
+    };
+    tokio::task::spawn_blocking(move || repo.save(&snapshot))
+        .await
+        .map_err(|err| anyhow!("state persistence task failed: {err}"))?
+        .map_err(|err| anyhow!(err.to_string()))
+}
+
+async fn shared_risk_context(
+    symbol: &str,
+    portfolio: &Arc<Mutex<Portfolio>>,
+    market: &Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    persisted: &Arc<Mutex<LiveState>>,
+) -> RiskContext {
+    let (signed_qty, equity, liquidate_only) = {
+        let guard = portfolio.lock().await;
+        (
+            guard.signed_position_qty(symbol),
+            guard.equity(),
+            guard.liquidate_only(),
+        )
+    };
+    let observed_price = {
+        let guard = market.lock().await;
+        guard.get(symbol).and_then(|snapshot| snapshot.price())
+    };
+    let last_price = if let Some(price) = observed_price {
+        price
+    } else {
+        let guard = persisted.lock().await;
+        guard
+            .last_prices
+            .get(symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    };
+    RiskContext {
+        signed_position_qty: signed_qty,
+        portfolio_equity: equity,
+        last_price,
+        liquidate_only,
     }
 }

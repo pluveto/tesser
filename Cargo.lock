@@ -2123,6 +2123,7 @@ dependencies = [
  "tesser-config",
  "tesser-core",
  "tesser-data",
+ "tesser-events",
  "tesser-execution",
  "tesser-paper",
  "tesser-portfolio",
@@ -2173,6 +2174,15 @@ dependencies = [
  "tesser-core",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "tesser-events"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tesser-core",
+ "tokio",
 ]
 
 [[package]]

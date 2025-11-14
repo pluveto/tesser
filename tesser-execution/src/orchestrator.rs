@@ -33,6 +33,7 @@ struct StoredAlgoState {
 /// - Routing events (fills, ticks, timers) to appropriate algorithms
 /// - Persisting algorithm state for crash recovery
 /// - Handling the lifecycle of algorithmic orders
+#[derive(Clone)]
 pub struct OrderOrchestrator {
     /// Active algorithm instances.
     algorithms: Arc<Mutex<HashMap<Uuid, Box<dyn ExecutionAlgorithm>>>>,

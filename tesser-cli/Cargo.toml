@@ -26,6 +26,7 @@ tesser-backtester = { path = "../tesser-backtester" }
 tesser-config = { path = "../tesser-config" }
 tesser-core = { path = "../tesser-core" }
 tesser-data = { path = "../tesser-data" }
+tesser-events = { path = "../tesser-events" }
 tesser-execution = { path = "../tesser-execution" }
 tesser-portfolio = { path = "../tesser-portfolio" }
 tesser-strategy = { path = "../tesser-strategy" }
