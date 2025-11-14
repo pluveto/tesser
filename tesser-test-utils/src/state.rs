@@ -2,11 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, Mutex};
 
-use tesser_core::{AccountBalance, Candle, Fill, Order, OrderId, Position, Side, Symbol, Tick};
+use tesser_core::{
+    AccountBalance, Candle, Fill, Order, OrderId, OrderStatus, Position, Price, Quantity, Side,
+    Symbol, Tick,
+};
 
 use crate::scenario::ScenarioManager;
 
@@ -176,6 +179,39 @@ impl AccountState {
             }
         }
         quote.updated_at = Utc::now();
+    }
+
+    pub fn order_by_link_id(&self, client_id: &str) -> Option<OrderId> {
+        self.orders
+            .values()
+            .find(|order| order.request.client_order_id.as_deref() == Some(client_id))
+            .map(|order| order.id.clone())
+    }
+
+    pub fn order(&self, order_id: &OrderId) -> Option<Order> {
+        self.orders.get(order_id).cloned()
+    }
+
+    pub fn balances_snapshot(&self) -> Vec<AccountBalance> {
+        self.balances.values().cloned().collect()
+    }
+
+    pub fn positions_snapshot(&self) -> Vec<Position> {
+        self.positions.values().cloned().collect()
+    }
+
+    pub fn executions_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+    ) -> Vec<Fill> {
+        self.executions
+            .iter()
+            .filter(|fill| {
+                fill.timestamp >= start && end.map(|limit| fill.timestamp <= limit).unwrap_or(true)
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -359,14 +395,14 @@ impl MockExchangeState {
 
     pub async fn with_account<F, T>(&self, api_key: &str, f: F) -> Result<T>
     where
-        F: FnOnce(&AccountState) -> T,
+        F: FnOnce(&AccountState) -> Result<T>,
     {
         let guard = self.inner.lock().await;
         let account = guard
             .accounts
             .get(api_key)
             .ok_or_else(|| anyhow!("unknown API key {api_key}"))?;
-        Ok(f(account))
+        f(account)
     }
 
     pub async fn next_order_id(&self) -> OrderId {
@@ -374,5 +410,145 @@ impl MockExchangeState {
         let id = guard.order_seq;
         guard.order_seq += 1;
         format!("MOCK-ORDER-{id}")
+    }
+
+    pub async fn register_order(&self, api_key: &str, order: Order) -> Result<Order> {
+        self.with_account_mut(api_key, |account| {
+            account.insert_order(order.clone());
+            Ok(order)
+        })
+        .await
+    }
+
+    pub async fn get_order(&self, api_key: &str, order_id: &OrderId) -> Result<Order> {
+        self.with_account(api_key, |account| {
+            account
+                .order(order_id)
+                .ok_or_else(|| anyhow!("unknown order id {order_id}"))
+        })
+        .await
+    }
+
+    pub async fn find_order_id(
+        &self,
+        api_key: &str,
+        order_id: Option<&str>,
+        order_link_id: Option<&str>,
+    ) -> Result<OrderId> {
+        if let Some(id) = order_id {
+            return Ok(id.to_string());
+        }
+        if let Some(link) = order_link_id {
+            return self
+                .with_account(api_key, |account| {
+                    account
+                        .order_by_link_id(link)
+                        .ok_or_else(|| anyhow!("unknown order link id {link}"))
+                })
+                .await;
+        }
+        Err(anyhow!(
+            "request must provide either orderId or orderLinkId"
+        ))
+    }
+
+    pub async fn cancel_order(&self, api_key: &str, order_id: &OrderId) -> Result<Order> {
+        self.with_account_mut(api_key, |account| {
+            account.update_order(order_id, |order| {
+                order.status = OrderStatus::Canceled;
+                order.updated_at = Utc::now();
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    pub async fn fill_order(
+        &self,
+        api_key: &str,
+        order_id: &OrderId,
+        quantity: Quantity,
+        price: Price,
+    ) -> Result<(Order, Fill)> {
+        let mut guard = self.inner.lock().await;
+        let account = guard
+            .accounts
+            .get_mut(api_key)
+            .ok_or_else(|| anyhow!("unknown API key {api_key}"))?;
+        let (fill, order_snapshot) = {
+            let order = account
+                .orders
+                .get_mut(order_id)
+                .ok_or_else(|| anyhow!("unknown order id {order_id}"))?;
+            let remaining = (order.request.quantity - order.filled_quantity).max(Decimal::ZERO);
+            if remaining.is_zero() {
+                return Err(anyhow!("order already fully filled"));
+            }
+            let exec_quantity = quantity.min(remaining);
+            if exec_quantity.is_zero() {
+                return Err(anyhow!("fill quantity resolved to zero"));
+            }
+            let filled_before = order.filled_quantity;
+            let new_filled = filled_before + exec_quantity;
+            let avg_price = if filled_before.is_zero() {
+                price
+            } else {
+                let previous_total = order.avg_fill_price.unwrap_or(price) * filled_before;
+                (previous_total + price * exec_quantity) / new_filled
+            };
+            order.filled_quantity = new_filled;
+            order.avg_fill_price = Some(avg_price);
+            order.status = if new_filled >= order.request.quantity {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            };
+            order.updated_at = Utc::now();
+            let fill = Fill {
+                order_id: order.id.clone(),
+                symbol: order.request.symbol.clone(),
+                side: order.request.side,
+                fill_price: price,
+                fill_quantity: exec_quantity,
+                fee: None,
+                timestamp: Utc::now(),
+            };
+            let order_snapshot = order.clone();
+            (fill, order_snapshot)
+        };
+        account.apply_fill(&fill);
+        Ok((order_snapshot, fill))
+    }
+
+    pub async fn account_balances(&self, api_key: &str) -> Result<Vec<AccountBalance>> {
+        self.with_account(api_key, |account| Ok(account.balances_snapshot()))
+            .await
+    }
+
+    pub async fn account_positions(&self, api_key: &str) -> Result<Vec<Position>> {
+        self.with_account(api_key, |account| Ok(account.positions_snapshot()))
+            .await
+    }
+
+    pub async fn executions_between(
+        &self,
+        api_key: &str,
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Fill>> {
+        self.with_account(api_key, |account| {
+            Ok(account.executions_in_range(start, end))
+        })
+        .await
+    }
+
+    pub async fn next_candle(&self) -> Option<Candle> {
+        let mut guard = self.inner.lock().await;
+        guard.market_data.next_candle()
+    }
+
+    pub async fn next_tick(&self) -> Option<Tick> {
+        let mut guard = self.inner.lock().await;
+        guard.market_data.next_tick()
     }
 }
