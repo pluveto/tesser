@@ -5,7 +5,8 @@ use std::any::Any;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tesser_core::{
-    AccountBalance, Candle, Order, OrderBook, OrderId, OrderRequest, Position, Signal, Tick,
+    AccountBalance, Candle, Instrument, Order, OrderBook, OrderId, OrderRequest, Position, Signal,
+    Tick,
 };
 use thiserror::Error;
 
@@ -115,6 +116,9 @@ pub trait ExecutionClient: Send + Sync {
 
     /// Retrieve the current open positions.
     async fn positions(&self) -> BrokerResult<Vec<Position>>;
+
+    /// Retrieve instrument metadata for the provided market category.
+    async fn list_instruments(&self, category: &str) -> BrokerResult<Vec<Instrument>>;
 
     /// Helper for downcasting to a concrete type.
     fn as_any(&self) -> &dyn Any;

@@ -259,7 +259,7 @@ Key CLI flags:
 | `--latency-ms` | Delay between signal and fill simulation | `0` |
 | `--state-path`, `--metrics-addr`, `--log-path` | Override the `[live]` config block | see config |
 | `--webhook-url` | Per-run override for `[live.alerting].webhook_url` | empty |
-| `--initial-equity` | Override `[backtest].initial_equity` for this session | see config |
+| `--initial-equity` | Override the `[backtest.initial_balances]` entry for the reporting currency | see config |
 | `--risk-max-order-qty`, `--risk-max-position-qty`, `--risk-max-drawdown` | Override `[risk_management]` guardrails | see config |
 | `--alert-max-data-gap-secs`, `--alert-max-order-failures`, `--alert-max-drawdown` | Override `[live.alerting]` thresholds | see config |
 

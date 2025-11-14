@@ -16,6 +16,7 @@ tesser-core = { path = "../tesser-core" }
 tesser-data = { path = "../tesser-data" }
 tesser-execution = { path = "../tesser-execution" }
 tesser-portfolio = { path = "../tesser-portfolio" }
+tesser-markets = { path = "../tesser-markets" }
 tesser-strategy = { path = "../tesser-strategy" }
 tesser-paper = { path = "../connectors/tesser-paper" }
 itertools = "0.13"

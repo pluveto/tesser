@@ -24,7 +24,8 @@ use tesser_bybit::{
 };
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
-    Candle, Fill, Interval, Order, OrderBook, OrderStatus, Price, Quantity, Side, Signal, Tick,
+    Candle, Fill, Interval, Order, OrderBook, OrderStatus, Price, Quantity, Side, Signal, Symbol,
+    Tick,
 };
 use tesser_events::{
     CandleEvent, Event, EventBus, FillEvent, OrderBookEvent, OrderUpdateEvent, SignalEvent,
@@ -34,6 +35,7 @@ use tesser_execution::{
     BasicRiskChecker, ExecutionEngine, FixedOrderSizer, OrderOrchestrator, PreTradeRiskChecker,
     RiskContext, RiskLimits, SqliteAlgoStateRepository,
 };
+use tesser_markets::MarketRegistry;
 use tesser_paper::PaperExecutionClient;
 use tesser_portfolio::{
     LiveState, Portfolio, PortfolioConfig, SqliteStateRepository, StateRepository,
@@ -74,7 +76,9 @@ pub struct LiveSessionSettings {
     pub history: usize,
     pub metrics_addr: SocketAddr,
     pub state_path: PathBuf,
-    pub initial_equity: Price,
+    pub initial_balances: HashMap<Symbol, Decimal>,
+    pub reporting_currency: Symbol,
+    pub markets_file: Option<PathBuf>,
     pub alerting: AlertingConfig,
     pub exec_backend: ExecutionBackend,
     pub risk: RiskManagementConfig,
@@ -140,6 +144,7 @@ pub async fn run_live_with_shutdown(
     }
 
     let execution_client = build_execution_client(&exchange, &settings)?;
+    let market_registry = load_market_registry(execution_client.clone(), &settings).await?;
     if matches!(settings.exec_backend, ExecutionBackend::Live) {
         info!(
             rest = %exchange.rest_url,
@@ -150,7 +155,7 @@ pub async fn run_live_with_shutdown(
     let risk_checker: Arc<dyn PreTradeRiskChecker> =
         Arc::new(BasicRiskChecker::new(settings.risk_limits()));
     let execution = ExecutionEngine::new(
-        execution_client,
+        execution_client.clone(),
         Box::new(FixedOrderSizer {
             quantity: settings.quantity,
         }),
@@ -164,8 +169,16 @@ pub async fn run_live_with_shutdown(
     // Create orchestrator with execution engine
     let orchestrator = OrderOrchestrator::new(Arc::new(execution), algo_state_repo).await?;
 
-    let runtime =
-        LiveRuntime::new(stream, strategy, symbols, orchestrator, settings, shutdown).await?;
+    let runtime = LiveRuntime::new(
+        stream,
+        strategy,
+        symbols,
+        orchestrator,
+        settings,
+        market_registry,
+        shutdown,
+    )
+    .await?;
     runtime.run().await
 }
 
@@ -228,6 +241,7 @@ impl LiveRuntime {
         symbols: Vec<String>,
         orchestrator: OrderOrchestrator,
         settings: LiveSessionSettings,
+        market_registry: Arc<MarketRegistry>,
         shutdown: ShutdownSignal,
     ) -> Result<Self> {
         let mut strategy_ctx = StrategyContext::new(settings.history);
@@ -274,15 +288,21 @@ impl LiveRuntime {
         }
 
         let portfolio_cfg = PortfolioConfig {
-            initial_equity: settings.initial_equity,
+            initial_balances: settings.initial_balances.clone(),
+            reporting_currency: settings.reporting_currency.clone(),
             max_drawdown: Some(settings.risk.max_drawdown),
         };
         let portfolio = if let Some((positions, balances)) = live_bootstrap {
-            Portfolio::from_exchange_state(positions, balances, portfolio_cfg.clone())
+            Portfolio::from_exchange_state(
+                positions,
+                balances,
+                portfolio_cfg.clone(),
+                market_registry.clone(),
+            )
         } else if let Some(snapshot) = persisted.portfolio.take() {
-            Portfolio::from_state(snapshot, portfolio_cfg.clone())
+            Portfolio::from_state(snapshot, portfolio_cfg.clone(), market_registry.clone())
         } else {
-            Portfolio::new(portfolio_cfg.clone())
+            Portfolio::new(portfolio_cfg.clone(), market_registry.clone())
         };
         strategy_ctx.update_positions(portfolio.positions());
         persisted.portfolio = Some(portfolio.snapshot());
@@ -727,6 +747,7 @@ fn spawn_event_subscribers(
                         market_metrics.clone(),
                         market_alerts.clone(),
                         market_snapshot.clone(),
+                        market_portfolio.clone(),
                         market_persisted.clone(),
                         market_bus.clone(),
                     )
@@ -890,6 +911,7 @@ async fn process_tick_event(
     metrics: Arc<LiveMetrics>,
     alerts: Arc<AlertManager>,
     market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    portfolio: Arc<Mutex<Portfolio>>,
     persisted: Arc<Mutex<LiveState>>,
     bus: Arc<EventBus>,
 ) -> Result<()> {
@@ -906,6 +928,12 @@ async fn process_tick_event(
     {
         let mut state = persisted.lock().await;
         state.last_prices.insert(tick.symbol.clone(), tick.price);
+    }
+    {
+        let mut guard = portfolio.lock().await;
+        if let Err(err) = guard.update_market_data(&tick.symbol, tick.price) {
+            warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
+        }
     }
     {
         let mut ctx = strategy_ctx.lock().await;
@@ -949,6 +977,12 @@ async fn process_candle_event(
         let client = orchestrator.execution_engine().client();
         if let Some(paper) = client.as_any().downcast_ref::<PaperExecutionClient>() {
             paper.update_price(&candle.symbol, candle.close);
+        }
+    }
+    {
+        let mut guard = portfolio.lock().await;
+        if let Err(err) = guard.update_market_data(&candle.symbol, candle.close) {
+            warn!(symbol = %candle.symbol, error = %err, "failed to refresh market data");
         }
     }
     {
@@ -1180,4 +1214,29 @@ async fn shared_risk_context(
         last_price,
         liquidate_only,
     }
+}
+
+async fn load_market_registry(
+    client: Arc<dyn ExecutionClient>,
+    settings: &LiveSessionSettings,
+) -> Result<Arc<MarketRegistry>> {
+    if let Some(path) = &settings.markets_file {
+        let registry = MarketRegistry::load_from_file(path)
+            .with_context(|| format!("failed to load markets from {}", path.display()))?;
+        return Ok(Arc::new(registry));
+    }
+
+    if settings.exec_backend.is_paper() {
+        return Err(anyhow!(
+            "paper execution requires --markets-file when exchange metadata is unavailable"
+        ));
+    }
+
+    let instruments = client
+        .list_instruments(settings.category.as_path())
+        .await
+        .context("failed to fetch instruments from execution client")?;
+    let registry =
+        MarketRegistry::from_instruments(instruments).map_err(|err| anyhow!(err.to_string()))?;
+    Ok(Arc::new(registry))
 }

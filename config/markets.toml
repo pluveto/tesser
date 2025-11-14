@@ -1,0 +1,17 @@
+[[markets]]
+symbol = "BTCUSDT"
+base = "BTC"
+quote = "USDT"
+settlement_currency = "USDT"
+kind = "linear_perpetual"
+tick_size = 0.5
+lot_size = 0.001
+
+[[markets]]
+symbol = "ETHUSDT"
+base = "ETH"
+quote = "USDT"
+settlement_currency = "USDT"
+kind = "linear_perpetual"
+tick_size = 0.05
+lot_size = 0.001

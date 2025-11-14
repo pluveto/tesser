@@ -6,7 +6,11 @@ data_path = "./data"
 log_level = "info"
 
 [backtest]
-initial_equity = 10000.0
+reporting_currency = "USDT"
+markets_file = "config/markets.toml"
+
+[backtest.initial_balances]
+USDT = 10000.0
 
 [risk_management]
 max_order_quantity = 1.0

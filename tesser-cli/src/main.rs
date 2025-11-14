@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -30,6 +31,7 @@ use tesser_execution::{
     ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
     RiskAdjustedSizer,
 };
+use tesser_markets::MarketRegistry;
 use tesser_paper::{MatchingEngine, PaperExecutionClient};
 use tesser_strategy::{builtin_strategy_names, load_strategy};
 use tracing::{info, warn};
@@ -350,6 +352,8 @@ struct BacktestRunArgs {
     /// One or more JSONL files containing tick/order book events (required for `--mode tick`)
     #[arg(long = "lob-data", value_name = "PATH", num_args = 0.., action = clap::ArgAction::Append)]
     lob_paths: Vec<PathBuf>,
+    #[arg(long)]
+    markets_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -377,6 +381,8 @@ struct BacktestBatchArgs {
     /// Order sizer (e.g. "fixed:0.01", "percent:0.02")
     #[arg(long, default_value = "fixed:0.01")]
     sizer: String,
+    #[arg(long)]
+    markets_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -407,6 +413,8 @@ struct LiveRunArgs {
     log_path: Option<PathBuf>,
     #[arg(long)]
     initial_equity: Option<Decimal>,
+    #[arg(long)]
+    markets_file: Option<PathBuf>,
     #[arg(long, default_value = "0")]
     slippage_bps: Decimal,
     #[arg(long, default_value = "0")]
@@ -459,10 +467,15 @@ impl LiveRunArgs {
             .with_context(|| format!("invalid metrics address '{addr}'"))
     }
 
-    fn resolved_initial_equity(&self, config: &AppConfig) -> Decimal {
-        self.initial_equity
-            .unwrap_or(config.backtest.initial_equity)
-            .max(Decimal::ZERO)
+    fn resolved_initial_balances(&self, config: &AppConfig) -> HashMap<Symbol, Decimal> {
+        let mut balances = clone_initial_balances(&config.backtest);
+        if let Some(value) = self.initial_equity {
+            balances.insert(
+                config.backtest.reporting_currency.clone(),
+                value.max(Decimal::ZERO),
+            );
+        }
+        balances
     }
 
     fn build_alerting(&self, config: &AppConfig) -> tesser_config::AlertingConfig {
@@ -596,6 +609,17 @@ impl BacktestRunArgs {
             BacktestModeArg::Tick => BacktestMode::Tick,
         };
 
+        let markets_path = self
+            .markets_file
+            .clone()
+            .or_else(|| config.backtest.markets_file.clone())
+            .ok_or_else(|| anyhow!("backtest requires --markets-file or backtest.markets_file"))?;
+        let market_registry = Arc::new(
+            MarketRegistry::load_from_file(&markets_path).with_context(|| {
+                format!("failed to load markets from {}", markets_path.display())
+            })?,
+        );
+
         type CandleModeBundle = (
             Vec<Candle>,
             Vec<MarketEvent>,
@@ -642,7 +666,7 @@ impl BacktestRunArgs {
                 let engine = Arc::new(MatchingEngine::new(
                     "matching-engine",
                     symbols.clone(),
-                    config.backtest.initial_equity,
+                    reporting_balance(&config.backtest),
                 ));
                 (
                     Vec::new(),
@@ -660,13 +684,14 @@ impl BacktestRunArgs {
         let mut cfg = BacktestConfig::new(symbols[0].clone(), candles);
         cfg.lob_events = lob_events;
         cfg.order_quantity = order_quantity;
-        cfg.initial_equity = config.backtest.initial_equity;
+        cfg.initial_balances = clone_initial_balances(&config.backtest);
+        cfg.reporting_currency = config.backtest.reporting_currency.clone();
         cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
         cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
         cfg.execution.latency_candles = self.latency_candles.max(1);
         cfg.mode = mode;
 
-        let report = Backtester::new(cfg, strategy, execution, matching_engine)
+        let report = Backtester::new(cfg, strategy, execution, matching_engine, market_registry)
             .run()
             .await
             .context("backtest failed")?;
@@ -683,6 +708,18 @@ impl BacktestBatchArgs {
         if self.data_paths.is_empty() {
             return Err(anyhow!("provide at least one --data path for batch mode"));
         }
+        let markets_path = self
+            .markets_file
+            .clone()
+            .or_else(|| config.backtest.markets_file.clone())
+            .ok_or_else(|| {
+                anyhow!("batch mode requires --markets-file or backtest.markets_file")
+            })?;
+        let market_registry = Arc::new(
+            MarketRegistry::load_from_file(&markets_path).with_context(|| {
+                format!("failed to load markets from {}", markets_path.display())
+            })?,
+        );
         let mut aggregated = Vec::new();
         for config_path in &self.config_paths {
             let contents = std::fs::read_to_string(config_path).with_context(|| {
@@ -702,12 +739,13 @@ impl BacktestBatchArgs {
                 ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
             let mut cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
             cfg.order_quantity = order_quantity;
-            cfg.initial_equity = config.backtest.initial_equity;
+            cfg.initial_balances = clone_initial_balances(&config.backtest);
+            cfg.reporting_currency = config.backtest.reporting_currency.clone();
             cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
             cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
             cfg.execution.latency_candles = self.latency_candles.max(1);
 
-            let report = Backtester::new(cfg, strategy, execution, None)
+            let report = Backtester::new(cfg, strategy, execution, None, market_registry.clone())
                 .run()
                 .await
                 .with_context(|| format!("backtest failed for {}", config_path.display()))?;
@@ -753,7 +791,12 @@ impl LiveRunArgs {
             bail!("--quantity must be greater than zero");
         }
         let quantity = self.quantity;
-        let initial_equity = self.resolved_initial_equity(config);
+        let initial_balances = self.resolved_initial_balances(config);
+        let reporting_currency = config.backtest.reporting_currency.clone();
+        let markets_file = self
+            .markets_file
+            .clone()
+            .or_else(|| config.backtest.markets_file.clone());
 
         let interval: Interval = self.interval.parse().map_err(|err: String| anyhow!(err))?;
         let category =
@@ -772,7 +815,9 @@ impl LiveRunArgs {
             history,
             metrics_addr,
             state_path,
-            initial_equity,
+            initial_balances,
+            reporting_currency,
+            markets_file,
             alerting,
             exec_backend: self.exec,
             risk: self.build_risk_config(config),
@@ -1225,6 +1270,22 @@ fn write_batch_report(path: &Path, rows: &[BatchRow]) -> Result<()> {
     }
     writer.flush()?;
     Ok(())
+}
+
+fn clone_initial_balances(config: &tesser_config::BacktestConfig) -> HashMap<Symbol, Decimal> {
+    config
+        .initial_balances
+        .iter()
+        .map(|(currency, amount)| (currency.clone(), *amount))
+        .collect()
+}
+
+fn reporting_balance(config: &tesser_config::BacktestConfig) -> Decimal {
+    config
+        .initial_balances
+        .get(&config.reporting_currency)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn parse_sizer(value: &str, cli_quantity: Option<Decimal>) -> Result<Box<dyn OrderSizer>> {

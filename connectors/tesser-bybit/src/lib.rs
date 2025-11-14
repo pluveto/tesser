@@ -15,7 +15,8 @@ use serde_json::Value;
 use sha2::Sha256;
 use tesser_broker::{BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult, ExecutionClient};
 use tesser_core::{
-    AccountBalance, Fill, Order, OrderRequest, OrderStatus, Position, Quantity, Side, TimeInForce,
+    AccountBalance, Fill, Instrument, InstrumentKind, Order, OrderRequest, OrderStatus, Position,
+    Quantity, Side, TimeInForce,
 };
 use tracing::warn;
 
@@ -481,8 +482,58 @@ impl ExecutionClient for BybitClient {
         Ok(positions)
     }
 
+    async fn list_instruments(&self, category: &str) -> BrokerResult<Vec<Instrument>> {
+        let resp = self
+            .http
+            .get(self.url("/v5/market/instruments-info"))
+            .query(&[("category", category)])
+            .send()
+            .await
+            .map_err(|err| BrokerError::Transport(err.to_string()))?
+            .json::<ApiResponse<InstrumentInfoResult>>()
+            .await
+            .map_err(|err| BrokerError::Serialization(err.to_string()))?;
+        self.ensure_success(&resp)?;
+        let mut instruments = Vec::new();
+        for item in resp.result.list {
+            let tick_size = item.price_filter.tick_size.parse().unwrap_or(Decimal::ZERO);
+            let lot_size = item
+                .lot_size_filter
+                .qty_step
+                .as_deref()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(Decimal::ZERO);
+            let settlement = item
+                .settle_coin
+                .clone()
+                .unwrap_or_else(|| item.quote_coin.clone());
+            instruments.push(Instrument {
+                symbol: item.symbol,
+                base: item.base_coin,
+                quote: item.quote_coin,
+                kind: map_instrument_kind(item.contract_type.as_deref(), category),
+                settlement_currency: settlement,
+                tick_size,
+                lot_size,
+            });
+        }
+        Ok(instruments)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+fn map_instrument_kind(contract_type: Option<&str>, category: &str) -> InstrumentKind {
+    match contract_type {
+        Some("InversePerpetual") => InstrumentKind::InversePerpetual,
+        Some("LinearPerpetual") => InstrumentKind::LinearPerpetual,
+        _ => match category {
+            "inverse" => InstrumentKind::InversePerpetual,
+            "spot" => InstrumentKind::Spot,
+            _ => InstrumentKind::LinearPerpetual,
+        },
     }
 }
 
@@ -513,6 +564,40 @@ struct ServerTimeResult {
 struct CreateOrderResult {
     #[serde(rename = "orderId")]
     order_id: String,
+}
+
+#[derive(Deserialize)]
+struct InstrumentInfoResult {
+    list: Vec<InstrumentInfoItem>,
+}
+
+#[derive(Deserialize)]
+struct InstrumentInfoItem {
+    symbol: String,
+    #[serde(rename = "baseCoin")]
+    base_coin: String,
+    #[serde(rename = "quoteCoin")]
+    quote_coin: String,
+    #[serde(rename = "settleCoin")]
+    settle_coin: Option<String>,
+    #[serde(rename = "contractType")]
+    contract_type: Option<String>,
+    #[serde(rename = "priceFilter")]
+    price_filter: InstrumentPriceFilter,
+    #[serde(rename = "lotSizeFilter")]
+    lot_size_filter: InstrumentLotFilter,
+}
+
+#[derive(Deserialize)]
+struct InstrumentPriceFilter {
+    #[serde(rename = "tickSize")]
+    tick_size: String,
+}
+
+#[derive(Deserialize)]
+struct InstrumentLotFilter {
+    #[serde(rename = "qtyStep")]
+    qty_step: Option<String>,
 }
 
 #[derive(Deserialize)]

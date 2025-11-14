@@ -2,7 +2,10 @@
 
 pub mod reporting;
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
@@ -12,6 +15,7 @@ use tesser_core::{
     Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
 };
 use tesser_execution::{ExecutionEngine, RiskContext};
+use tesser_markets::MarketRegistry;
 use tesser_paper::{MatchingEngine, PaperExecutionClient};
 use tesser_portfolio::{Portfolio, PortfolioConfig};
 use tesser_strategy::{Strategy, StrategyContext};
@@ -24,7 +28,8 @@ pub struct BacktestConfig {
     pub lob_events: Vec<MarketEvent>,
     pub order_quantity: Quantity,
     pub history: usize,
-    pub initial_equity: Decimal,
+    pub initial_balances: HashMap<Symbol, Decimal>,
+    pub reporting_currency: Symbol,
     pub execution: ExecutionModel,
     pub mode: BacktestMode,
 }
@@ -38,7 +43,8 @@ impl BacktestConfig {
             lob_events: Vec::new(),
             order_quantity: Decimal::ONE,
             history: 512,
-            initial_equity: Decimal::new(10_000, 0),
+            initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
+            reporting_currency: "USDT".into(),
             execution: ExecutionModel::default(),
             mode: BacktestMode::Candle,
         }
@@ -124,14 +130,16 @@ impl Backtester {
         strategy: Box<dyn Strategy>,
         execution: ExecutionEngine,
         matching_engine: Option<Arc<MatchingEngine>>,
+        market_registry: Arc<MarketRegistry>,
     ) -> Self {
         let portfolio_config = PortfolioConfig {
-            initial_equity: config.initial_equity,
+            initial_balances: config.initial_balances.clone(),
+            reporting_currency: config.reporting_currency.clone(),
             max_drawdown: None, // Disable liquidate-only for backtests for now
         };
         Self {
             strategy_ctx: StrategyContext::new(config.history),
-            portfolio: Portfolio::new(portfolio_config),
+            portfolio: Portfolio::new(portfolio_config, market_registry),
             config,
             strategy,
             execution,
@@ -205,11 +213,22 @@ impl Backtester {
                 }
             }
 
+            if let Err(err) = self
+                .portfolio
+                .update_market_data(&candle.symbol, candle.close)
+            {
+                warn!(
+                    symbol = %candle.symbol,
+                    error = %err,
+                    "failed to refresh market data"
+                );
+            }
+
             let equity = self.portfolio.equity();
             equity_curve.push((candle.timestamp, equity));
         }
 
-        let reporter = Reporter::new(self.config.initial_equity, equity_curve, all_fills);
+        let reporter = Reporter::new(self.portfolio.initial_equity(), equity_curve, all_fills);
         reporter.calculate()
     }
 
@@ -304,7 +323,9 @@ impl Backtester {
                         .process_trade(tick.side, tick.price, tick.size, tick.exchange_timestamp)
                         .await;
                     last_trade_price = Some(tick.price);
-                    self.portfolio.mark_price(&tick.symbol, tick.price);
+                    if let Err(err) = self.portfolio.update_market_data(&tick.symbol, tick.price) {
+                        warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
+                    }
                     self.strategy_ctx.push_tick(tick.clone());
                     self.strategy
                         .on_tick(&self.strategy_ctx, tick)
@@ -320,7 +341,7 @@ impl Backtester {
             equity_curve.push((event.timestamp, equity));
         }
 
-        let reporter = Reporter::new(self.config.initial_equity, equity_curve, all_fills);
+        let reporter = Reporter::new(self.portfolio.initial_equity(), equity_curve, all_fills);
         reporter.calculate()
     }
 
