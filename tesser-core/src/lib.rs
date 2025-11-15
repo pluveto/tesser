@@ -1,7 +1,7 @@
 //! Fundamental data types shared across the entire workspace.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
@@ -18,6 +18,96 @@ pub type Symbol = String;
 
 /// Unique identifier assigned to orders (exchange or client provided).
 pub type OrderId = String;
+
+/// Enumerates the supported financial instrument families.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentKind {
+    Spot,
+    LinearPerpetual,
+    InversePerpetual,
+}
+
+/// Immutable metadata describing a tradable market.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Instrument {
+    pub symbol: Symbol,
+    pub base: Symbol,
+    pub quote: Symbol,
+    pub kind: InstrumentKind,
+    pub settlement_currency: Symbol,
+    pub tick_size: Price,
+    pub lot_size: Quantity,
+}
+
+/// Represents a currency balance and its current conversion rate to the reporting currency.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Cash {
+    pub currency: Symbol,
+    pub quantity: Quantity,
+    pub conversion_rate: Price,
+}
+
+impl Cash {
+    /// Convert this balance into the reporting currency using the latest conversion rate.
+    #[must_use]
+    pub fn value(&self) -> Price {
+        self.quantity * self.conversion_rate
+    }
+}
+
+/// Multi-currency ledger keyed by currency symbol.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CashBook(pub HashMap<Symbol, Cash>);
+
+impl CashBook {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    pub fn upsert(&mut self, cash: Cash) {
+        self.0.insert(cash.currency.clone(), cash);
+    }
+
+    pub fn adjust(&mut self, currency: &str, delta: Quantity) -> Quantity {
+        let entry = self.0.entry(currency.to_string()).or_insert(Cash {
+            currency: currency.to_string(),
+            quantity: Decimal::ZERO,
+            conversion_rate: Decimal::ZERO,
+        });
+        entry.quantity += delta;
+        entry.quantity
+    }
+
+    pub fn update_conversion_rate(&mut self, currency: &str, rate: Price) {
+        let entry = self.0.entry(currency.to_string()).or_insert(Cash {
+            currency: currency.to_string(),
+            quantity: Decimal::ZERO,
+            conversion_rate: Decimal::ZERO,
+        });
+        entry.conversion_rate = rate;
+    }
+
+    #[must_use]
+    pub fn total_value(&self) -> Price {
+        self.0.values().map(Cash::value).sum()
+    }
+
+    #[must_use]
+    pub fn get(&self, currency: &str) -> Option<&Cash> {
+        self.0.get(currency)
+    }
+
+    #[must_use]
+    pub fn get_mut(&mut self, currency: &str) -> Option<&mut Cash> {
+        self.0.get_mut(currency)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &Cash)> {
+        self.0.iter()
+    }
+}
 
 /// Execution hints for algorithmic order placement.
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -2059,6 +2059,7 @@ dependencies = [
  "tesser-core",
  "tesser-data",
  "tesser-execution",
+ "tesser-markets",
  "tesser-paper",
  "tesser-portfolio",
  "tesser-strategy",
@@ -2125,6 +2126,7 @@ dependencies = [
  "tesser-data",
  "tesser-events",
  "tesser-execution",
+ "tesser-markets",
  "tesser-paper",
  "tesser-portfolio",
  "tesser-strategy",
@@ -2219,6 +2221,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tesser-markets"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tesser-broker",
+ "tesser-core",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "tesser-paper"
 version = "0.1.0"
 dependencies = [
@@ -2243,6 +2256,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tesser-core",
+ "tesser-markets",
  "thiserror 1.0.69",
  "uuid",
 ]

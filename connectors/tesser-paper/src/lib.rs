@@ -14,8 +14,8 @@ use conditional::ConditionalOrderManager;
 use rust_decimal::Decimal;
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient, MarketStream};
 use tesser_core::{
-    AccountBalance, Candle, DepthUpdate, Fill, LocalOrderBook, Order, OrderBook, OrderId,
-    OrderRequest, OrderStatus, OrderType, Position, Price, Quantity, Side, Symbol, Tick,
+    AccountBalance, Candle, DepthUpdate, Fill, Instrument, LocalOrderBook, Order, OrderBook,
+    OrderId, OrderRequest, OrderStatus, OrderType, Position, Price, Quantity, Side, Symbol, Tick,
     TimeInForce,
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -338,6 +338,10 @@ impl ExecutionClient for MatchingEngine {
     async fn positions(&self) -> BrokerResult<Vec<Position>> {
         let positions = self.positions.lock().await;
         Ok(positions.values().cloned().collect())
+    }
+
+    async fn list_instruments(&self, _category: &str) -> BrokerResult<Vec<Instrument>> {
+        Ok(Vec::new())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -853,6 +857,10 @@ impl ExecutionClient for PaperExecutionClient {
 
     async fn positions(&self) -> BrokerResult<Vec<Position>> {
         Ok(self.positions.lock().await.clone())
+    }
+
+    async fn list_instruments(&self, _category: &str) -> BrokerResult<Vec<Instrument>> {
+        Ok(Vec::new())
     }
 
     fn as_any(&self) -> &dyn Any {

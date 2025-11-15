@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -132,6 +134,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .await;
 
     let temp = tempdir()?;
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
     let settings = LiveSessionSettings {
         category: PublicChannel::Linear,
         interval: Interval::OneMinute,
@@ -141,7 +144,9 @@ async fn live_run_executes_round_trip() -> Result<()> {
         history: 8,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         state_path: temp.path().join("live_state.db"),
-        initial_equity: Decimal::new(10_000, 0),
+        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
+        reporting_currency: "USDT".into(),
+        markets_file: Some(markets_file),
         alerting: AlertingConfig::default(),
         exec_backend: ExecutionBackend::Live,
         risk: RiskManagementConfig::default(),

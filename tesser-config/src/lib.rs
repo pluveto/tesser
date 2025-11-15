@@ -25,10 +25,14 @@ pub struct AppConfig {
     pub risk_management: RiskManagementConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BacktestConfig {
-    #[serde(default = "default_equity")]
-    pub initial_equity: Decimal,
+    #[serde(default = "default_initial_balances")]
+    pub initial_balances: HashMap<String, Decimal>,
+    #[serde(default = "default_reporting_currency")]
+    pub reporting_currency: String,
+    #[serde(default)]
+    pub markets_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -78,7 +82,9 @@ pub struct RiskManagementConfig {
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
-            initial_equity: default_equity(),
+            initial_balances: default_initial_balances(),
+            reporting_currency: default_reporting_currency(),
+            markets_file: None,
         }
     }
 }
@@ -125,6 +131,16 @@ fn default_log_level() -> String {
 
 fn default_equity() -> Decimal {
     Decimal::new(10_000, 0)
+}
+
+fn default_reporting_currency() -> String {
+    "USDT".to_string()
+}
+
+fn default_initial_balances() -> HashMap<String, Decimal> {
+    let mut balances = HashMap::new();
+    balances.insert(default_reporting_currency(), default_equity());
+    balances
 }
 
 fn default_state_path() -> PathBuf {

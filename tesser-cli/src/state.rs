@@ -82,16 +82,25 @@ fn print_summary(path: &Path, state: &LiveState) {
 }
 
 fn print_portfolio(portfolio: &PortfolioState) {
-    let equity = portfolio.cash
-        + portfolio.realized_pnl
-        + portfolio
-            .positions
-            .values()
-            .map(|pos| pos.unrealized_pnl)
-            .sum::<Decimal>();
+    let unrealized: Decimal = portfolio
+        .positions
+        .values()
+        .map(|pos| pos.unrealized_pnl)
+        .sum();
+    let cash_value = portfolio.balances.total_value();
+    let equity = cash_value + unrealized;
+    let realized = equity - portfolio.initial_equity - unrealized;
+    let reporting_cash = portfolio
+        .balances
+        .get(&portfolio.reporting_currency)
+        .map(|cash| cash.quantity)
+        .unwrap_or_default();
     println!("Portfolio snapshot:");
-    println!("  Cash: {:.2}", portfolio.cash);
-    println!("  Realized PnL: {:.2}", portfolio.realized_pnl);
+    println!(
+        "  Cash ({}): {:.2}",
+        portfolio.reporting_currency, reporting_cash
+    );
+    println!("  Realized PnL: {:.2}", realized);
     println!("  Equity: {:.2}", equity);
     println!(
         "  Peak equity: {:.2} (liquidate_only={})",
@@ -99,6 +108,22 @@ fn print_portfolio(portfolio: &PortfolioState) {
     );
     if let Some(limit) = portfolio.drawdown_limit {
         println!("  Drawdown limit: {:.2}%", limit * Decimal::from(100));
+    }
+
+    if portfolio
+        .balances
+        .iter()
+        .any(|(_, cash)| !cash.quantity.is_zero())
+    {
+        println!("  Balances:");
+        let mut balances: Vec<_> = portfolio.balances.iter().collect();
+        balances.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        for (currency, cash) in balances {
+            println!(
+                "    {:<8} qty={:.6} rate={:.6}",
+                currency, cash.quantity, cash.conversion_rate
+            );
+        }
     }
 
     if portfolio.positions.is_empty() {
