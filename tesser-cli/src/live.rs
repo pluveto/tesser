@@ -469,20 +469,18 @@ impl LiveRuntime {
         let persisted = Arc::new(Mutex::new(persisted));
         let orchestrator = Arc::new(orchestrator);
         let event_bus = Arc::new(EventBus::new(2048));
-        let reconciliation_ctx = if settings.exec_backend.is_paper() {
-            None
-        } else {
-            Some(Arc::new(ReconciliationContext::new(
-                orchestrator.execution_engine().client(),
-                portfolio.clone(),
-                persisted.clone(),
-                state_repo.clone(),
-                alerts.clone(),
-                metrics.clone(),
-                settings.reporting_currency.clone(),
-                settings.reconciliation_threshold,
-            )))
-        };
+        let reconciliation_ctx = (!settings.exec_backend.is_paper()).then(|| {
+            Arc::new(ReconciliationContext::new(ReconciliationContextConfig {
+                client: orchestrator.execution_engine().client(),
+                portfolio: portfolio.clone(),
+                persisted: persisted.clone(),
+                state_repo: state_repo.clone(),
+                alerts: alerts.clone(),
+                metrics: metrics.clone(),
+                reporting_currency: settings.reporting_currency.clone(),
+                threshold: settings.reconciliation_threshold,
+            }))
+        });
         let reconciliation_task = reconciliation_ctx.as_ref().map(|ctx| {
             spawn_reconciliation_loop(
                 ctx.clone(),
@@ -625,17 +623,29 @@ struct ReconciliationContext {
     threshold: Decimal,
 }
 
+struct ReconciliationContextConfig {
+    client: Arc<dyn ExecutionClient>,
+    portfolio: Arc<Mutex<Portfolio>>,
+    persisted: Arc<Mutex<LiveState>>,
+    state_repo: Arc<dyn StateRepository>,
+    alerts: Arc<AlertManager>,
+    metrics: Arc<LiveMetrics>,
+    reporting_currency: Symbol,
+    threshold: Decimal,
+}
+
 impl ReconciliationContext {
-    fn new(
-        client: Arc<dyn ExecutionClient>,
-        portfolio: Arc<Mutex<Portfolio>>,
-        persisted: Arc<Mutex<LiveState>>,
-        state_repo: Arc<dyn StateRepository>,
-        alerts: Arc<AlertManager>,
-        metrics: Arc<LiveMetrics>,
-        reporting_currency: Symbol,
-        threshold: Decimal,
-    ) -> Self {
+    fn new(config: ReconciliationContextConfig) -> Self {
+        let ReconciliationContextConfig {
+            client,
+            portfolio,
+            persisted,
+            state_repo,
+            alerts,
+            metrics,
+            reporting_currency,
+            threshold,
+        } = config;
         let min_threshold = Decimal::new(1, 6); // 0.000001 as a practical floor
         let threshold = if threshold <= Decimal::ZERO {
             min_threshold
