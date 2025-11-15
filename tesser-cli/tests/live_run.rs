@@ -134,8 +134,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .await;
 
     let temp = tempdir()?;
-    let markets_file =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
     let settings = LiveSessionSettings {
         category: PublicChannel::Linear,
         interval: Interval::OneMinute,
