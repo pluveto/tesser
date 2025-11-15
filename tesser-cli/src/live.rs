@@ -1451,13 +1451,14 @@ async fn process_order_update_event(
             symbol = %order.request.symbol,
             "order rejected by exchange"
         );
-        alerts
-            .order_failure("order rejected by exchange")
-            .await;
+        alerts.order_failure("order rejected by exchange").await;
         alerts
             .notify(
                 "Order rejected",
-                &format!("Order {} for {} was rejected", order.id, order.request.symbol),
+                &format!(
+                    "Order {} for {} was rejected",
+                    order.id, order.request.symbol
+                ),
             )
             .await;
     }
