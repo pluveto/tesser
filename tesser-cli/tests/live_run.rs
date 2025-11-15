@@ -256,8 +256,10 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
     let mut exchange = MockExchange::start(config).await?;
     let (alert_url, mut alert_rx, alert_handle) = start_alert_listener().await?;
 
-    let mut alerting = AlertingConfig::default();
-    alerting.webhook_url = Some(alert_url);
+    let alerting = AlertingConfig {
+        webhook_url: Some(alert_url),
+        ..AlertingConfig::default()
+    };
 
     let temp = tempdir()?;
     let state_path = temp.path().join("live_state.db");
