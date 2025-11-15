@@ -339,6 +339,122 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn alerts_on_rejected_order() -> Result<()> {
+    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
+        currency: "USDT".into(),
+        total: Decimal::new(10_000, 0),
+        available: Decimal::new(10_000, 0),
+        updated_at: Utc::now(),
+    });
+    let base_time = Utc::now();
+    let candles = (0..2)
+        .map(|i| Candle {
+            symbol: SYMBOL.into(),
+            interval: Interval::OneMinute,
+            open: Decimal::new(1_000 + i as i64, 0),
+            high: Decimal::new(1_010 + i as i64, 0),
+            low: Decimal::new(995 + i as i64, 0),
+            close: Decimal::new(1_005 + i as i64, 0),
+            volume: Decimal::ONE,
+            timestamp: base_time + ChronoDuration::minutes(i as i64),
+        })
+        .collect::<Vec<_>>();
+    let ticks = (0..2)
+        .map(|i| Tick {
+            symbol: SYMBOL.into(),
+            price: Decimal::new(1_005 + i as i64, 0),
+            size: Decimal::ONE,
+            side: Side::Buy,
+            exchange_timestamp: base_time + ChronoDuration::seconds(i as i64),
+            received_at: Utc::now(),
+        })
+        .collect::<Vec<_>>();
+    let rejection_payload = json!({
+        "topic": "order",
+        "data": [{
+            "orderId": "MOCK-ORDER-1",
+            "symbol": SYMBOL,
+            "side": "Buy",
+            "orderStatus": "Rejected"
+        }]
+    });
+    let scenarios = ScenarioManager::new();
+    scenarios
+        .push(Scenario {
+            name: "reject-order".into(),
+            trigger: ScenarioTrigger::OrderCreate,
+            action: ScenarioAction::InjectPrivateEvent(rejection_payload),
+        })
+        .await;
+    let config = MockExchangeConfig::new()
+        .with_account(account)
+        .with_candles(candles)
+        .with_ticks(ticks)
+        .with_scenarios(scenarios);
+    let mut exchange = MockExchange::start(config).await?;
+    let (alert_url, mut alert_rx, alert_handle) = start_alert_listener().await?;
+
+    let mut alerting = AlertingConfig::default();
+    alerting.webhook_url = Some(alert_url);
+    alerting.max_order_failures = 1;
+
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 4,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        state_path,
+        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
+        reporting_currency: "USDT".into(),
+        markets_file: Some(markets_file),
+        alerting,
+        exec_backend: ExecutionBackend::Live,
+        risk: RiskManagementConfig::default(),
+        reconciliation_interval: Duration::from_secs(1),
+        reconciliation_threshold: Decimal::new(1, 3),
+    };
+    let exchange_cfg = ExchangeConfig {
+        rest_url: exchange.rest_url(),
+        ws_url: exchange.ws_url(),
+        api_key: "test-key".into(),
+        api_secret: "test-secret".into(),
+    };
+    let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
+    let shutdown = ShutdownSignal::new();
+    let run_handle = tokio::spawn(run_live_with_shutdown(
+        Box::new(strategy),
+        vec![SYMBOL.to_string()],
+        exchange_cfg,
+        settings,
+        shutdown.clone(),
+    ));
+
+    // Wait for a rejection alert
+    let alert = timeout(Duration::from_secs(5), alert_rx.recv())
+        .await
+        .context("alert listener timed out")?
+        .context("alert channel closed unexpectedly")?;
+    assert_eq!(
+        alert.get("title").and_then(|value| value.as_str()),
+        Some("Order rejected")
+    );
+
+    // Prevent unused warnings for strategy monitor
+    drop(monitor);
+    shutdown.trigger();
+    run_handle.await??;
+    alert_handle.abort();
+    exchange.shutdown().await;
+    Ok(())
+}
+
 async fn start_alert_listener() -> Result<(String, mpsc::Receiver<JsonValue>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel(8);
     let make_svc = make_service_fn(move |_| {

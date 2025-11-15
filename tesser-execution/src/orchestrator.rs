@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 use crate::algorithm::{
@@ -15,10 +16,21 @@ use crate::algorithm::{
 };
 use crate::repository::AlgoStateRepository;
 use crate::{ExecutionEngine, RiskContext};
-use tesser_core::{ExecutionHint, Fill, Order, Price, Quantity, Signal, Tick};
+use tesser_core::{
+    ExecutionHint, Fill, Order, OrderRequest, OrderStatus, Price, Quantity, Signal, Tick,
+};
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
 type OrderToAlgoMap = HashMap<String, Uuid>;
+
+#[derive(Clone)]
+struct PendingOrder {
+    request: OrderRequest,
+    placed_at: Instant,
+}
+
+pub const ORDER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+pub const ORDER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(15);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredAlgoState {
@@ -40,6 +52,8 @@ pub struct OrderOrchestrator {
 
     /// Maps order IDs to their parent algorithm IDs.
     order_mapping: Arc<Mutex<OrderToAlgoMap>>,
+    /// Tracks pending orders for timeout handling.
+    pending_orders: Arc<Mutex<HashMap<String, PendingOrder>>>,
 
     /// Cached risk context per symbol supplied by the portfolio.
     risk_contexts: Arc<Mutex<HashMap<String, RiskContext>>>,
@@ -59,11 +73,13 @@ impl OrderOrchestrator {
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
         let order_mapping = Arc::new(Mutex::new(HashMap::new()));
+        let pending_orders = Arc::new(Mutex::new(HashMap::new()));
         let risk_contexts = Arc::new(Mutex::new(HashMap::new()));
 
         let orchestrator = Self {
             algorithms,
             order_mapping,
+            pending_orders,
             risk_contexts,
             execution_engine,
             state_repo,
@@ -197,9 +213,13 @@ impl OrderOrchestrator {
             }
             None => {
                 // Handle normal, non-algorithmic orders
-                self.execution_engine
+                if let Some(order) = self
+                    .execution_engine
                     .handle_signal(signal.clone(), *ctx)
-                    .await?;
+                    .await?
+                {
+                    self.register_pending(&order);
+                }
                 Ok(())
             }
         }
@@ -449,6 +469,7 @@ impl OrderOrchestrator {
             let mut mapping = self.order_mapping.lock().unwrap();
             mapping.insert(order.id.clone(), parent_algo_id);
         }
+        self.register_pending(&order);
 
         // Notify the algorithm that the order was placed
         {
@@ -469,6 +490,7 @@ impl OrderOrchestrator {
             let mapping = self.order_mapping.lock().unwrap();
             mapping.get(&fill.order_id).copied()
         };
+        self.clear_pending(&fill.order_id);
 
         let Some(algo_id) = parent_algo_id else {
             // This fill doesn't belong to any algorithm, ignore it
@@ -703,7 +725,13 @@ impl OrderOrchestrator {
         // Clean up order mappings
         {
             let mut mapping = self.order_mapping.lock().unwrap();
-            mapping.retain(|_, algo_id| algo_id != id);
+            mapping.retain(|order_id, algo_id| {
+                let retain = algo_id != id;
+                if !retain {
+                    self.clear_pending(order_id);
+                }
+                retain
+            });
         }
 
         // Delete persistent state
@@ -736,5 +764,131 @@ impl OrderOrchestrator {
     /// Access to the underlying execution engine.
     pub fn execution_engine(&self) -> Arc<ExecutionEngine> {
         Arc::clone(&self.execution_engine)
+    }
+
+    /// Remove a pending order when an update arrives.
+    pub fn on_order_update(&self, order: &Order) {
+        if matches!(
+            order.status,
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+        ) {
+            self.clear_pending(&order.id);
+        }
+    }
+
+    /// Poll the exchange for any pending orders that exceeded the timeout.
+    /// Returns synthesized order updates for downstream handling.
+    pub async fn poll_stale_orders(&self) -> Result<Vec<Order>> {
+        let stale: Vec<(String, PendingOrder)> = {
+            let mut pending = self.pending_orders.lock().unwrap();
+            let now = Instant::now();
+            let expired: Vec<String> = pending
+                .iter()
+                .filter_map(|(id, entry)| {
+                    if now.duration_since(entry.placed_at) >= ORDER_TIMEOUT {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            expired
+                .into_iter()
+                .filter_map(|id| pending.remove(&id).map(|entry| (id, entry)))
+                .collect()
+        };
+
+        let mut updates = Vec::new();
+        for (order_id, entry) in stale {
+            let client = self.execution_engine.client();
+            let synthesized = match client.list_open_orders(&entry.request.symbol).await {
+                Ok(remote_orders) => {
+                    if let Some(existing) =
+                        remote_orders.into_iter().find(|order| order.id == order_id)
+                    {
+                        // If the order is still working, cancel it proactively.
+                        if matches!(
+                            existing.status,
+                            OrderStatus::PendingNew
+                                | OrderStatus::Accepted
+                                | OrderStatus::PartiallyFilled
+                        ) {
+                            let _ = client
+                                .cancel_order(order_id.clone(), &entry.request.symbol)
+                                .await;
+                            let mut canceled = existing.clone();
+                            canceled.status = OrderStatus::Canceled;
+                            canceled.updated_at = chrono::Utc::now();
+                            Some(canceled)
+                        } else {
+                            Some(existing)
+                        }
+                    } else {
+                        Some(build_timeout_order(
+                            order_id.clone(),
+                            entry.request.clone(),
+                            OrderStatus::Rejected,
+                        ))
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        order_id = %order_id,
+                        symbol = %entry.request.symbol,
+                        error = %err,
+                        "failed to query stale order; canceling defensively"
+                    );
+                    let _ = client
+                        .cancel_order(order_id.clone(), &entry.request.symbol)
+                        .await;
+                    Some(build_timeout_order(
+                        order_id.clone(),
+                        entry.request.clone(),
+                        OrderStatus::Canceled,
+                    ))
+                }
+            };
+
+            if let Some(order) = synthesized {
+                self.on_order_update(&order);
+                self.clear_order_mapping(&order_id);
+                updates.push(order);
+            }
+        }
+
+        Ok(updates)
+    }
+
+    fn register_pending(&self, order: &Order) {
+        let mut pending = self.pending_orders.lock().unwrap();
+        pending.insert(
+            order.id.clone(),
+            PendingOrder {
+                request: order.request.clone(),
+                placed_at: Instant::now(),
+            },
+        );
+    }
+
+    fn clear_pending(&self, order_id: &str) {
+        let mut pending = self.pending_orders.lock().unwrap();
+        pending.remove(order_id);
+    }
+
+    fn clear_order_mapping(&self, order_id: &str) {
+        let mut mapping = self.order_mapping.lock().unwrap();
+        mapping.remove(order_id);
+    }
+}
+
+fn build_timeout_order(id: String, request: OrderRequest, status: OrderStatus) -> Order {
+    Order {
+        id,
+        request,
+        status,
+        filled_quantity: Decimal::ZERO,
+        avg_fill_price: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
     }
 }
