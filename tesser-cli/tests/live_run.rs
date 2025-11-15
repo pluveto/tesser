@@ -15,7 +15,7 @@ use hyper::{
     Body, Request, Response,
 };
 use rust_decimal::Decimal;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use tempfile::tempdir;
 use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
@@ -31,7 +31,7 @@ use tesser_portfolio::{SqliteStateRepository, StateRepository};
 use tesser_strategy::{Strategy, StrategyContext, StrategyResult};
 use tesser_test_utils::{
     AccountConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario, ScenarioAction,
-    ScenarioTrigger,
+    ScenarioManager, ScenarioTrigger,
 };
 
 const SYMBOL: &str = "BTCUSDT";
