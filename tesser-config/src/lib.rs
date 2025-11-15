@@ -53,6 +53,10 @@ pub struct LiveRuntimeConfig {
     pub metrics_addr: String,
     #[serde(default = "default_live_log_path")]
     pub log_path: PathBuf,
+    #[serde(default = "default_reconciliation_interval_secs")]
+    pub reconciliation_interval_secs: u64,
+    #[serde(default = "default_reconciliation_threshold")]
+    pub reconciliation_threshold: Decimal,
     #[serde(default)]
     pub alerting: AlertingConfig,
 }
@@ -95,6 +99,8 @@ impl Default for LiveRuntimeConfig {
             state_path: default_state_path(),
             metrics_addr: default_metrics_addr(),
             log_path: default_live_log_path(),
+            reconciliation_interval_secs: default_reconciliation_interval_secs(),
+            reconciliation_threshold: default_reconciliation_threshold(),
             alerting: AlertingConfig::default(),
         }
     }
@@ -153,6 +159,14 @@ fn default_metrics_addr() -> String {
 
 fn default_live_log_path() -> PathBuf {
     PathBuf::from("./logs/live.json")
+}
+
+fn default_reconciliation_interval_secs() -> u64 {
+    60
+}
+
+fn default_reconciliation_threshold() -> Decimal {
+    Decimal::new(1, 3) // 0.001 == 0.1%
 }
 
 fn default_data_gap_secs() -> u64 {

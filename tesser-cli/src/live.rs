@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
@@ -24,8 +24,8 @@ use tesser_bybit::{
 };
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
-    Candle, Fill, Interval, Order, OrderBook, OrderStatus, Price, Quantity, Side, Signal, Symbol,
-    Tick,
+    Candle, Fill, Interval, Order, OrderBook, OrderStatus, Position, Price, Quantity, Side, Signal,
+    Symbol, Tick,
 };
 use tesser_events::{
     CandleEvent, Event, EventBus, FillEvent, OrderBookEvent, OrderUpdateEvent, SignalEvent,
@@ -82,6 +82,8 @@ pub struct LiveSessionSettings {
     pub alerting: AlertingConfig,
     pub exec_backend: ExecutionBackend,
     pub risk: RiskManagementConfig,
+    pub reconciliation_interval: Duration,
+    pub reconciliation_threshold: Decimal,
 }
 
 impl LiveSessionSettings {
@@ -219,16 +221,15 @@ fn build_execution_client(
 struct LiveRuntime {
     stream: BybitMarketStream,
     orchestrator: Arc<OrderOrchestrator>,
-    portfolio: Arc<Mutex<Portfolio>>,
-    alerts: Arc<AlertManager>,
     state_repo: Arc<dyn StateRepository>,
     persisted: Arc<Mutex<LiveState>>,
     event_bus: Arc<EventBus>,
     shutdown: ShutdownSignal,
     metrics_task: JoinHandle<()>,
     alert_task: Option<JoinHandle<()>>,
+    reconciliation_task: Option<JoinHandle<()>>,
+    reconciliation_ctx: Option<Arc<ReconciliationContext>>,
     private_event_rx: mpsc::Receiver<BrokerEvent>,
-    exec_backend: ExecutionBackend,
     #[allow(dead_code)]
     last_private_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
     subscriber_handles: Vec<JoinHandle<()>>,
@@ -468,6 +469,27 @@ impl LiveRuntime {
         let persisted = Arc::new(Mutex::new(persisted));
         let orchestrator = Arc::new(orchestrator);
         let event_bus = Arc::new(EventBus::new(2048));
+        let reconciliation_ctx = if settings.exec_backend.is_paper() {
+            None
+        } else {
+            Some(Arc::new(ReconciliationContext::new(
+                orchestrator.execution_engine().client(),
+                portfolio.clone(),
+                persisted.clone(),
+                state_repo.clone(),
+                alerts.clone(),
+                metrics.clone(),
+                settings.reporting_currency.clone(),
+                settings.reconciliation_threshold,
+            )))
+        };
+        let reconciliation_task = reconciliation_ctx.as_ref().map(|ctx| {
+            spawn_reconciliation_loop(
+                ctx.clone(),
+                shutdown.clone(),
+                settings.reconciliation_interval,
+            )
+        });
         let subscriber_handles = spawn_event_subscribers(
             event_bus.clone(),
             strategy.clone(),
@@ -499,16 +521,15 @@ impl LiveRuntime {
         Ok(Self {
             stream,
             orchestrator,
-            portfolio,
-            alerts,
             state_repo,
             persisted,
             event_bus,
             shutdown,
             metrics_task,
             alert_task,
+            reconciliation_task,
+            reconciliation_ctx,
             private_event_rx,
-            exec_backend: settings.exec_backend,
             last_private_sync,
             subscriber_handles,
         })
@@ -516,11 +537,12 @@ impl LiveRuntime {
 
     async fn run(mut self) -> Result<()> {
         info!("live session started");
-        self.reconcile_state()
-            .await
-            .context("initial state reconciliation failed")?;
+        if let Some(ctx) = self.reconciliation_ctx.as_ref() {
+            perform_state_reconciliation(ctx.as_ref())
+                .await
+                .context("initial state reconciliation failed")?;
+        }
         let backoff = Duration::from_millis(200);
-        let mut reconciliation_timer = tokio::time::interval(Duration::from_secs(60));
         let mut orchestrator_timer = tokio::time::interval(Duration::from_secs(1));
 
         while !self.shutdown.triggered() {
@@ -557,11 +579,6 @@ impl LiveRuntime {
                         }
                     }
                 }
-                _ = reconciliation_timer.tick(), if !self.exec_backend.is_paper() => {
-                    if let Err(e) = self.reconcile_state().await {
-                        error!("Periodic state reconciliation failed: {}", e);
-                    }
-                }
                 _ = orchestrator_timer.tick() => {
                     // Drive TWAP and other time-based algorithms
                     if let Err(e) = self.orchestrator.on_timer_tick().await {
@@ -580,6 +597,9 @@ impl LiveRuntime {
         if let Some(handle) = self.alert_task.take() {
             handle.abort();
         }
+        if let Some(handle) = self.reconciliation_task.take() {
+            handle.abort();
+        }
         for handle in self.subscriber_handles.drain(..) {
             handle.abort();
         }
@@ -589,65 +609,207 @@ impl LiveRuntime {
         Ok(())
     }
 
-    async fn reconcile_state(&mut self) -> Result<()> {
-        if self.exec_backend.is_paper() {
-            return Ok(());
-        }
-
-        info!("Running state reconciliation...");
-        let client = self.orchestrator.execution_engine().client();
-        match client.positions().await {
-            Ok(remote_positions) => {
-                let local_positions = {
-                    let guard = self.portfolio.lock().await;
-                    guard.positions()
-                };
-                if remote_positions.len() != local_positions.len() {
-                    warn!(
-                        remote = remote_positions.len(),
-                        local = local_positions.len(),
-                        "Position count mismatch"
-                    );
-                    self.alerts
-                        .notify("Reconciliation Error", "Position count mismatch detected")
-                        .await;
-                }
-            }
-            Err(e) => error!("Failed to fetch remote positions: {e}"),
-        }
-
-        match client.account_balances().await {
-            Ok(remote_balances) => {
-                if let Some(usdt) = remote_balances.iter().find(|b| b.currency == "USDT") {
-                    let local_cash = {
-                        let guard = self.portfolio.lock().await;
-                        guard.cash()
-                    };
-                    let diff = (usdt.available - local_cash).abs();
-                    if diff > Decimal::ONE {
-                        warn!(
-                            remote = %usdt.available,
-                            local = %local_cash,
-                            "Cash balance mismatch"
-                        );
-                        self.alerts
-                            .notify(
-                                "Reconciliation Error",
-                                &format!("Cash balance deviates by {:.2}", diff),
-                            )
-                            .await;
-                    }
-                }
-            }
-            Err(e) => error!("Failed to fetch remote balances: {e}"),
-        }
-
-        info!("State reconciliation complete.");
-        Ok(())
-    }
-
     async fn save_state(&self) -> Result<()> {
         persist_state(self.state_repo.clone(), self.persisted.clone()).await
+    }
+}
+
+struct ReconciliationContext {
+    client: Arc<dyn ExecutionClient>,
+    portfolio: Arc<Mutex<Portfolio>>,
+    persisted: Arc<Mutex<LiveState>>,
+    state_repo: Arc<dyn StateRepository>,
+    alerts: Arc<AlertManager>,
+    metrics: Arc<LiveMetrics>,
+    reporting_currency: Symbol,
+    threshold: Decimal,
+}
+
+impl ReconciliationContext {
+    fn new(
+        client: Arc<dyn ExecutionClient>,
+        portfolio: Arc<Mutex<Portfolio>>,
+        persisted: Arc<Mutex<LiveState>>,
+        state_repo: Arc<dyn StateRepository>,
+        alerts: Arc<AlertManager>,
+        metrics: Arc<LiveMetrics>,
+        reporting_currency: Symbol,
+        threshold: Decimal,
+    ) -> Self {
+        let min_threshold = Decimal::new(1, 6); // 0.000001 as a practical floor
+        let threshold = if threshold <= Decimal::ZERO {
+            min_threshold
+        } else {
+            threshold
+        };
+        Self {
+            client,
+            portfolio,
+            persisted,
+            state_repo,
+            alerts,
+            metrics,
+            reporting_currency,
+            threshold,
+        }
+    }
+}
+
+fn spawn_reconciliation_loop(
+    ctx: Arc<ReconciliationContext>,
+    shutdown: ShutdownSignal,
+    interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while shutdown.sleep(interval).await {
+            if let Err(err) = perform_state_reconciliation(ctx.as_ref()).await {
+                error!(error = %err, "periodic state reconciliation failed");
+            }
+        }
+    })
+}
+
+async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()> {
+    info!("running state reconciliation");
+    let remote_positions = ctx
+        .client
+        .positions()
+        .await
+        .context("failed to fetch remote positions")?;
+    let remote_balances = ctx
+        .client
+        .account_balances()
+        .await
+        .context("failed to fetch remote balances")?;
+    let (local_positions, local_cash) = {
+        let guard = ctx.portfolio.lock().await;
+        (guard.positions(), guard.cash())
+    };
+
+    let remote_map = positions_to_map(remote_positions);
+    let local_map = positions_to_map(local_positions);
+    let mut tracked_symbols: HashSet<String> = HashSet::new();
+    tracked_symbols.extend(remote_map.keys().cloned());
+    tracked_symbols.extend(local_map.keys().cloned());
+
+    let mut severe_findings = Vec::new();
+    for symbol in tracked_symbols {
+        let local_qty = local_map.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+        let remote_qty = remote_map.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+        let diff = (local_qty - remote_qty).abs();
+        let diff_value = diff.to_f64().unwrap_or(0.0);
+        ctx.metrics.update_position_diff(&symbol, diff_value);
+        if diff > Decimal::ZERO {
+            warn!(
+                symbol = %symbol,
+                local = %local_qty,
+                remote = %remote_qty,
+                diff = %diff,
+                "position mismatch detected during reconciliation"
+            );
+            let pct = normalize_diff(diff, remote_qty);
+            if pct >= ctx.threshold {
+                error!(
+                    symbol = %symbol,
+                    local = %local_qty,
+                    remote = %remote_qty,
+                    diff = %diff,
+                    pct = %pct,
+                    "position mismatch exceeds threshold"
+                );
+                severe_findings.push(format!(
+                    "{symbol} local={local_qty} remote={remote_qty} diff={diff}"
+                ));
+            }
+        }
+    }
+
+    let reporting = ctx.reporting_currency.as_str();
+    let remote_cash = remote_balances
+        .iter()
+        .find(|balance| balance.currency == reporting)
+        .map(|balance| balance.available)
+        .unwrap_or_else(|| Decimal::ZERO);
+    let cash_diff = (remote_cash - local_cash).abs();
+    ctx.metrics
+        .update_balance_diff(reporting, cash_diff.to_f64().unwrap_or(0.0));
+    if cash_diff > Decimal::ZERO {
+        warn!(
+            currency = %reporting,
+            local = %local_cash,
+            remote = %remote_cash,
+            diff = %cash_diff,
+            "balance mismatch detected during reconciliation"
+        );
+        let pct = normalize_diff(cash_diff, remote_cash);
+        if pct >= ctx.threshold {
+            error!(
+                currency = %reporting,
+                local = %local_cash,
+                remote = %remote_cash,
+                diff = %cash_diff,
+                pct = %pct,
+                "balance mismatch exceeds threshold"
+            );
+            severe_findings.push(format!(
+                "{reporting} balance local={local_cash} remote={remote_cash} diff={cash_diff}"
+            ));
+        }
+    }
+
+    if severe_findings.is_empty() {
+        info!("state reconciliation complete with no critical divergence");
+        return Ok(());
+    }
+
+    let alert_body = severe_findings.join("; ");
+    ctx.alerts
+        .notify("State reconciliation divergence", &alert_body)
+        .await;
+    enforce_liquidate_only(ctx).await;
+    Ok(())
+}
+
+async fn enforce_liquidate_only(ctx: &ReconciliationContext) {
+    let snapshot = {
+        let mut guard = ctx.portfolio.lock().await;
+        if !guard.set_liquidate_only(true) {
+            return;
+        }
+        info!("entering liquidate-only mode due to reconciliation divergence");
+        guard.snapshot()
+    };
+    {
+        let mut state = ctx.persisted.lock().await;
+        state.portfolio = Some(snapshot);
+    }
+    if let Err(err) = persist_state(ctx.state_repo.clone(), ctx.persisted.clone()).await {
+        warn!(error = %err, "failed to persist liquidate-only transition");
+    }
+}
+
+fn positions_to_map(positions: Vec<Position>) -> HashMap<String, Decimal> {
+    let mut map = HashMap::new();
+    for position in positions {
+        map.insert(position.symbol.clone(), position_signed_qty(&position));
+    }
+    map
+}
+
+fn position_signed_qty(position: &Position) -> Decimal {
+    match position.side {
+        Some(Side::Buy) => position.quantity,
+        Some(Side::Sell) => -position.quantity,
+        None => Decimal::ZERO,
+    }
+}
+
+fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
+    if diff <= Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        let denominator = std::cmp::max(reference.abs(), Decimal::ONE);
+        diff / denominator
     }
 }
 

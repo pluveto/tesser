@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tesser_cli::alerts::sanitize_webhook;
 use tesser_cli::data_validation::{validate_dataset, ValidationConfig, ValidationOutcome};
 use tesser_cli::live::{run_live, ExecutionBackend, LiveSessionSettings};
@@ -424,6 +425,10 @@ struct LiveRunArgs {
     #[arg(long, default_value_t = 512)]
     history: usize,
     #[arg(long)]
+    reconciliation_interval_secs: Option<u64>,
+    #[arg(long)]
+    reconciliation_threshold: Option<Decimal>,
+    #[arg(long)]
     webhook_url: Option<String>,
     #[arg(long)]
     alert_max_data_gap_secs: Option<u64>,
@@ -465,6 +470,25 @@ impl LiveRunArgs {
             .unwrap_or_else(|| config.live.metrics_addr.clone());
         addr.parse()
             .with_context(|| format!("invalid metrics address '{addr}'"))
+    }
+
+    fn reconciliation_interval(&self, config: &AppConfig) -> StdDuration {
+        let secs = self
+            .reconciliation_interval_secs
+            .unwrap_or(config.live.reconciliation_interval_secs)
+            .max(1);
+        StdDuration::from_secs(secs)
+    }
+
+    fn reconciliation_threshold(&self, config: &AppConfig) -> Decimal {
+        let configured = self
+            .reconciliation_threshold
+            .unwrap_or(config.live.reconciliation_threshold);
+        if configured <= Decimal::ZERO {
+            config.live.reconciliation_threshold.max(Decimal::new(1, 6))
+        } else {
+            configured
+        }
     }
 
     fn resolved_initial_balances(&self, config: &AppConfig) -> HashMap<Symbol, Decimal> {
@@ -805,6 +829,8 @@ impl LiveRunArgs {
         let state_path = self.resolved_state_path(config);
         let alerting = self.build_alerting(config);
         let history = self.history.max(32);
+        let reconciliation_interval = self.reconciliation_interval(config);
+        let reconciliation_threshold = self.reconciliation_threshold(config);
 
         let settings = LiveSessionSettings {
             category,
@@ -821,6 +847,8 @@ impl LiveRunArgs {
             alerting,
             exec_backend: self.exec,
             risk: self.build_risk_config(config),
+            reconciliation_interval,
+            reconciliation_threshold,
         };
 
         info!(

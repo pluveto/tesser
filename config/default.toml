@@ -33,6 +33,8 @@ api_secret = ""
 state_path = "./reports/live_state.db" # SQLite database for live state
 metrics_addr = "127.0.0.1:9100"
 log_path = "./logs/live.json"
+reconciliation_interval_secs = 60
+reconciliation_threshold = 0.001
 
 [live.alerting]
 webhook_url = ""

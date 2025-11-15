@@ -65,6 +65,8 @@ pub struct LiveMetrics {
     equity_gauge: Gauge,
     price_gauge: GaugeVec,
     data_gap_gauge: Gauge,
+    reconciliation_position_diff: GaugeVec,
+    reconciliation_balance_diff: GaugeVec,
 }
 
 impl LiveMetrics {
@@ -89,6 +91,22 @@ impl LiveMetrics {
             "Seconds since last market data heartbeat",
         )
         .unwrap();
+        let reconciliation_position_diff = GaugeVec::new(
+            prometheus::Opts::new(
+                "tesser_reconciliation_position_diff",
+                "Absolute quantity difference between local and remote positions",
+            ),
+            &["symbol"],
+        )
+        .unwrap();
+        let reconciliation_balance_diff = GaugeVec::new(
+            prometheus::Opts::new(
+                "tesser_reconciliation_balance_diff",
+                "Absolute balance difference between local and remote accounts",
+            ),
+            &["currency"],
+        )
+        .unwrap();
 
         registry.register(Box::new(ticks_total.clone())).unwrap();
         registry.register(Box::new(candles_total.clone())).unwrap();
@@ -98,6 +116,12 @@ impl LiveMetrics {
         registry.register(Box::new(equity_gauge.clone())).unwrap();
         registry.register(Box::new(price_gauge.clone())).unwrap();
         registry.register(Box::new(data_gap_gauge.clone())).unwrap();
+        registry
+            .register(Box::new(reconciliation_position_diff.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(reconciliation_balance_diff.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -109,6 +133,8 @@ impl LiveMetrics {
             equity_gauge,
             price_gauge,
             data_gap_gauge,
+            reconciliation_position_diff,
+            reconciliation_balance_diff,
         }
     }
 
@@ -146,6 +172,18 @@ impl LiveMetrics {
 
     pub fn update_staleness(&self, seconds: f64) {
         self.data_gap_gauge.set(seconds);
+    }
+
+    pub fn update_position_diff(&self, symbol: &str, diff: f64) {
+        self.reconciliation_position_diff
+            .with_label_values(&[symbol])
+            .set(diff);
+    }
+
+    pub fn update_balance_diff(&self, currency: &str, diff: f64) {
+        self.reconciliation_balance_diff
+            .with_label_values(&[currency])
+            .set(diff);
     }
 }
 

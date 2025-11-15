@@ -284,6 +284,16 @@ impl Portfolio {
         self.liquidate_only
     }
 
+    /// Forcefully toggle liquidate-only mode. Returns true if the flag changed.
+    pub fn set_liquidate_only(&mut self, enabled: bool) -> bool {
+        if self.liquidate_only == enabled {
+            false
+        } else {
+            self.liquidate_only = enabled;
+            true
+        }
+    }
+
     /// Snapshot the current state for persistence.
     #[must_use]
     pub fn snapshot(&self) -> PortfolioState {

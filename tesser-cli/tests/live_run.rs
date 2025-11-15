@@ -1,25 +1,33 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
+use hyper::{
+    body::to_bytes,
+    service::{make_service_fn, service_fn},
+    Body, Request, Response,
+};
 use rust_decimal::Decimal;
+use serde_json::Value as JsonValue;
 use tempfile::tempdir;
 use tokio::sync::Notify;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use tesser_bybit::PublicChannel;
 use tesser_cli::live::{
     run_live_with_shutdown, ExecutionBackend, LiveSessionSettings, ShutdownSignal,
 };
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
-use tesser_core::{AccountBalance, Candle, Interval, Side, Signal, SignalKind, Tick};
+use tesser_core::{AccountBalance, Candle, Interval, Position, Side, Signal, SignalKind, Tick};
+use tesser_portfolio::{SqliteStateRepository, StateRepository};
 use tesser_strategy::{Strategy, StrategyContext, StrategyResult};
 use tesser_test_utils::{
     AccountConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario, ScenarioAction,
@@ -150,6 +158,8 @@ async fn live_run_executes_round_trip() -> Result<()> {
         alerting: AlertingConfig::default(),
         exec_backend: ExecutionBackend::Live,
         risk: RiskManagementConfig::default(),
+        reconciliation_interval: Duration::from_secs(1),
+        reconciliation_threshold: Decimal::new(1, 3),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -208,11 +218,224 @@ async fn live_run_executes_round_trip() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
+    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
+        currency: "USDT".into(),
+        total: Decimal::new(10_000, 0),
+        available: Decimal::new(10_000, 0),
+        updated_at: Utc::now(),
+    });
+    let base_time = Utc::now();
+    let candles = (0..3)
+        .map(|i| Candle {
+            symbol: SYMBOL.into(),
+            interval: Interval::OneMinute,
+            open: Decimal::new(1_000 + i as i64, 0),
+            high: Decimal::new(1_010 + i as i64, 0),
+            low: Decimal::new(995 + i as i64, 0),
+            close: Decimal::new(1_005 + i as i64, 0),
+            volume: Decimal::ONE,
+            timestamp: base_time + ChronoDuration::minutes(i as i64),
+        })
+        .collect::<Vec<_>>();
+    let ticks = (0..3)
+        .map(|i| Tick {
+            symbol: SYMBOL.into(),
+            price: Decimal::new(1_005 + i as i64, 0),
+            size: Decimal::ONE,
+            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            exchange_timestamp: base_time + ChronoDuration::seconds(i as i64),
+            received_at: Utc::now(),
+        })
+        .collect::<Vec<_>>();
+    let config = MockExchangeConfig::new()
+        .with_account(account)
+        .with_candles(candles)
+        .with_ticks(ticks);
+    let mut exchange = MockExchange::start(config).await?;
+    let (alert_url, mut alert_rx, alert_handle) = start_alert_listener().await?;
+
+    let mut alerting = AlertingConfig::default();
+    alerting.webhook_url = Some(alert_url);
+
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 4,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        state_path: state_path.clone(),
+        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
+        reporting_currency: "USDT".into(),
+        markets_file: Some(markets_file),
+        alerting,
+        exec_backend: ExecutionBackend::Live,
+        risk: RiskManagementConfig::default(),
+        reconciliation_interval: Duration::from_millis(200),
+        reconciliation_threshold: Decimal::new(1, 4),
+    };
+    let exchange_cfg = ExchangeConfig {
+        rest_url: exchange.rest_url(),
+        ws_url: exchange.ws_url(),
+        api_key: "test-key".into(),
+        api_secret: "test-secret".into(),
+    };
+    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(SYMBOL));
+    let shutdown = ShutdownSignal::new();
+    let run_handle = tokio::spawn(run_live_with_shutdown(
+        strategy,
+        vec![SYMBOL.to_string()],
+        exchange_cfg,
+        settings,
+        shutdown.clone(),
+    ));
+
+    sleep(Duration::from_millis(300)).await;
+    exchange
+        .state()
+        .with_account_mut("test-key", |account| {
+            account.positions.insert(
+                SYMBOL.into(),
+                Position {
+                    symbol: SYMBOL.into(),
+                    side: Some(Side::Buy),
+                    quantity: Decimal::new(5, 0),
+                    entry_price: Some(Decimal::new(1_000, 0)),
+                    unrealized_pnl: Decimal::ZERO,
+                    updated_at: Utc::now(),
+                },
+            );
+            if let Some(balance) = account.balances.get_mut("USDT") {
+                balance.available += Decimal::new(500, 0);
+                balance.total = balance.available;
+                balance.updated_at = Utc::now();
+            }
+            Ok(())
+        })
+        .await?;
+
+    let alert = timeout(Duration::from_secs(5), alert_rx.recv())
+        .await
+        .context("alert listener timed out")?
+        .context("alert channel closed unexpectedly")?;
+    assert_eq!(
+        alert.get("title").and_then(|value| value.as_str()),
+        Some("State reconciliation divergence")
+    );
+    wait_for_liquidate_only(&state_path, Duration::from_secs(5)).await?;
+
+    shutdown.trigger();
+    run_handle.await??;
+    alert_handle.abort();
+    exchange.shutdown().await;
+    Ok(())
+}
+
+async fn start_alert_listener() -> Result<(String, mpsc::Receiver<JsonValue>, JoinHandle<()>)> {
+    let (tx, rx) = mpsc::channel(8);
+    let make_svc = make_service_fn(move |_| {
+        let tx = tx.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let tx = tx.clone();
+                async move {
+                    let bytes = to_bytes(req.into_body()).await?;
+                    if let Ok(json) = serde_json::from_slice::<JsonValue>(&bytes) {
+                        let _ = tx.send(json).await;
+                    }
+                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                }
+            }))
+        }
+    });
+    let server = hyper::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_svc);
+    let addr = server.local_addr();
+    let handle = tokio::spawn(async move {
+        if let Err(err) = server.await {
+            eprintln!("alert listener exited: {err}");
+        }
+    });
+    Ok((format!("http://{}", addr), rx, handle))
+}
+
+async fn wait_for_liquidate_only(path: &Path, timeout: Duration) -> Result<()> {
+    let repo = SqliteStateRepository::new(path.to_path_buf());
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = repo
+            .load()
+            .map_err(|err| anyhow!("failed to load state: {err}"))?;
+        if state
+            .portfolio
+            .as_ref()
+            .map(|snapshot| snapshot.liquidate_only)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    Err(anyhow!(
+        "timed out waiting for liquidate-only flag in persisted state"
+    ))
+}
+
 struct ScriptedStrategy {
     symbol: String,
     stage: usize,
     pending: Vec<Signal>,
     state: Arc<StrategyState>,
+}
+
+struct PassiveStrategy {
+    symbol: String,
+}
+
+impl PassiveStrategy {
+    fn new(symbol: &str) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+        }
+    }
+}
+
+impl Strategy for PassiveStrategy {
+    fn name(&self) -> &str {
+        "passive-test"
+    }
+
+    fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &tesser_core::Fill) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    fn drain_signals(&mut self) -> Vec<Signal> {
+        Vec::new()
+    }
 }
 
 impl ScriptedStrategy {
