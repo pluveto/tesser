@@ -246,6 +246,7 @@ struct LiveRuntime {
     last_private_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
     subscriber_handles: Vec<JoinHandle<()>>,
     connection_monitors: Vec<JoinHandle<()>>,
+    order_timeout_task: JoinHandle<()>,
     _public_connection: Arc<AtomicBool>,
     _private_connection: Option<Arc<AtomicBool>>,
 }
@@ -565,6 +566,12 @@ impl LiveRuntime {
             persisted.clone(),
             settings.exec_backend,
         );
+        let order_timeout_task = spawn_order_timeout_monitor(
+            orchestrator.clone(),
+            event_bus.clone(),
+            alerts.clone(),
+            shutdown.clone(),
+        );
 
         info!(
             symbols = ?symbols,
@@ -595,6 +602,7 @@ impl LiveRuntime {
             last_private_sync,
             subscriber_handles,
             connection_monitors,
+            order_timeout_task,
             _public_connection: public_connection,
             _private_connection: private_connection,
         })
@@ -665,6 +673,7 @@ impl LiveRuntime {
         if let Some(handle) = self.reconciliation_task.take() {
             handle.abort();
         }
+        self.order_timeout_task.abort();
         for handle in self.subscriber_handles.drain(..) {
             handle.abort();
         }
@@ -1085,6 +1094,7 @@ fn spawn_event_subscribers(
     let fill_state = state_repo.clone();
     let fill_orchestrator = orchestrator.clone();
     let fill_persisted = persisted.clone();
+    let fill_alerts = alerts.clone();
     handles.push(tokio::spawn(async move {
         let orchestrator = fill_orchestrator.clone();
         let persisted = fill_persisted.clone();
@@ -1099,7 +1109,7 @@ fn spawn_event_subscribers(
                         strategy_ctx.clone(),
                         orchestrator.clone(),
                         metrics.clone(),
-                        alerts.clone(),
+                        fill_alerts.clone(),
                         fill_state.clone(),
                         persisted.clone(),
                     )
@@ -1120,15 +1130,23 @@ fn spawn_event_subscribers(
 
     let order_bus = bus.clone();
     let order_persisted = persisted.clone();
+    let order_alerts = alerts.clone();
+    let order_orchestrator = orchestrator.clone();
     handles.push(tokio::spawn(async move {
+        let orchestrator = order_orchestrator.clone();
         let persisted = order_persisted.clone();
         let mut stream = order_bus.subscribe();
         loop {
             match stream.recv().await {
                 Ok(Event::OrderUpdate(evt)) => {
-                    if let Err(err) =
-                        process_order_update_event(evt.order, state_repo.clone(), persisted.clone())
-                            .await
+                    if let Err(err) = process_order_update_event(
+                        evt.order,
+                        orchestrator.clone(),
+                        order_alerts.clone(),
+                        state_repo.clone(),
+                        persisted.clone(),
+                    )
+                    .await
                     {
                         warn!(error = %err, "order update handler failed");
                     }
@@ -1421,9 +1439,29 @@ async fn process_fill_event(
 
 async fn process_order_update_event(
     order: Order,
+    orchestrator: Arc<OrderOrchestrator>,
+    alerts: Arc<AlertManager>,
     state_repo: Arc<dyn StateRepository>,
     persisted: Arc<Mutex<LiveState>>,
 ) -> Result<()> {
+    orchestrator.on_order_update(&order);
+    if matches!(order.status, OrderStatus::Rejected) {
+        error!(
+            order_id = %order.id,
+            symbol = %order.request.symbol,
+            "order rejected by exchange"
+        );
+        alerts.order_failure("order rejected by exchange").await;
+        alerts
+            .notify(
+                "Order rejected",
+                &format!(
+                    "Order {} for {} was rejected",
+                    order.id, order.request.symbol
+                ),
+            )
+            .await;
+    }
     {
         let mut snapshot = persisted.lock().await;
         let mut found = false;
@@ -1536,6 +1574,44 @@ fn spawn_connection_monitor(
             metrics.update_connection_status(stream, flag.load(Ordering::SeqCst));
             if !shutdown.sleep(Duration::from_secs(5)).await {
                 break;
+            }
+        }
+    })
+}
+
+fn spawn_order_timeout_monitor(
+    orchestrator: Arc<OrderOrchestrator>,
+    bus: Arc<EventBus>,
+    alerts: Arc<AlertManager>,
+    shutdown: ShutdownSignal,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tesser_execution::orchestrator::ORDER_POLL_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if shutdown.triggered() {
+                break;
+            }
+            match orchestrator.poll_stale_orders().await {
+                Ok(updates) => {
+                    for order in updates {
+                        if matches!(order.status, OrderStatus::Rejected | OrderStatus::Canceled) {
+                            let message = format!(
+                                "Order {} for {} timed out after {}s",
+                                order.id,
+                                order.request.symbol,
+                                tesser_execution::orchestrator::ORDER_TIMEOUT.as_secs()
+                            );
+                            error!(%message);
+                            alerts.order_failure(&message).await;
+                            alerts.notify("Order timeout", &message).await;
+                        }
+                        bus.publish(Event::OrderUpdate(OrderUpdateEvent { order }));
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "order timeout monitor failed");
+                }
             }
         }
     })
