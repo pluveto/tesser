@@ -119,9 +119,19 @@ pub async fn run_live_with_shutdown(
         return Err(anyhow!("--quantity must be positive"));
     }
 
-    let mut stream = BybitMarketStream::connect_public(&exchange.ws_url, settings.category)
-        .await
-        .context("failed to connect to Bybit WebSocket")?;
+    let public_connection = Arc::new(AtomicBool::new(false));
+    let private_connection = if matches!(settings.exec_backend, ExecutionBackend::Live) {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let mut stream = BybitMarketStream::connect_public(
+        &exchange.ws_url,
+        settings.category,
+        Some(public_connection.clone()),
+    )
+    .await
+    .context("failed to connect to Bybit WebSocket")?;
     for symbol in &symbols {
         stream
             .subscribe(BybitSubscription::Trades {
@@ -179,6 +189,8 @@ pub async fn run_live_with_shutdown(
         settings,
         market_registry,
         shutdown,
+        public_connection,
+        private_connection,
     )
     .await?;
     runtime.run().await
@@ -233,9 +245,13 @@ struct LiveRuntime {
     #[allow(dead_code)]
     last_private_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
     subscriber_handles: Vec<JoinHandle<()>>,
+    connection_monitors: Vec<JoinHandle<()>>,
+    _public_connection: Arc<AtomicBool>,
+    _private_connection: Option<Arc<AtomicBool>>,
 }
 
 impl LiveRuntime {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         stream: BybitMarketStream,
         strategy: Box<dyn Strategy>,
@@ -244,6 +260,8 @@ impl LiveRuntime {
         settings: LiveSessionSettings,
         market_registry: Arc<MarketRegistry>,
         shutdown: ShutdownSignal,
+        public_connection: Arc<AtomicBool>,
+        private_connection: Option<Arc<AtomicBool>>,
     ) -> Result<Self> {
         let mut strategy_ctx = StrategyContext::new(settings.history);
         let state_repo: Arc<dyn StateRepository> =
@@ -318,14 +336,38 @@ impl LiveRuntime {
         }
 
         let metrics = LiveMetrics::new();
+        metrics.update_connection_status("public", public_connection.load(Ordering::SeqCst));
+        if let Some(flag) = &private_connection {
+            metrics.update_connection_status("private", flag.load(Ordering::SeqCst));
+        }
         let metrics_task = spawn_metrics_server(metrics.registry(), settings.metrics_addr);
         let dispatcher = AlertDispatcher::new(settings.alerting.webhook_url.clone());
-        let alerts = AlertManager::new(settings.alerting, dispatcher);
+        let alerts = AlertManager::new(
+            settings.alerting,
+            dispatcher,
+            Some(public_connection.clone()),
+            private_connection.clone(),
+        );
         let (private_event_tx, private_event_rx) = mpsc::channel(1024);
         let last_private_sync = Arc::new(tokio::sync::Mutex::new(persisted.last_candle_ts));
         let alerts = Arc::new(alerts);
         let alert_task = alerts.spawn_watchdog();
         let metrics = Arc::new(metrics);
+        let mut connection_monitors = Vec::new();
+        connection_monitors.push(spawn_connection_monitor(
+            shutdown.clone(),
+            public_connection.clone(),
+            metrics.clone(),
+            "public",
+        ));
+        if let Some(flag) = private_connection.clone() {
+            connection_monitors.push(spawn_connection_monitor(
+                shutdown.clone(),
+                flag,
+                metrics.clone(),
+                "private",
+            ));
+        }
 
         if !settings.exec_backend.is_paper() {
             let execution_engine = orchestrator.execution_engine();
@@ -338,6 +380,8 @@ impl LiveRuntime {
             let exec_client = execution_engine.client();
             let symbols_for_private = symbols.clone();
             let last_sync_handle = last_private_sync.clone();
+            let private_connection_flag = private_connection.clone();
+            let metrics_for_private = metrics.clone();
             tokio::spawn(async move {
                 let creds = bybit_creds;
                 let endpoint = ws_url;
@@ -345,8 +389,18 @@ impl LiveRuntime {
                 let symbols = symbols_for_private;
                 let last_sync = last_sync_handle;
                 loop {
-                    match tesser_bybit::ws::connect_private(&endpoint, &creds).await {
+                    match tesser_bybit::ws::connect_private(
+                        &endpoint,
+                        &creds,
+                        private_connection_flag.clone(),
+                    )
+                    .await
+                    {
                         Ok(mut socket) => {
+                            if let Some(flag) = &private_connection_flag {
+                                flag.store(true, Ordering::SeqCst);
+                            }
+                            metrics_for_private.update_connection_status("private", true);
                             info!("Connected to Bybit private WebSocket stream");
                             // Incremental reconciliation right after a successful reconnect
                             // 1) Sync open orders
@@ -455,8 +509,18 @@ impl LiveRuntime {
                                 }
                             }
                         }
-                        Err(e) => error!("Private WebSocket connection failed: {e}. Retrying..."),
+                        Err(e) => {
+                            if let Some(flag) = &private_connection_flag {
+                                flag.store(false, Ordering::SeqCst);
+                            }
+                            metrics_for_private.update_connection_status("private", false);
+                            error!("Private WebSocket connection failed: {e}. Retrying...");
+                        }
                     }
+                    if let Some(flag) = &private_connection_flag {
+                        flag.store(false, Ordering::SeqCst);
+                    }
+                    metrics_for_private.update_connection_status("private", false);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
@@ -530,6 +594,9 @@ impl LiveRuntime {
             private_event_rx,
             last_private_sync,
             subscriber_handles,
+            connection_monitors,
+            _public_connection: public_connection,
+            _private_connection: private_connection,
         })
     }
 
@@ -599,6 +666,9 @@ impl LiveRuntime {
             handle.abort();
         }
         for handle in self.subscriber_handles.drain(..) {
+            handle.abort();
+        }
+        for handle in self.connection_monitors.drain(..) {
             handle.abort();
         }
         if let Err(err) = self.save_state().await {
@@ -1091,6 +1161,7 @@ async fn process_tick_event(
 ) -> Result<()> {
     metrics.inc_tick();
     metrics.update_staleness(0.0);
+    metrics.update_last_data_timestamp(Utc::now().timestamp() as f64);
     alerts.heartbeat().await;
     {
         let mut guard = market.lock().await;
@@ -1162,6 +1233,7 @@ async fn process_candle_event(
 ) -> Result<()> {
     metrics.inc_candle();
     metrics.update_staleness(0.0);
+    metrics.update_last_data_timestamp(Utc::now().timestamp() as f64);
     alerts.heartbeat().await;
     metrics.update_price(&candle.symbol, candle.close.to_f64().unwrap_or(0.0));
     {
@@ -1451,6 +1523,22 @@ async fn alert_liquidate_only(alerts: Arc<AlertManager>) {
             "Portfolio entered liquidate-only mode; new exposure blocked until review",
         )
         .await;
+}
+
+fn spawn_connection_monitor(
+    shutdown: ShutdownSignal,
+    flag: Arc<AtomicBool>,
+    metrics: Arc<LiveMetrics>,
+    stream: &'static str,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            metrics.update_connection_status(stream, flag.load(Ordering::SeqCst));
+            if !shutdown.sleep(Duration::from_secs(5)).await {
+                break;
+            }
+        }
+    })
 }
 
 async fn load_market_registry(

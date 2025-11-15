@@ -41,27 +41,44 @@ struct AlertState {
     peak_equity: Decimal,
     drawdown_triggered: bool,
     data_gap_triggered: bool,
+    last_public_connection: Instant,
+    last_private_connection: Instant,
+    public_alerted: bool,
+    private_alerted: bool,
 }
 
 pub struct AlertManager {
     config: AlertingConfig,
     dispatcher: AlertDispatcher,
     state: Arc<Mutex<AlertState>>,
+    public_connection: Option<Arc<std::sync::atomic::AtomicBool>>,
+    private_connection: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AlertManager {
-    pub fn new(config: AlertingConfig, dispatcher: AlertDispatcher) -> Self {
+    pub fn new(
+        config: AlertingConfig,
+        dispatcher: AlertDispatcher,
+        public_connection: Option<Arc<std::sync::atomic::AtomicBool>>,
+        private_connection: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
         let state = AlertState {
             last_data: Instant::now(),
             consecutive_failures: 0,
             peak_equity: Decimal::ZERO,
             drawdown_triggered: false,
             data_gap_triggered: false,
+            last_public_connection: Instant::now(),
+            last_private_connection: Instant::now(),
+            public_alerted: false,
+            private_alerted: false,
         };
         Self {
             config,
             dispatcher,
             state: Arc::new(Mutex::new(state)),
+            public_connection,
+            private_connection,
         }
     }
 
@@ -138,12 +155,53 @@ impl AlertManager {
         }
         let dispatcher = self.dispatcher.clone();
         let state = self.state.clone();
+        let public_connection = self.public_connection.clone();
+        let private_connection = self.private_connection.clone();
         let period = Duration::from_secs(threshold);
         Some(tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(30));
             loop {
                 ticker.tick().await;
                 let mut guard = state.lock().await;
+                let now = Instant::now();
+                if let Some(flag) = &public_connection {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        guard.last_public_connection = now;
+                        guard.public_alerted = false;
+                    } else if !guard.public_alerted
+                        && now.duration_since(guard.last_public_connection)
+                            >= Duration::from_secs(60)
+                    {
+                        guard.public_alerted = true;
+                        drop(guard);
+                        dispatcher
+                            .notify(
+                                "Exchange connection lost (public)",
+                                "Public stream disconnected for over 60s",
+                            )
+                            .await;
+                        guard = state.lock().await;
+                    }
+                }
+                if let Some(flag) = &private_connection {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        guard.last_private_connection = now;
+                        guard.private_alerted = false;
+                    } else if !guard.private_alerted
+                        && now.duration_since(guard.last_private_connection)
+                            >= Duration::from_secs(60)
+                    {
+                        guard.private_alerted = true;
+                        drop(guard);
+                        dispatcher
+                            .notify(
+                                "Exchange connection lost (private)",
+                                "Private stream disconnected for over 60s",
+                            )
+                            .await;
+                        guard = state.lock().await;
+                    }
+                }
                 if guard.last_data.elapsed() >= period && !guard.data_gap_triggered {
                     guard.data_gap_triggered = true;
                     drop(guard);

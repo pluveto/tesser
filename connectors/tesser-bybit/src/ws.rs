@@ -1,4 +1,8 @@
 use std::str::FromStr;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -94,10 +98,15 @@ pub struct BybitMarketStream {
     tick_rx: Mutex<mpsc::Receiver<Tick>>,
     candle_rx: Mutex<mpsc::Receiver<Candle>>,
     order_book_rx: Mutex<mpsc::Receiver<tesser_core::OrderBook>>,
+    connection_status: Option<Arc<AtomicBool>>,
 }
 
 impl BybitMarketStream {
-    pub async fn connect_public(base_url: &str, channel: PublicChannel) -> BrokerResult<Self> {
+    pub async fn connect_public(
+        base_url: &str,
+        channel: PublicChannel,
+        connection_status: Option<Arc<AtomicBool>>,
+    ) -> BrokerResult<Self> {
         let endpoint = format!(
             "{}/v5/public/{}",
             base_url.trim_end_matches('/'),
@@ -106,12 +115,25 @@ impl BybitMarketStream {
         let (ws, _) = connect_async(&endpoint)
             .await
             .map_err(|err| BrokerError::from_display(err, BrokerErrorKind::Transport))?;
+        if let Some(flag) = &connection_status {
+            flag.store(true, Ordering::SeqCst);
+        }
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (tick_tx, tick_rx) = mpsc::channel(2048);
         let (candle_tx, candle_rx) = mpsc::channel(1024);
         let (order_book_tx, order_book_rx) = mpsc::channel(256);
+        let status_for_loop = connection_status.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_ws_loop(ws, command_rx, tick_tx, candle_tx, order_book_tx).await {
+            if let Err(err) = run_ws_loop(
+                ws,
+                command_rx,
+                tick_tx,
+                candle_tx,
+                order_book_tx,
+                status_for_loop,
+            )
+            .await
+            {
                 error!(error = %err, "bybit ws loop exited unexpectedly");
             }
         });
@@ -125,18 +147,35 @@ impl BybitMarketStream {
             tick_rx: Mutex::new(tick_rx),
             candle_rx: Mutex::new(candle_rx),
             order_book_rx: Mutex::new(order_book_rx),
+            connection_status,
         })
+    }
+
+    pub fn connection_status(&self) -> Option<Arc<AtomicBool>> {
+        self.connection_status.clone()
     }
 }
 
 pub async fn connect_private(
     base_url: &str,
     creds: &BybitCredentials,
+    connection_status: Option<Arc<AtomicBool>>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, BrokerError> {
     let endpoint = format!("{}/v5/private", base_url.trim_end_matches('/'));
-    let (mut socket, _) = connect_async(&endpoint)
-        .await
-        .map_err(|e| BrokerError::Transport(e.to_string()))?;
+    let (mut socket, _) = match connect_async(&endpoint).await {
+        Ok(value) => {
+            if let Some(flag) = &connection_status {
+                flag.store(true, Ordering::SeqCst);
+            }
+            value
+        }
+        Err(err) => {
+            if let Some(flag) = &connection_status {
+                flag.store(false, Ordering::SeqCst);
+            }
+            return Err(BrokerError::Transport(err.to_string()));
+        }
+    };
 
     let expires = (Utc::now() + chrono::Duration::seconds(10)).timestamp_millis();
     let payload = format!("GET/realtime{expires}");
@@ -243,9 +282,14 @@ async fn run_ws_loop(
     tick_tx: mpsc::Sender<Tick>,
     candle_tx: mpsc::Sender<Candle>,
     order_book_tx: mpsc::Sender<tesser_core::OrderBook>,
+    connection_status: Option<Arc<AtomicBool>>,
 ) -> BrokerResult<()> {
     let mut heartbeat = interval(Duration::from_secs(20));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    if let Some(flag) = &connection_status {
+        flag.store(true, Ordering::SeqCst);
+    }
 
     loop {
         tokio::select! {
@@ -276,6 +320,10 @@ async fn run_ws_loop(
                 send_ping(&mut socket).await?;
             }
         }
+    }
+
+    if let Some(flag) = connection_status {
+        flag.store(false, Ordering::SeqCst);
     }
 
     Ok(())

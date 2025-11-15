@@ -67,6 +67,8 @@ pub struct LiveMetrics {
     data_gap_gauge: Gauge,
     reconciliation_position_diff: GaugeVec,
     reconciliation_balance_diff: GaugeVec,
+    connection_status: GaugeVec,
+    last_data_timestamp: Gauge,
 }
 
 impl LiveMetrics {
@@ -107,6 +109,19 @@ impl LiveMetrics {
             &["currency"],
         )
         .unwrap();
+        let connection_status = GaugeVec::new(
+            prometheus::Opts::new(
+                "tesser_exchange_connection_status",
+                "Status of exchange websocket connections (1=connected, 0=disconnected)",
+            ),
+            &["stream"],
+        )
+        .unwrap();
+        let last_data_timestamp = Gauge::new(
+            "tesser_market_data_last_received_timestamp_seconds",
+            "Unix timestamp of the last received market data event",
+        )
+        .unwrap();
 
         registry.register(Box::new(ticks_total.clone())).unwrap();
         registry.register(Box::new(candles_total.clone())).unwrap();
@@ -122,6 +137,12 @@ impl LiveMetrics {
         registry
             .register(Box::new(reconciliation_balance_diff.clone()))
             .unwrap();
+        registry
+            .register(Box::new(connection_status.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(last_data_timestamp.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -135,6 +156,8 @@ impl LiveMetrics {
             data_gap_gauge,
             reconciliation_position_diff,
             reconciliation_balance_diff,
+            connection_status,
+            last_data_timestamp,
         }
     }
 
@@ -184,6 +207,17 @@ impl LiveMetrics {
         self.reconciliation_balance_diff
             .with_label_values(&[currency])
             .set(diff);
+    }
+
+    pub fn update_connection_status(&self, stream: &str, connected: bool) {
+        let value = if connected { 1.0 } else { 0.0 };
+        self.connection_status
+            .with_label_values(&[stream])
+            .set(value);
+    }
+
+    pub fn update_last_data_timestamp(&self, timestamp_secs: f64) {
+        self.last_data_timestamp.set(timestamp_secs);
     }
 }
 
