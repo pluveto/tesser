@@ -48,7 +48,7 @@ jobs:
       - name: Determine tag name
         id: tag
         run: |
-          TAG=$(bash scripts/get_release_tag.sh)
+          TAG=$(bash .github/scripts/get_release_tag.sh)
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
