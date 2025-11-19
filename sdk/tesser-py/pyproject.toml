@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tesser"
-version = "0.2.3"
+version = "0.0.0" # placeholder
 description = "Python SDK for Tesser Trading Engine"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
-  { name = "Tesser Contributors", email = "dev@tesser.local" }
+  { name = "Tesser Contributors", email = "opensource@tesser.space" }
 ]
 dependencies = [
   "grpcio>=1.60.0",
