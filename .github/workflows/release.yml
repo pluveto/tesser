@@ -4,13 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version bump type'
+        description: 'Release Level'
         required: true
         type: choice
         options:
+          # Standard semantic version bumps
           - patch
           - minor
           - major
+          # Pre-release bumps
+          - alpha
+          - beta
+          - rc
+          # Promote pre-release to official (e.g., 1.0.0-rc.1 -> 1.0.0)
+          - release
         default: patch
 
 env:
@@ -18,8 +25,7 @@ env:
   PACKAGE_NAME: tesser-cli
 
 jobs:
-  # 1. Verification Phase (Dry Run)
-  # Uses cargo-release's default dry-run behavior to verify config and state.
+  # 1. Verification Phase
   check-dry-run:
     name: Verify and Dry Run
     runs-on: ubuntu-latest
@@ -37,14 +43,13 @@ jobs:
           tool: cargo-release
 
       - name: Check cargo publish (Dry Run)
-        # explicit --dry-run for clarity, though it is default
+        # 'cargo release' handles keywords like 'alpha', 'beta' natively
         run: cargo release ${{ github.event.inputs.version }} --dry-run --no-push --no-tag --no-publish
 
       - name: Check compilation
         run: cargo check --release
 
   # 2. State Mutation Phase
-  # Bump version, create git tag locally, then push.
   tag-and-push:
     name: Bump Version and Tag
     needs: check-dry-run
@@ -53,6 +58,7 @@ jobs:
       contents: write
     outputs:
       tag_name: ${{ steps.tag.outputs.tag_name }}
+      is_prerelease: ${{ steps.tag.outputs.is_prerelease }}
       changelog: ${{ steps.changelog.outputs.body }}
     steps:
       - name: Checkout repository
@@ -75,11 +81,15 @@ jobs:
           git config user.email "${{ github.actor }}@users.noreply.github.com"
 
       - name: Bump version and commit
-        run: cargo release ${{ github.event.inputs.version }} --execute --no-publish --no-push --no-tag --no-confirm
+        # --no-tag: We create the tag manually to ensure it is unique
+        # --no-confirm: Crucial for CI automation
+        run: cargo release ${{ github.event.inputs.version }} --execute --no-publish --no-push --no-confirm --no-tag
 
-      - name: Create Single Tag
+      - name: Create Single Tag and Detect Prerelease
         id: tag
+        shell: bash
         run: |
+          # 1. Get exact version from Cargo metadata
           VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r ".packages[] | select(.name == \"${{ env.PACKAGE_NAME }}\") | .version")
           
           if [ -z "$VERSION" ]; then
@@ -89,10 +99,19 @@ jobs:
           
           TAG="v$VERSION"
           
+          # 2. Manually create tag
           git tag -a "$TAG" -m "Release $TAG"
           
+          # 3. Detect if this is a pre-release (contains a hyphen, e.g., 0.2.0-alpha.1)
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "Detected PRE-RELEASE version."
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Detected STABLE version."
+          fi
+          
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Created tag: $TAG"
 
       - name: Generate changelog
         id: changelog
@@ -108,7 +127,6 @@ jobs:
         run: git push origin HEAD:refs/heads/main --tags
 
   # 3. Build Phase
-  # Compile binaries for all targets. If this fails, Crates.io is not polluted.
   build-artifacts:
     name: Build Artifacts
     needs: tag-and-push
@@ -180,7 +198,6 @@ jobs:
           retention-days: 1
 
   # 4. Publication Phase
-  # Final step: Create GH Release and Publish to Crates.io
   publish-final:
     name: Publish to Registry and GitHub
     needs: [tag-and-push, build-artifacts]
@@ -211,7 +228,8 @@ jobs:
           body: ${{ needs.tag-and-push.outputs.changelog }}
           files: dist/*
           draft: false
-          prerelease: false
+          # Automatically check the "Prerelease" box if it is alpha/beta/rc
+          prerelease: ${{ needs.tag-and-push.outputs.is_prerelease }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute publish order
