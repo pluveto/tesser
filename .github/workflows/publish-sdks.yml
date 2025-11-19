@@ -56,4 +56,4 @@ jobs:
         run: uv build
 
       - name: Publish via Trusted Publisher
-        run: uv publish --trusted-publisher always
+        run: uv publish --trusted-publishing always
