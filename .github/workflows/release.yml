@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version bump type (patch, minor, major)
+        description: 'Version bump type'
         required: true
         type: choice
         options:
@@ -17,9 +17,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  prepare-release:
-    name: Prepare release artifacts
+  # 1. Verification Phase
+  # Perform dry-runs to ensure the project is publishable before making any changes.
+  check-dry-run:
+    name: Verify and Dry Run
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-release
+        uses: taiki-e/install-action@cargo-release
+
+      - name: Check cargo publish (Dry Run)
+        # Verifies dependencies, packaging, and version bumping without modifying state.
+        run: cargo release ${{ github.event.inputs.version }} --dry-run --no-push --no-tag --no-publish
+
+      - name: Check compilation
+        run: cargo check --release
+
+  # 2. State Mutation Phase
+  # Bump version, create git tag, and push to repository.
+  tag-and-push:
+    name: Bump Version and Tag
+    needs: check-dry-run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       tag_name: ${{ steps.tag.outputs.tag_name }}
       changelog: ${{ steps.changelog.outputs.body }}
@@ -28,30 +56,33 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Use a PAT here if the main branch is protected and GITHUB_TOKEN cannot push.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install release tooling
-        run: |
-          cargo install cargo-release --locked
-          cargo install git-cliff --locked
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release, git-cliff
 
-      - name: Configure Git author
+      - name: Configure Git
         run: |
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
 
-      - name: Run cargo release
-        run: cargo release ${{ github.event.inputs.version }} --execute --no-publish
+      - name: Bump version and commit
+        run: cargo release ${{ github.event.inputs.version }} --execute --no-publish --no-push
 
       - name: Determine tag name
         id: tag
         run: |
-          TAG=$(bash .github/scripts/get_release_tag.sh)
+          TAG=$(git describe --tags --abbrev=0)
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: $TAG"
 
-      - name: Generate release notes
+      - name: Generate changelog
         id: changelog
         run: |
           git-cliff --latest --strip all > RELEASE_NOTES.md
@@ -61,39 +92,17 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Push release commit and tag
+      - name: Push changes
         run: git push origin HEAD --follow-tags
 
-  create-github-release:
-    name: Create draft release
-    runs-on: ubuntu-latest
-    needs: prepare-release
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      release_id: ${{ steps.create_release.outputs.id }}
-    permissions:
-      contents: write
-    steps:
-      - name: Create GitHub release draft
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
-          release_name: ${{ needs.prepare-release.outputs.tag_name }}
-          body: ${{ needs.prepare-release.outputs.changelog }}
-          draft: true
-          prerelease: false
-
-  build-and-upload:
-    name: Build and upload binaries
+  # 3. Build Phase
+  # Compile binaries for all targets. If this fails, Crates.io is not polluted.
+  build-artifacts:
+    name: Build Artifacts
+    needs: tag-and-push
     runs-on: ${{ matrix.os }}
-    needs:
-      - prepare-release
-      - create-github-release
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - os: ubuntu-latest
@@ -112,62 +121,86 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-release.outputs.tag_name }}
+          ref: ${{ needs.tag-and-push.outputs.tag_name }}
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build tesser-cli
+      - name: Build binary
         run: cargo build --package tesser-cli --release --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash
         run: |
           set -euo pipefail
+          
           CLI_NAME="tesser-cli"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             CLI_NAME="tesser-cli.exe"
           fi
-          ARTIFACT_NAME="tesser-cli-${{ needs.prepare-release.outputs.tag_name }}-${{ matrix.target }}"
-          ARTIFACT_DIR="$ARTIFACT_NAME"
-          mkdir -p "$ARTIFACT_DIR"
-          cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_DIR/"
+          
+          ARTIFACT_NAME="tesser-cli-${{ needs.tag-and-push.outputs.tag_name }}-${{ matrix.target }}"
+          mkdir -p "$ARTIFACT_NAME"
+          
+          cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_NAME/"
+          
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             ARCHIVE_PATH="${ARTIFACT_NAME}.zip"
-            7z a "$ARCHIVE_PATH" "./$ARTIFACT_DIR/*" >/dev/null
+            7z a "$ARCHIVE_PATH" "./$ARTIFACT_NAME/*" >/dev/null
           else
             ARCHIVE_PATH="${ARTIFACT_NAME}.tar.gz"
-            tar -czf "$ARCHIVE_PATH" -C "$ARTIFACT_DIR" .
+            tar -czf "$ARCHIVE_PATH" -C "$ARTIFACT_NAME" .
           fi
+          
           echo "ASSET_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
-          echo "ASSET_NAME=$ARCHIVE_PATH" >> "$GITHUB_ENV"
 
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload intermediate artifact
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create-github-release.outputs.upload_url }}
-          asset_path: ${{ env.ASSET_PATH }}
-          asset_name: ${{ env.ASSET_NAME }}
-          asset_content_type: application/octet-stream
+          name: bin-${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+          retention-days: 1
 
-  publish-crates:
-    name: Publish crates.io packages
+  # 4. Publication Phase
+  # Only runs if code is tagged and binaries are successfully built.
+  publish-final:
+    name: Publish to Registry and GitHub
+    needs: [tag-and-push, build-artifacts]
     runs-on: ubuntu-latest
-    needs:
-      - prepare-release
-      - create-github-release
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-release.outputs.tag_name }}
+          ref: ${{ needs.tag-and-push.outputs.tag_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.tag-and-push.outputs.tag_name }}
+          name: ${{ needs.tag-and-push.outputs.tag_name }}
+          body: ${{ needs.tag-and-push.outputs.changelog }}
+          files: dist/*
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute publish order
         id: publish_order
@@ -179,7 +212,7 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Publish crates
+      - name: Publish to Crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
@@ -195,25 +228,3 @@ jobs:
             echo "::endgroup::"
             sleep 30
           done <<< "${{ steps.publish_order.outputs.crates }}"
-
-  publish-release:
-    name: Publish GitHub release
-    runs-on: ubuntu-latest
-    needs:
-      - build-and-upload
-      - publish-crates
-      - create-github-release
-    permissions:
-      contents: write
-    steps:
-      - name: Publish draft release
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: ${{ needs.create-github-release.outputs.release_id }},
-              draft: false
-            });
