@@ -1,1 +1,0 @@
-"""Generated protobuf modules."""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 from typing import Optional
 
@@ -38,7 +39,16 @@ class Runner:
         def _handle_stop(*_):
             stop_event.set()
 
-        loop.add_signal_handler(signal.SIGINT, _handle_stop)
-        loop.add_signal_handler(signal.SIGTERM, _handle_stop)
+        if os.name != "nt":
+            loop.add_signal_handler(signal.SIGINT, _handle_stop)
+            loop.add_signal_handler(signal.SIGTERM, _handle_stop)
+        else:  # Windows lacks universal signal support
+            loop.create_task(self._wait_for_keyboard(stop_event))
         await stop_event.wait()
         await server.stop(5)
+
+    async def _wait_for_keyboard(self, stop_event: asyncio.Event):
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, lambda: input())
+        await fut
+        stop_event.set()

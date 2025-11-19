@@ -49,6 +49,9 @@ logs/
 # This includes historical data downloads in various formats, except for curated examples.
 /data/
 sdk/tesser-py/.venv/
+sdk/tesser-py/src/tesser/protos/**/*.py
+sdk/tesser-py/src/tesser/protos/**/*.pyi
+sdk/tesser-py/src/**/__pycache__/
 research/.venv/
 # Allow small checked-in datasets for documentation purposes.
 *.csv

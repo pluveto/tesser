@@ -1,53 +1,34 @@
 # tesser-py
 
-`tesser-py` is the official Python SDK for authoring remote Tesser strategies. It exposes a Pythonic API on top of the StrategyService gRPC contract so that quantitative researchers can write strategies using familiar tools such as pandas and numpy while the Rust engine remains responsible for ingestion, risk management, and execution.
+`tesser-py` is the Python SDK for building remote strategies that plug into the Tesser trading engine via gRPC.
 
-## Features
+## Requirements
 
-- Async-first strategy base class with optional sync helpers.
-- Dataclass models for ticks, candles, signals, positions, and more.
-- Automatic conversion to/from pandas and numpy when available.
-- A resilient gRPC server runner with structured logging and graceful shutdown.
-- Example strategies that show how to integrate with TA libraries.
+- Python 3.9+
+- [`uv`](https://github.com/astral-sh/uv) for dependency management (pip/venv also works, but all docs/tests assume uv)
+- `protoc` (v27+) available on PATH when regenerating protobuf stubs
 
-## Layout
-
-```
-tesser/
-├── models.py          # Dataclasses and enums
-├── strategy.py        # Base strategy API
-├── conversions.py     # Proto ↔ Python conversions
-├── runner.py          # Async runner bootstrapping gRPC server
-├── service.py         # StrategyService implementation
-├── client.py          # Optional helper client for testing
-├── utils/             # Decimal helpers and logging utilities
-└── protos/            # Generated protobuf & gRPC stubs
-```
-
-## Quick start
+## Quick Start
 
 ```bash
 cd sdk/tesser-py
-python -m pip install -e .[data,dev]
-python -m grpc_tools.protoc \
-  -I protos \
-  --python_out=tesser/protos \
-  --grpc_python_out=tesser/protos \
-  protos/tesser/rpc/v1/tesser.proto
+uv sync --all-extras
+uv run scripts/codegen.py
+uv run pytest
 ```
+
+Then start a strategy:
 
 ```python
 import asyncio
-from tesser.strategy import Strategy
-from tesser.runner import Runner
-from tesser.models import Signal, SignalKind
+from tesser import Runner, Strategy, Signal, SignalKind
 
 class PyCross(Strategy):
     def __init__(self):
         super().__init__(name="py-cross", symbol="BTC-USD")
 
     async def on_tick(self, context, tick):
-        if tick.price > tick.price.median:
+        if tick.price > 50_000:
             return [Signal(symbol=tick.symbol, kind=SignalKind.ENTER_LONG)]
         return []
 
@@ -55,4 +36,17 @@ if __name__ == "__main__":
     asyncio.run(Runner(PyCross()).serve())
 ```
 
-See `examples/` for more complete samples.
+## Layout
+
+```
+sdk/tesser-py/
+├── pyproject.toml
+├── src/tesser/        # Library sources
+├── scripts/codegen.py # Protobuf generator
+├── tests/             # Unit/integration tests
+└── examples/
+```
+
+## Code Generation
+
+`uv run scripts/codegen.py` compiles the protobuf definition located under `tesser-rpc/proto` and drops the generated files in `src/tesser/protos`. This step runs automatically in CI and should be executed whenever the proto changes.

@@ -1,0 +1,18 @@
+set shell := ["/bin/bash", "-cu"]
+
+default: check
+
+setup:
+	uv sync --all-extras --dev
+
+codegen:
+	uv run scripts/codegen.py
+
+lint:
+	uv run ruff check src tests
+	# uv run mypy src  # enable once stubs stabilize
+
+pytest: codegen
+	uv run pytest
+
+check: lint pytest
