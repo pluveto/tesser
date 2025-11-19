@@ -25,3 +25,5 @@ tesser-broker = { version = "0.2.2", path = "../tesser-broker" }
 tesser-backtester = { version = "0.2.2", path = "../tesser-backtester" }
 tesser-paper = { version = "0.2.2", path = "../connectors/tesser-paper" }
 tesser-bybit = { version = "0.2.2", path = "../connectors/tesser-bybit" }
+anyhow.workspace = true
+tesser-cli = { version = "0.2.2", path = "../tesser-cli" }

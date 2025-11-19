@@ -2051,9 +2051,11 @@ dependencies = [
 name = "tesser"
 version = "0.2.2"
 dependencies = [
+ "anyhow",
  "tesser-backtester",
  "tesser-broker",
  "tesser-bybit",
+ "tesser-cli",
  "tesser-config",
  "tesser-core",
  "tesser-data",

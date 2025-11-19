@@ -14,6 +14,12 @@ pub use tesser_paper as paper;
 pub use tesser_portfolio as portfolio;
 pub use tesser_strategy as strategy;
 pub use tesser_strategy_macros as strategy_macros;
+pub use tesser_cli;
+
+/// Convenience entrypoint to run the CLI directly from the facade crate.
+pub async fn run_cli() -> anyhow::Result<()> {
+    tesser_cli::run_app().await
+}
 
 /// Convenience prelude to pull commonly used items into scope.
 pub mod prelude {
@@ -29,5 +35,5 @@ pub mod prelude {
     pub use tesser_markets::*;
     pub use tesser_paper::*;
     pub use tesser_portfolio::*;
-    pub use tesser_strategy::*;
+    pub use tesser_strategy::{register_strategy, Strategy, *};
 }
