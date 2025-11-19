@@ -176,21 +176,21 @@ async fn rpc_strategy_handles_grpc_events() {
     strategy.configure(config).unwrap();
 
     let ctx = StrategyContext::default();
-    strategy.on_tick(&ctx, &build_tick()).unwrap();
+    strategy.on_tick(&ctx, &build_tick()).await.unwrap();
     let mut signals = strategy.drain_signals();
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].kind, SignalKind::EnterLong);
     assert_eq!(signals[0].note.as_deref(), Some("tick"));
 
-    strategy.on_candle(&ctx, &build_candle()).unwrap();
+    strategy.on_candle(&ctx, &build_candle()).await.unwrap();
     signals = strategy.drain_signals();
     assert_eq!(signals[0].kind, SignalKind::ExitLong);
 
-    strategy.on_order_book(&ctx, &build_book()).unwrap();
+    strategy.on_order_book(&ctx, &build_book()).await.unwrap();
     signals = strategy.drain_signals();
     assert_eq!(signals[0].kind, SignalKind::EnterShort);
 
-    strategy.on_fill(&ctx, &build_fill()).unwrap();
+    strategy.on_fill(&ctx, &build_fill()).await.unwrap();
     signals = strategy.drain_signals();
     assert_eq!(signals[0].kind, SignalKind::Flatten);
     assert_eq!(strategy.symbol(), "BTC-USD");

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde::Deserialize;
 use tesser_core::{Candle, Fill, OrderBook, Signal, Symbol, Tick};
 use tesser_strategy::{
@@ -61,7 +62,7 @@ impl RpcStrategy {
         }
     }
 
-    fn ensure_client(&mut self) -> StrategyResult<&mut (dyn RemoteStrategyClient + '_)> {
+    async fn ensure_client(&mut self) -> StrategyResult<&mut (dyn RemoteStrategyClient + '_)> {
         if self.client.is_none() {
             let config = self
                 .transport_config
@@ -69,15 +70,17 @@ impl RpcStrategy {
                 .ok_or_else(|| StrategyError::InvalidConfig("transport config missing".into()))?;
 
             let mut client = Self::build_client(&config);
+
             client
                 .connect()
+                .await
                 .map_err(|e| StrategyError::Internal(format!("RPC connect failed: {e}")))?;
 
             let init_request = InitRequest {
                 config_json: self.config_payload.clone(),
             };
 
-            let response = client.initialize(init_request).map_err(|e| {
+            let response = client.initialize(init_request).await.map_err(|e| {
                 StrategyError::Internal(format!("remote strategy init failed: {e}"))
             })?;
 
@@ -116,6 +119,7 @@ impl RpcStrategy {
     }
 }
 
+#[async_trait]
 impl Strategy for RpcStrategy {
     fn name(&self) -> &str {
         "rpc-strategy"
@@ -147,56 +151,60 @@ impl Strategy for RpcStrategy {
         Ok(())
     }
 
-    fn on_tick(&mut self, ctx: &StrategyContext, tick: &Tick) -> StrategyResult<()> {
+    async fn on_tick(&mut self, ctx: &StrategyContext, tick: &Tick) -> StrategyResult<()> {
         let request = TickRequest {
             tick: Some(tick.clone().into()),
             context: Some(ctx.into()),
         };
 
-        let result = self.ensure_client()?.on_tick(request);
-        match result {
+        let client = self.ensure_client().await?;
+        match client.on_tick(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnTick error: {}", e),
         }
         Ok(())
     }
 
-    fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+    async fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
         let request = CandleRequest {
             candle: Some(candle.clone().into()),
             context: Some(ctx.into()),
         };
 
-        let result = self.ensure_client()?.on_candle(request);
-        match result {
+        let client = self.ensure_client().await?;
+        match client.on_candle(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnCandle error: {}", e),
         }
         Ok(())
     }
 
-    fn on_fill(&mut self, ctx: &StrategyContext, fill: &Fill) -> StrategyResult<()> {
+    async fn on_fill(&mut self, ctx: &StrategyContext, fill: &Fill) -> StrategyResult<()> {
         let request = FillRequest {
             fill: Some(fill.clone().into()),
             context: Some(ctx.into()),
         };
 
-        let result = self.ensure_client()?.on_fill(request);
-        match result {
+        let client = self.ensure_client().await?;
+        match client.on_fill(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnFill error: {}", e),
         }
         Ok(())
     }
 
-    fn on_order_book(&mut self, ctx: &StrategyContext, book: &OrderBook) -> StrategyResult<()> {
+    async fn on_order_book(
+        &mut self,
+        ctx: &StrategyContext,
+        book: &OrderBook,
+    ) -> StrategyResult<()> {
         let request = OrderBookRequest {
             order_book: Some(book.clone().into()),
             context: Some(ctx.into()),
         };
 
-        let result = self.ensure_client()?.on_order_book(request);
-        match result {
+        let client = self.ensure_client().await?;
+        match client.on_order_book(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnOrderBook error: {}", e),
         }
