@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tesser"
+version = "0.1.0"
+description = "Python SDK for building remote Tesser strategies over gRPC"
+readme = "README.md"
+authors = [
+  { name = "Tesser Contributors", email = "dev@tesser.local" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+  "grpcio>=1.63",
+  "pydantic>=2.9",
+]
+
+[project.optional-dependencies]
+data = [
+  "pandas>=2.0",
+  "numpy>=1.25",
+]
+dev = [
+  "grpcio-tools>=1.63",
+  "pytest>=8.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/tesserspace/tesser"
+Documentation = "https://github.com/tesserspace/tesser/tree/main/docs"

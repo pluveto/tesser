@@ -48,7 +48,7 @@ logs/
 # Ignore market data, which can be very large and should not be version controlled.
 # This includes historical data downloads in various formats, except for curated examples.
 /data/
-.venv/
+sdk/tesser-py/.venv/
 research/.venv/
 # Allow small checked-in datasets for documentation purposes.
 *.csv
@@ -105,3 +105,4 @@ ehthumbs.db
 # *.html
 # *.pdf
 sheafy.toml
+.venv/
