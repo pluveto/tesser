@@ -100,7 +100,7 @@ async fn spawn_server() -> (SocketAddr, oneshot::Sender<()>) {
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(StrategyServiceServer::new(MockStrategyService::default()))
+            .add_service(StrategyServiceServer::new(MockStrategyService))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = rx.await;
             })
