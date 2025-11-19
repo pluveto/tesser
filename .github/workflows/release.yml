@@ -15,10 +15,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PACKAGE_NAME: tesser-cli
 
 jobs:
-  # 1. Verification Phase
-  # Perform dry-runs to ensure the project is publishable before making any changes.
+  # 1. Verification Phase (Dry Run)
+  # Uses cargo-release's default dry-run behavior to verify config and state.
   check-dry-run:
     name: Verify and Dry Run
     runs-on: ubuntu-latest
@@ -36,14 +37,14 @@ jobs:
           tool: cargo-release
 
       - name: Check cargo publish (Dry Run)
-        # Verifies dependencies, packaging, and version bumping without modifying state.
+        # explicit --dry-run for clarity, though it is default
         run: cargo release ${{ github.event.inputs.version }} --dry-run --no-push --no-tag --no-publish
 
       - name: Check compilation
         run: cargo check --release
 
   # 2. State Mutation Phase
-  # Bump version, create git tag, and push to repository.
+  # Bump version, create git tag locally, then push.
   tag-and-push:
     name: Bump Version and Tag
     needs: check-dry-run
@@ -58,7 +59,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use a PAT here if the main branch is protected and GITHUB_TOKEN cannot push.
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
@@ -75,13 +75,26 @@ jobs:
           git config user.email "${{ github.actor }}@users.noreply.github.com"
 
       - name: Bump version and commit
+        # --execute applies changes locally.
+        # --no-publish skips crates.io (we do that last).
+        # --no-push skips git push (we do that explicitly later).
         run: cargo release ${{ github.event.inputs.version }} --execute --no-publish --no-push
 
-      - name: Determine tag name
+      - name: Determine tag name (Robust)
         id: tag
+        shell: bash
         run: |
-          TAG=$(git describe --tags --abbrev=0)
+          # Use cargo metadata as the source of truth, avoiding git describe errors on new repos.
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r ".packages[] | select(.name == \"${{ env.PACKAGE_NAME }}\") | .version")
+          
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version for package ${{ env.PACKAGE_NAME }}"
+            exit 1
+          fi
+          
+          TAG="v$VERSION"
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
           echo "Generated tag: $TAG"
 
       - name: Generate changelog
@@ -95,6 +108,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Push changes
+        # explicitly push the commit AND the new tag
         run: git push origin HEAD --follow-tags
 
   # 3. Build Phase
@@ -135,19 +149,19 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build binary
-        run: cargo build --package tesser-cli --release --target ${{ matrix.target }}
+        run: cargo build --package ${{ env.PACKAGE_NAME }} --release --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash
         run: |
           set -euo pipefail
           
-          CLI_NAME="tesser-cli"
+          CLI_NAME="${{ env.PACKAGE_NAME }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            CLI_NAME="tesser-cli.exe"
+            CLI_NAME="${{ env.PACKAGE_NAME }}.exe"
           fi
           
-          ARTIFACT_NAME="tesser-cli-${{ needs.tag-and-push.outputs.tag_name }}-${{ matrix.target }}"
+          ARTIFACT_NAME="${{ env.PACKAGE_NAME }}-${{ needs.tag-and-push.outputs.tag_name }}-${{ matrix.target }}"
           mkdir -p "$ARTIFACT_NAME"
           
           cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_NAME/"
@@ -170,7 +184,7 @@ jobs:
           retention-days: 1
 
   # 4. Publication Phase
-  # Only runs if code is tagged and binaries are successfully built.
+  # Final step: Create GH Release and Publish to Crates.io
   publish-final:
     name: Publish to Registry and GitHub
     needs: [tag-and-push, build-artifacts]
