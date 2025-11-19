@@ -179,16 +179,20 @@ impl Backtester {
                         price = %fill.fill_price,
                         "triggered paper conditional order"
                     );
-                    self.record_fill(&fill, &mut all_fills)?;
+                    self.record_fill(&fill, &mut all_fills)
+                        .await
+                        .context("failed to record triggered fill")?;
                 }
             }
 
             self.process_pending_fills(idx, &candle, &mut all_fills)
+                .await
                 .context("failed to settle pending fills")?;
 
             self.strategy_ctx.push_candle(candle.clone());
             self.strategy
                 .on_candle(&self.strategy_ctx, &candle)
+                .await
                 .context("strategy failed on candle")?;
             let signals = self.strategy.drain_signals();
             for signal in signals {
@@ -232,7 +236,7 @@ impl Backtester {
         reporter.calculate()
     }
 
-    fn process_pending_fills(
+    async fn process_pending_fills(
         &mut self,
         candle_index: usize,
         candle: &Candle,
@@ -242,7 +246,9 @@ impl Backtester {
         while let Some(pending) = self.pending.pop_front() {
             if pending.due_index == candle_index {
                 let fill = self.build_fill(&pending.order, candle);
-                self.record_fill(&fill, all_fills)?;
+                self.record_fill(&fill, all_fills)
+                    .await
+                    .context("failed to record pending fill")?;
             } else {
                 remaining.push_back(pending);
             }
@@ -313,6 +319,7 @@ impl Backtester {
                     self.strategy_ctx.push_order_book(book.clone());
                     self.strategy
                         .on_order_book(&self.strategy_ctx, book)
+                        .await
                         .context("strategy failed on order book event")?;
                 }
                 MarketEventKind::Depth(update) => {
@@ -329,6 +336,7 @@ impl Backtester {
                     self.strategy_ctx.push_tick(tick.clone());
                     self.strategy
                         .on_tick(&self.strategy_ctx, tick)
+                        .await
                         .context("strategy failed on tick event")?;
                 }
             }
@@ -376,13 +384,15 @@ impl Backtester {
         if let Some(engine) = &self.matching_engine {
             let fills = engine.drain_fills().await;
             for fill in fills {
-                self.record_fill(&fill, all_fills)?;
+                self.record_fill(&fill, all_fills)
+                    .await
+                    .context("failed to record matching fill")?;
             }
         }
         Ok(())
     }
 
-    fn record_fill(&mut self, fill: &Fill, all_fills: &mut Vec<Fill>) -> anyhow::Result<()> {
+    async fn record_fill(&mut self, fill: &Fill, all_fills: &mut Vec<Fill>) -> anyhow::Result<()> {
         self.portfolio
             .apply_fill(fill)
             .context("failed to update portfolio with fill")?;
@@ -391,6 +401,7 @@ impl Backtester {
             .update_positions(self.portfolio.positions());
         self.strategy
             .on_fill(&self.strategy_ctx, fill)
+            .await
             .context("strategy failed on fill event")?;
         Ok(())
     }

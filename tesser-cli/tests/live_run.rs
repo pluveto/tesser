@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tokio::{sync::mpsc, task::JoinHandle};
 
+use async_trait::async_trait;
 use tesser_bybit::PublicChannel;
 use tesser_cli::live::{
     run_live_with_shutdown, ExecutionBackend, LiveSessionSettings, ShutdownSignal,
@@ -546,6 +547,7 @@ impl PassiveStrategy {
     }
 }
 
+#[async_trait]
 impl Strategy for PassiveStrategy {
     fn name(&self) -> &str {
         "passive-test"
@@ -559,15 +561,19 @@ impl Strategy for PassiveStrategy {
         Ok(())
     }
 
-    fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
+    async fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
         Ok(())
     }
 
-    fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
+    async fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
         Ok(())
     }
 
-    fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &tesser_core::Fill) -> StrategyResult<()> {
+    async fn on_fill(
+        &mut self,
+        _ctx: &StrategyContext,
+        _fill: &tesser_core::Fill,
+    ) -> StrategyResult<()> {
         Ok(())
     }
 
@@ -594,6 +600,7 @@ impl ScriptedStrategy {
     }
 }
 
+#[async_trait]
 impl Strategy for ScriptedStrategy {
     fn name(&self) -> &str {
         "scripted-test"
@@ -607,11 +614,11 @@ impl Strategy for ScriptedStrategy {
         Ok(())
     }
 
-    fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
+    async fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
         Ok(())
     }
 
-    fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
+    async fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
         if self.stage == 0 {
             self.pending
                 .push(Signal::new(self.symbol.clone(), SignalKind::EnterLong, 1.0));
@@ -624,7 +631,11 @@ impl Strategy for ScriptedStrategy {
         Ok(())
     }
 
-    fn on_fill(&mut self, _ctx: &StrategyContext, _fill: &tesser_core::Fill) -> StrategyResult<()> {
+    async fn on_fill(
+        &mut self,
+        _ctx: &StrategyContext,
+        _fill: &tesser_core::Fill,
+    ) -> StrategyResult<()> {
         self.state.fills.fetch_add(1, Ordering::SeqCst);
         self.state.notify.notify_waiters();
         Ok(())

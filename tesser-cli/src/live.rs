@@ -1262,6 +1262,7 @@ async fn process_tick_event(
         let mut strat = strategy.lock().await;
         strat
             .on_tick(&ctx, &tick)
+            .await
             .context("strategy failure on tick event")?;
     }
     emit_signals(strategy.clone(), bus.clone(), metrics.clone()).await;
@@ -1335,6 +1336,7 @@ async fn process_candle_event(
         let mut strat = strategy.lock().await;
         strat
             .on_candle(&ctx, &candle)
+            .await
             .context("strategy failure on candle event")?;
     }
     {
@@ -1373,6 +1375,7 @@ async fn process_order_book_event(
         let mut strat = strategy.lock().await;
         strat
             .on_order_book(&ctx, &book)
+            .await
             .context("strategy failure on order book")?;
     }
     emit_signals(strategy.clone(), bus.clone(), metrics.clone()).await;
@@ -1444,6 +1447,7 @@ async fn process_fill_event(
         let ctx = strategy_ctx.lock().await;
         strat
             .on_fill(&ctx, &fill)
+            .await
             .context("Strategy failed on fill event")?;
     }
     let equity = {
