@@ -14,7 +14,7 @@ chrono.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tesser-broker = { path = "../../tesser-broker" }
-tesser-core = { path = "../../tesser-core" }
+tesser-broker.workspace = true
+tesser-core.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true

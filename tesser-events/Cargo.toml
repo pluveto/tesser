@@ -9,6 +9,6 @@ description = "Event definitions and lightweight event bus interfaces for Tesser
 readme = "README.md"
 
 [dependencies]
-tesser-core = { path = "../tesser-core" }
+tesser-core.workspace = true
 tokio = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }

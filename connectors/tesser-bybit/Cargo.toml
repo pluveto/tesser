@@ -18,8 +18,8 @@ serde_json.workspace = true
 serde_urlencoded.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tesser-broker = { path = "../../tesser-broker" }
-tesser-core = { path = "../../tesser-core" }
+tesser-broker.workspace = true
+tesser-core.workspace = true
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true

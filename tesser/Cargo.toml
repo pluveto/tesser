@@ -11,17 +11,17 @@ categories = ["algorithms", "finance"]
 readme = "README.md"
 
 [dependencies]
-tesser-core = { path = "../tesser-core" }
-tesser-config = { path = "../tesser-config" }
-tesser-data = { path = "../tesser-data" }
-tesser-events = { path = "../tesser-events" }
-tesser-execution = { path = "../tesser-execution" }
-tesser-portfolio = { path = "../tesser-portfolio" }
-tesser-markets = { path = "../tesser-markets" }
-tesser-strategy = { path = "../tesser-strategy" }
-tesser-strategy-macros = { path = "../tesser-strategy-macros" }
-tesser-indicators = { path = "../tesser-indicators" }
-tesser-broker = { path = "../tesser-broker" }
-tesser-backtester = { path = "../tesser-backtester" }
-tesser-paper = { path = "../connectors/tesser-paper" }
-tesser-bybit = { path = "../connectors/tesser-bybit" }
+tesser-core.workspace = true
+tesser-config.workspace = true
+tesser-data.workspace = true
+tesser-events.workspace = true
+tesser-execution.workspace = true
+tesser-portfolio.workspace = true
+tesser-markets.workspace = true
+tesser-strategy.workspace = true
+tesser-strategy-macros.workspace = true
+tesser-indicators.workspace = true
+tesser-broker.workspace = true
+tesser-backtester.workspace = true
+tesser-paper.workspace = true
+tesser-bybit.workspace = true
