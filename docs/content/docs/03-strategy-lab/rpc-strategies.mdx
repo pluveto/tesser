@@ -1,0 +1,56 @@
+# Remote RPC Strategies
+
+Tesser now allows you to delegate the decision loop of a strategy to an external service via **`RpcStrategy`**. This page explains how to configure it, what guarantees it provides, and how to monitor it when running the CLI or the backtester.
+
+## When to use it
+
+Use `RpcStrategy` when your signal model lives outside of Rust (Python, Go, etc.) or when you want to scale the computation independently of the event loop that feeds market data. The local node still streams ticks/candles/order books, but every event is forwarded to your remote service over gRPC and the resulting signals are injected back into the engine.
+
+## Configuration reference
+
+`RpcStrategy` is configured entirely through the `params` TOML block. The same snippet works in the CLI (`tesser-cli`) and the backtester.
+
+```toml
+[[strategies]]
+name = "external-alpha"
+type = "RpcStrategy"
+
+params = """
+transport = "grpc"
+endpoint = "http://127.0.0.1:50051"
+timeout_ms = 250
+symbols = ["BTC-USD", "ETH-USD"]
+heartbeat_interval_ms = 3000
+"""
+```
+
+### Fields
+
+| Field | Required | Description |
+| ----- | -------- | ----------- |
+| `transport` | yes | Currently only `"grpc"` is supported. |
+| `endpoint` | yes | Full URI (validated with the `url` crate). `http://host:port` works for plaintext. |
+| `timeout_ms` | no | Per-RPC deadline (defaults to 500 ms). |
+| `symbols` | no | Optional whitelist. When set, local code ignores all other symbols and will not even connect until one of these symbols appears. |
+| `heartbeat_interval_ms` | no | Frequency (ms) to ping the remote `Heartbeat` method. Default is 5 s. |
+
+## Lifecycle & failure handling
+
+1. **Lazy connection** – We only connect on the first relevant event (tick/candle/fill). If `symbols` filters are set, foreign symbols are dropped before dialing.
+2. **Handshake** – `InitRequest` is sent immediately after connecting. If the remote service suggests symbols, they are used unless you pinned `symbols` locally.
+3. **Heartbeats** – A background task calls `heartbeat()` every `heartbeat_interval_ms`. If several consecutive heartbeats fail or return unhealthy, the client is dropped and the next event will reconnect and re-send `InitRequest`.
+4. **Retries** – Transport errors (e.g. `Unavailable`, `DeadlineExceeded`) trigger a gRPC retry before the client is considered dead. Persistent failures cause `RpcStrategy` to log a warning and wait until the remote comes back.
+
+All errors are surfaced through `tracing` with the `rpc` target. Combine them with the CLI’s new strategy timing logs (look for `strategy lock wait exceeded threshold`) to catch slow or unhealthy remotes.
+
+## Testing locally
+
+You can run the new chaos test (`cargo test -p tesser-rpc chaos_test_reconnection_lifecycle`) to see the full reconnect cycle. It starts a mock gRPC server, kills it mid-stream, restarts it, and proves that `RpcStrategy` re-initializes automatically and resumes signal generation.
+
+For manual testing:
+
+1. Start your external gRPC server.
+2. Add the `RpcStrategy` entry to your CLI/backtester config.
+3. Run `tesser-cli run …` or `tesser-backtester …` and tail the logs. You should see `configured gRPC transport` followed by `RPC strategy initialized` once the handshake succeeds.
+
+If you stop your remote server, the CLI will log dropped clients and the next event after you restart the server will reconnect transparently.
