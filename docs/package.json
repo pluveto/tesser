@@ -10,6 +10,8 @@
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.4.0",
     "clsx": "^2.1.1",
     "framer-motion": "^12.23.24",
     "fumadocs-core": "16.0.14",
@@ -20,7 +22,8 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "sharp": "^0.34.5",
-    "tailwind-merge": "^3.4.0"
+    "tailwind-merge": "^3.4.0",
+    "three": "^0.181.2"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.16",
@@ -28,6 +31,7 @@
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
+    "@types/three": "^0.181.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.16",
     "typescript": "^5.9.3"
