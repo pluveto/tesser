@@ -37,6 +37,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '27.1'
+
       - name: Install cargo-release
         uses: taiki-e/install-action@v2
         with:
@@ -69,6 +74,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: '27.1'
 
       - name: Install tools
         uses: taiki-e/install-action@v2
@@ -161,6 +171,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: '27.1'
 
       - name: Build binary
         run: cargo build --package ${{ env.PACKAGE_NAME }} --release --target ${{ matrix.target }}
