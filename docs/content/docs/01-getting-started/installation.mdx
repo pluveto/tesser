@@ -1,0 +1,33 @@
+---
+title: Environment Setup
+description: Verify prerequisites and prepare your workstation for Tesser.
+---
+
+## Toolchain Requirements
+
+- **Rust**: Install via [rustup.rs](https://rustup.rs) and stick to the latest stable channel.
+- **pnpm + Node.js 20**: Required for the standalone docs site and dashboard experiments.
+- **Git**: Needed for pulling workspace updates and managing strategy repos.
+
+```bash
+curl https://sh.rustup.rs -sSf | sh
+curl -fsSL https://get.pnpm.io/install.sh | sh -
+```
+
+## Workspace Bootstrap
+
+Clone the repository and install the docs dependencies (they live in the `docs` folder and do not pollute the Rust workspace):
+
+```bash
+git clone https://github.com/tesserspace/tesser.git
+cd tesser
+pnpm install --prefix docs
+```
+
+## Local Configuration
+
+- Copy `config/default.toml` to a custom profile (e.g. `config/local.toml`) and adjust exchange keys.
+- Export `TESSER_ENV=local` before running `tesser-cli` so it resolves the correct profile.
+- Add `.env` values for services such as Prometheus exporters when you reach the operations stage.
+
+Once these steps are complete you can jump back to the **Quick Start** page to execute your first backtest.

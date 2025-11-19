@@ -1,0 +1,33 @@
+---
+title: Exchange Abstraction
+description: Implement two traits and Tesser speaks to any venue.
+---
+
+The `tesser-broker` crate defines a very small surface area that every connector must satisfy:
+
+```rust
+pub trait MarketStream {
+    async fn subscribe(&mut self, symbols: &[Symbol]) -> anyhow::Result<()>;
+    async fn next_event(&mut self) -> anyhow::Result<MarketEvent>;
+}
+
+pub trait ExecutionClient {
+    async fn place(&self, order: OrderRequest) -> anyhow::Result<OrderId>;
+    async fn cancel(&self, id: &OrderId) -> anyhow::Result<()>;
+    async fn positions(&self) -> anyhow::Result<Vec<Position>>;
+}
+```
+
+## Connector Anatomy
+
+1. **Transport** – WebSocket tasks and REST clients that translate exchange payloads into Tesser types.
+2. **Auth** – A pluggable signer so keys never leak outside the connector crate.
+3. **Reconcilers** – Periodically fetch the ground truth and push `ReconciliationEvent`s when something drifts.
+
+## Adding a Venue
+
+1. Create `connectors/tesser-{venue}`.
+2. Implement `MarketStream` and `ExecutionClient`.
+3. Register the connector inside `tesser-config`, enabling it to show up as `--execution-target {venue}` in the CLI.
+
+Because every venue speaks through the same traits, strategies and risk controls remain unchanged when you switch between Paper, Bybit, or a future exchange.

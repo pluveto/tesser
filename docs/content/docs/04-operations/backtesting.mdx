@@ -1,0 +1,26 @@
+---
+title: Backtesting Engine
+description: Replay months of data through the exact same event loop.
+---
+
+The backtester wires the data layer, strategies, and execution logic exactly like the live system—the only difference is the connector (`tesser-paper`) that simulates fills deterministically.
+
+## Running a Scenario
+
+```bash
+cargo run -p tesser-cli -- \
+    backtest run \
+    --strategy-config examples/strategies/sma_cross.toml \
+    --data examples/data/btcusdt_1m_sample.csv \
+    --mode candle
+```
+
+Switch to `--mode tick` and provide order-book snapshots when you need depth-aware simulations.
+
+## Reports
+
+- Equity curve + drawdown
+- Fill breakdown by hint (VWAP, Pegged, etc.)
+- Latency histograms for strategy handlers
+
+All reports serialize to JSON so you can feed them into your research notebook or CI.

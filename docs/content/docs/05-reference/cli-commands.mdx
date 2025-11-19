@@ -1,0 +1,27 @@
+---
+title: CLI Commands
+description: Quick reference for tesser-cli.
+---
+
+```text
+tesser-cli --env <profile> <COMMAND>
+```
+
+## Data
+
+- `data download --symbol BTCUSDT --interval 1m --out data/btc.csv`
+- `data validate --input data/btc.csv`
+- `data resample --input data/btc.csv --interval 5m`
+
+## Backtesting
+
+- `backtest run --strategy-config strategies/sma_cross.toml --data data/btc.csv`
+- `backtest batch --config research/batch.toml --out reports/batch.csv`
+
+## Live Operations
+
+- `live run --strategy-config strategies/alpha.toml`
+- `state inspect --path .tesser/state.db`
+- `strategies list`
+
+Use `--help` on any subcommand to print detailed flags and examples.

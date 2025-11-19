@@ -1,0 +1,36 @@
+---
+title: Risk Management
+description: Guardrails that keep capital safe in live markets.
+---
+
+## Pre-trade Checks
+
+`tesser-execution` validates every order before it leaves the process:
+
+- Max notionals per asset and per strategy.
+- Leverage caps and maintenance margin checks.
+- Participation throttles so you never exceed a configurable percentage of venue volume.
+
+Orders that violate a rule are downgraded to warnings or rejected outright depending on the policy.
+
+## Portfolio Guardrails
+
+The portfolio service tracks exposure across venues. You can enforce:
+
+- **Max Position** – Hard cap on base asset holdings.
+- **Max Drawdown** – When equity drops below the configured percentage, Tesser downgrades to *liquidate-only*.
+- **Circuit Breakers** – Tie into volatility indicators or exchange health to halt trading.
+
+## Liquidate-only Mode
+
+Triggered when drawdown or reconciliation fails. The system:
+
+1. Cancels resting orders.
+2. Flushes outstanding signals.
+3. Only accepts exit signals until exposure returns to safe thresholds.
+
+## Reconciliation
+
+- Periodic account snapshots compare on-chain balances with local state.
+- Any mismatch publishes a `ReconciliationEvent` so monitoring tools can alert operators.
+- Optional “auto-heal” tasks flatten positions automatically for paper trading environments.

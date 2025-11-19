@@ -1,0 +1,27 @@
+---
+title: Live Trading
+description: Deploy strategies with the same binaries you backtest.
+---
+
+## Checklist
+
+- Configure API keys in `config/{env}.toml`.
+- Set `execution.target = "bybit"` (or your custom connector).
+- Point `data.market_stream` to the production WebSocket endpoint.
+
+## Launch
+
+```bash
+cargo run -p tesser-cli -- \
+    live run \
+    --strategy-config strategies/sma_cross.toml \
+    --env prod
+```
+
+The CLI spins up three async tasks:
+
+1. **Market Data** – Streams ticks into the event bus.
+2. **Strategy Runtime** – Executes your WASM-free Rust strategies with millisecond latency.
+3. **Execution Engine** – Routes intent to the exchange and persists state for recovery.
+
+If the process restarts it reloads everything from the SQLite snapshot and resumes from the latest offsets. Pair it with Prometheus exporters to watch latency, error rates, and per-strategy PnL in Grafana.

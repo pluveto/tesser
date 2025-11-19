@@ -1,0 +1,27 @@
+---
+title: Event Loop
+description: How ticks, signals, and fills flow through the framework.
+---
+
+Tesser is fundamentally an event-driven system. Every component reacts to typed events rather than calling each other directly, which keeps the runtime predictable and testable.
+
+## Sources
+
+1. **Market Data** – Adapters inside `tesser-bybit` push order-book deltas and trades.
+2. **Strategy Timers** – Synthetic heartbeats trigger periodic jobs such as risk recalculations.
+3. **Execution Feedback** – Order acknowledgements and fills are streamed as events so the rest of the system stays in sync.
+
+## Bus Semantics
+
+- `EventBus<T>` is backed by `tokio::broadcast`, enabling fan-out without complex wiring.
+- Producers never block the main loop; if a subscriber lags it is restarted with the last durable snapshot.
+- Consumers can be unit-tested by replaying their event stream in isolation.
+
+## Lifecycle
+
+```text
+MarketStream -> EventBus<TickEvent> -> Strategy -> EventBus<SignalEvent>
+            -> Execution Engine -> EventBus<OrderEvent> -> Portfolio
+```
+
+Each arrow denotes asynchronous handoff. This structure gives you deterministic replay in the backtester and resilience in live trading.

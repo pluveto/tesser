@@ -1,0 +1,26 @@
+---
+title: Configuration Reference
+description: All knobs that shape a Tesser deployment.
+---
+
+## Files
+
+- `config/default.toml` – Baseline values checked into git.
+- `config/{env}.toml` – Environment overrides (e.g., `prod`, `staging`, `paper`).
+- `.env` – Secrets and service endpoints, loaded automatically by the CLI.
+
+## Key Sections
+
+- `[execution]` – Selects the connector (`paper`, `bybit`) and execution hints per strategy.
+- `[risk]` – Max drawdown, per-asset notional caps, and participation throttles.
+- `[data]` – Market data adapters, retention windows, and replay options.
+
+## Overrides
+
+Use `--env` to select a profile at runtime:
+
+```bash
+tesser-cli --env prod live run --strategy-config strat.toml
+```
+
+All options can also be overridden with environment variables using the `TESSER__` prefix (e.g., `TESSER__RISK__MAX_DRAWDOWN=0.1`).

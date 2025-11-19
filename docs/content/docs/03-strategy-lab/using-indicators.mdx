@@ -1,0 +1,40 @@
+---
+title: Using Indicators
+description: Compose zero-cost indicators to power your strategies.
+---
+
+Indicators in Tesser are streaming primitives—they update in O(1) time and never allocate on the heap. Everything lives inside `tesser-indicators`.
+
+## Feeding Data
+
+```rust
+use rust_decimal::Decimal;
+use tesser_indicators::{Indicator, indicators::Ema};
+
+let mut ema = Ema::new(21)?;
+
+for candle in candles {
+    if let Some(value) = ema.next(candle.close) {
+        tracing::info!("EMA21 = {value}");
+    }
+}
+```
+
+Each indicator implements the `Indicator` trait so you can swap them or compose pipelines.
+
+## Composition
+
+Use the `pipe()` helpers to build higher-level signals:
+
+```rust
+let (mut fast, mut slow) = (Ema::new(8)?, Ema::new(21)?);
+if let (Some(f), Some(s)) = (fast.next(price), slow.next(price)) {
+    if f > s {
+        // emit bullish signal
+    }
+}
+```
+
+## Persistence
+
+The CLI stores indicator state alongside the strategy snapshot so you can restart a live session without losing context. Implement `SerializableIndicator` on custom components for the same behavior.

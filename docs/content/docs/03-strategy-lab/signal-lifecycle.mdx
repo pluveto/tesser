@@ -1,0 +1,16 @@
+---
+title: Signal Lifecycle
+description: What happens after your strategy fires a signal.
+---
+
+1. **Strategy emits `Signal`** – Typically from `on_tick` or `on_candle`. Use the provided `SignalBuilder` helpers to keep payloads consistent.
+2. **Execution Engine** – Receives the signal, enriches it with portfolio context, and chooses an execution hint (VWAP, PeggedBest, Sniper, etc.).
+3. **Risk Filters** – Guardrails (max position size, participation caps) run before any order hits the wire.
+4. **Order Routing** – The engine translates the validated intent into `OrderRequest`s and hands them to the configured `ExecutionClient`.
+5. **Fill Feedback** – Executions stream back through the event bus; the strategy can react in `on_fill`, and the portfolio updates realized PnL.
+
+```text
+Signal -> Execution -> Risk -> Orders -> Exchange -> Fills -> Portfolio
+```
+
+Keep the signal payload focused on *intent* (e.g., “go long BTCUSDT, size 0.5”). Pricing tactics, throttling, and compliance rules live downstream so they can be audited centrally.

@@ -1,0 +1,29 @@
+---
+title: Data Engineering
+description: Acquire, validate, and store high quality market data.
+---
+
+## Sources
+
+- **Bybit Historical** – Use the public bulk download API or trigger `tesser-cli data download` with your API key for authenticated ranges.
+- **Custom Feeds** – Drop CSV/JSONL files under `data/` and point backtests to them via `--data`.
+
+## Validation
+
+```bash
+cargo run -p tesser-cli -- data validate \
+    --input data/btcusdt_1m_sample.csv
+```
+
+The validator detects:
+
+- Missing candles or duplicated timestamps.
+- Price spikes outside configurable tolerances.
+- Volume gaps that usually signal exchange outages.
+
+## Storage
+
+- CSV is the default interchange format.
+- Parquet support is underway; the CLI already exposes `data convert --to parquet` so you can try it today for analytics workloads.
+
+Keep raw downloads immutable and derive normalized datasets via scripts in `research/` so simulations remain reproducible.
