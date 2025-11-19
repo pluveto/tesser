@@ -15,6 +15,7 @@ anyhow.workspace = true
 
 tesser-core = { version = "0.2.3", path = "../tesser-core" }
 tesser-config = { version = "0.2.3", path = "../tesser-config" }
+tesser-cli = { version = "0.2.3", path = "../tesser-cli" }
 tesser-data = { version = "0.2.3", path = "../tesser-data" }
 tesser-events = { version = "0.2.3", path = "../tesser-events" }
 tesser-execution = { version = "0.2.3", path = "../tesser-execution" }

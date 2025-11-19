@@ -3,6 +3,7 @@
 pub use tesser_backtester as backtester;
 pub use tesser_broker as broker;
 pub use tesser_bybit as bybit;
+pub use tesser_cli;
 pub use tesser_config as config;
 pub use tesser_core as core;
 pub use tesser_data as data;
@@ -14,7 +15,6 @@ pub use tesser_paper as paper;
 pub use tesser_portfolio as portfolio;
 pub use tesser_strategy as strategy;
 pub use tesser_strategy_macros as strategy_macros;
-pub use tesser_cli;
 
 /// Convenience entrypoint to run the CLI directly from the facade crate.
 pub async fn run_cli() -> anyhow::Result<()> {
