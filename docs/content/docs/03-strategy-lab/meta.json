@@ -3,6 +3,7 @@
   "pages": [
     "writing-strategies",
     "using-indicators",
-    "signal-lifecycle"
+    "signal-lifecycle",
+    "rpc-strategies"
   ]
 }

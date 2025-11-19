@@ -42,3 +42,4 @@ rust_decimal.workspace = true
 [dev-dependencies]
 tesser-test-utils = { version = "0.2.3", path = "../tesser-test-utils" }
 tempfile = "3.10"
+async-trait.workspace = true

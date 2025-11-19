@@ -17,6 +17,7 @@ members = [
     "tesser-indicators", 
     "tesser-test-utils", 
     "tesser-markets",
+    "tesser-rpc",
     "tesser",
 ]
 
@@ -68,6 +69,7 @@ tesser-execution = { version = "0.2.3", path = "tesser-execution" }
 tesser-indicators = { version = "0.2.3", path = "tesser-indicators" }
 tesser-markets = { version = "0.2.3", path = "tesser-markets" }
 tesser-portfolio = { version = "0.2.3", path = "tesser-portfolio" }
+tesser-rpc = { version = "0.2.3", path = "tesser-rpc" }
 tesser-strategy = { version = "0.2.3", path = "tesser-strategy" }
 tesser-strategy-macros = { version = "0.2.3", path = "tesser-strategy-macros" }
 tesser-test-utils = { version = "0.2.3", path = "tesser-test-utils" }
