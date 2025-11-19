@@ -31,7 +31,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-release
-        uses: taiki-e/install-action@cargo-release
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release
 
       - name: Check cargo publish (Dry Run)
         # Verifies dependencies, packaging, and version bumping without modifying state.
