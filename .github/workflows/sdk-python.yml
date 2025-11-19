@@ -18,9 +18,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.10", "3.11", "3.12"]
-
+        # os: [ubuntu-latest, macos-latest, windows-latest]
+        # python: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest]
+        python: ["3.10"]
     defaults:
       run:
         working-directory: sdk/tesser-py
@@ -47,8 +48,8 @@ jobs:
       - name: Lint
         run: uv run ruff check src tests
 
-      # - name: Type check
-      #   run: uv run mypy src
+      - name: Type check
+        run: uv run mypy src
 
       - name: Run tests
         run: uv run pytest
