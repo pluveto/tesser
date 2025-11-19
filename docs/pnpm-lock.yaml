@@ -29,6 +29,9 @@ importers:
       react-dom:
         specifier: ^19.2.0
         version: 19.2.0(react@19.2.0)
+      sharp:
+        specifier: ^0.34.5
+        version: 0.34.5
     devDependencies:
       '@tailwindcss/postcss':
         specifier: ^4.1.16
@@ -1934,8 +1937,7 @@ snapshots:
     dependencies:
       tslib: 2.8.1
 
-  '@img/colour@1.0.0':
-    optional: true
+  '@img/colour@1.0.0': {}
 
   '@img/sharp-darwin-arm64@0.34.5':
     optionalDependencies:
@@ -3691,8 +3693,7 @@ snapshots:
     dependencies:
       compute-scroll-into-view: 3.1.1
 
-  semver@7.7.3:
-    optional: true
+  semver@7.7.3: {}
 
   sharp@0.34.5:
     dependencies:
@@ -3724,7 +3725,6 @@ snapshots:
       '@img/sharp-win32-arm64': 0.34.5
       '@img/sharp-win32-ia32': 0.34.5
       '@img/sharp-win32-x64': 0.34.5
-    optional: true
 
   shiki@3.15.0:
     dependencies:
