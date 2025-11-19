@@ -899,9 +899,7 @@ async fn enforce_liquidate_only(ctx: &ReconciliationContext) {
         let mut state = ctx.persisted.lock().await;
         state.portfolio = Some(snapshot);
     }
-    if let Err(err) =
-        persist_state(ctx.state_repo.clone(), ctx.persisted.clone(), None).await
-    {
+    if let Err(err) = persist_state(ctx.state_repo.clone(), ctx.persisted.clone(), None).await {
         warn!(error = %err, "failed to persist liquidate-only transition");
     }
 }
