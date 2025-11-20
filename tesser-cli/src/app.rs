@@ -25,9 +25,9 @@ use tesser_backtester::reporting::PerformanceReport;
 use tesser_backtester::{BacktestConfig, BacktestMode, Backtester, MarketEvent, MarketEventKind};
 use tesser_broker::ExecutionClient;
 use tesser_bybit::PublicChannel;
-use tesser_config::{load_config, AppConfig, RiskManagementConfig};
+use tesser_config::{load_config, AppConfig, ExchangeDriver, RiskManagementConfig};
 use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
-use tesser_data::download::{BybitDownloader, KlineRequest};
+use tesser_data::download::{BinanceDownloader, BybitDownloader, KlineRequest};
 use tesser_execution::{
     ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
     RiskAdjustedSizer,
@@ -171,16 +171,28 @@ impl DataDownloadArgs {
             return Err(anyhow!("start time must be earlier than end time"));
         }
 
-        let downloader = BybitDownloader::new(&exchange_cfg.rest_url);
-        let request = KlineRequest::new(&self.category, &self.symbol, interval, start, end);
         info!(
             "Downloading {} candles for {} ({})",
             self.interval, self.symbol, self.exchange
         );
-        let mut candles = downloader
-            .download_klines(&request)
-            .await
-            .with_context(|| "failed to download candles from Bybit")?;
+        let mut candles = match exchange_cfg.driver {
+            ExchangeDriver::Bybit => {
+                let downloader = BybitDownloader::new(&exchange_cfg.rest_url);
+                let request = KlineRequest::new(&self.category, &self.symbol, interval, start, end);
+                downloader
+                    .download_klines(&request)
+                    .await
+                    .with_context(|| "failed to download candles from Bybit")?
+            }
+            ExchangeDriver::Binance => {
+                let downloader = BinanceDownloader::new(&exchange_cfg.rest_url);
+                let request = KlineRequest::new("", &self.symbol, interval, start, end);
+                downloader
+                    .download_klines(&request)
+                    .await
+                    .with_context(|| "failed to download candles from Binance")?
+            }
+        };
 
         if candles.is_empty() {
             info!("No candles returned for {}", self.symbol);
@@ -442,7 +454,7 @@ pub struct LiveRunArgs {
     risk_max_position_qty: Option<Decimal>,
     #[arg(long)]
     risk_max_drawdown: Option<Decimal>,
-    /// Bybit orderbook depth to subscribe to (e.g., 1, 25, 50)
+    /// Bybit orderbook depth to subscribe to (e.g., 1, 25, 50). Ignored for other connectors.
     #[arg(long)]
     orderbook_depth: Option<usize>,
     /// Order sizer (e.g. "fixed:0.01", "percent:0.02")
@@ -800,6 +812,8 @@ impl LiveRunArgs {
             .cloned()
             .ok_or_else(|| anyhow!("exchange profile {} not found", self.exchange))?;
 
+        let driver = exchange_cfg.driver.clone();
+
         let contents = fs::read_to_string(&self.strategy_config)
             .with_context(|| format!("failed to read {}", self.strategy_config.display()))?;
         let def: StrategyConfigFile =
@@ -848,6 +862,7 @@ impl LiveRunArgs {
             risk: self.build_risk_config(config),
             reconciliation_interval,
             reconciliation_threshold,
+            driver,
         };
 
         info!(
@@ -855,6 +870,7 @@ impl LiveRunArgs {
             symbols = ?symbols,
             exchange = %self.exchange,
             interval = %self.interval,
+            driver = ?settings.driver,
             exec = ?self.exec,
             "starting live session"
         );

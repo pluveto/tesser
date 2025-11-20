@@ -13,6 +13,7 @@ members = [
     "tesser-events",
     "connectors/tesser-bybit",
     "connectors/tesser-paper",
+    "connectors/tesser-binance",
     "tesser-config", 
     "tesser-indicators", 
     "tesser-test-utils", 
@@ -78,6 +79,7 @@ tesser-strategy-macros = { version = "0.4.1", path = "tesser-strategy-macros" }
 tesser-test-utils = { version = "0.4.1", path = "tesser-test-utils" }
 tesser = { version = "0.4.1", path = "tesser" }
 tesser-bybit = { version = "0.4.1", path = "connectors/tesser-bybit" }
+tesser-binance = { version = "0.4.1", path = "connectors/tesser-binance" }
 tesser-paper = { version = "0.4.1", path = "connectors/tesser-paper" }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 

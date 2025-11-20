@@ -11,9 +11,10 @@ description: All knobs that shape a Tesser deployment.
 
 ## Key Sections
 
-- `[execution]` – Selects the connector (`paper`, `bybit`) and execution hints per strategy.
+- `[execution]` – Selects the connector (`paper`, `bybit`, `binance`) and execution hints per strategy.
 - `[risk]` – Max drawdown, per-asset notional caps, and participation throttles.
 - `[data]` – Market data adapters, retention windows, and replay options.
+- `[exchange.<name>]` – REST/WebSocket endpoints, credentials, and the `driver` (`bybit` or `binance`) used by live trading.
 
 ## Overrides
 

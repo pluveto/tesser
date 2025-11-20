@@ -16,7 +16,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tesser-broker = { version = "0.4.1", path = "../tesser-broker" }
-tesser-bybit = { version = "0.4.1", path = "../connectors/tesser-bybit" }
 tesser-core = { version = "0.4.1", path = "../tesser-core" }
 tesser-strategy = { version = "0.4.1", path = "../tesser-strategy" }
 thiserror.workspace = true

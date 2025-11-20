@@ -230,6 +230,19 @@ impl Interval {
             Self::OneDay => "D",
         }
     }
+
+    /// Convert the interval to Binance-compatible identifiers.
+    pub fn to_binance(self) -> &'static str {
+        match self {
+            Self::OneSecond => "1s",
+            Self::OneMinute => "1m",
+            Self::FiveMinutes => "5m",
+            Self::FifteenMinutes => "15m",
+            Self::OneHour => "1h",
+            Self::FourHours => "4h",
+            Self::OneDay => "1d",
+        }
+    }
 }
 
 impl FromStr for Interval {

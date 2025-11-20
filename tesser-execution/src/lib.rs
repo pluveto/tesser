@@ -13,7 +13,6 @@ use anyhow::{bail, Context};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tesser_broker::{BrokerError, BrokerResult, ExecutionClient};
-use tesser_bybit::{BybitClient, BybitCredentials};
 use tesser_core::{
     Order, OrderRequest, OrderType, Price, Quantity, Side, Signal, SignalKind, Symbol,
 };
@@ -468,20 +467,5 @@ impl ExecutionEngine {
 
     pub fn sizer(&self) -> &dyn OrderSizer {
         self.sizer.as_ref()
-    }
-
-    pub fn credentials(&self) -> Option<BybitCredentials> {
-        self.client
-            .as_any()
-            .downcast_ref::<BybitClient>()
-            .and_then(|client| client.get_credentials())
-    }
-
-    pub fn ws_url(&self) -> String {
-        self.client
-            .as_any()
-            .downcast_ref::<BybitClient>()
-            .map(|client| client.get_ws_url())
-            .unwrap_or_default()
     }
 }

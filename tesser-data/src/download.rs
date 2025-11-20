@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use tesser_core::{Candle, Interval, Symbol};
 use tracing::debug;
 
@@ -190,6 +191,123 @@ struct BybitKlineResponse {
 #[derive(Debug, Deserialize)]
 struct KlineResult {
     list: Vec<Vec<String>>,
+}
+
+/// Simple Binance REST downloader for kline data.
+pub struct BinanceDownloader {
+    client: Client,
+    base_url: String,
+}
+
+impl BinanceDownloader {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.into(),
+        }
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        format!("{base}/{path}")
+    }
+
+    pub async fn download_klines(&self, req: &KlineRequest<'_>) -> Result<Vec<Candle>> {
+        let mut cursor = req.start.timestamp_millis();
+        let end_ms = req.end.timestamp_millis();
+        if cursor >= end_ms {
+            return Err(anyhow!("start must be earlier than end"));
+        }
+        let mut candles = Vec::new();
+        let interval_ms = req.interval.as_duration().num_milliseconds();
+        while cursor < end_ms {
+            let response = self
+                .client
+                .get(self.endpoint("fapi/v1/klines"))
+                .query(&[
+                    ("symbol", req.symbol),
+                    ("interval", req.interval.to_binance()),
+                    ("startTime", &cursor.to_string()),
+                    ("endTime", &end_ms.to_string()),
+                    ("limit", &req.limit.min(MAX_LIMIT).to_string()),
+                ])
+                .send()
+                .await
+                .context("request to Binance failed")?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("failed to read Binance response body")?;
+            debug!(
+                "binance kline response (status {}): {}",
+                status,
+                truncate(&body, 512)
+            );
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "Binance responded with status {}: {}",
+                    status,
+                    truncate(&body, 256)
+                ));
+            }
+            let entries: Vec<Vec<JsonValue>> = serde_json::from_str(&body).map_err(|err| {
+                anyhow!(
+                    "failed to parse Binance response: {} (body snippet: {})",
+                    err,
+                    truncate(&body, 256)
+                )
+            })?;
+            if entries.is_empty() {
+                break;
+            }
+            let mut batch = Vec::new();
+            for entry in entries {
+                if let Some(candle) = parse_binance_entry(&entry, req.symbol, req.interval) {
+                    if candle.timestamp.timestamp_millis() >= cursor
+                        && candle.timestamp.timestamp_millis() <= end_ms
+                    {
+                        batch.push(candle);
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            batch.sort_by_key(|c| c.timestamp);
+            cursor = batch
+                .last()
+                .map(|c| c.timestamp.timestamp_millis() + interval_ms)
+                .unwrap_or(end_ms);
+            candles.extend(batch);
+        }
+        candles.sort_by_key(|c| c.timestamp);
+        candles.dedup_by_key(|c| c.timestamp);
+        Ok(candles)
+    }
+}
+
+fn parse_binance_entry(entry: &[JsonValue], symbol: &str, interval: Interval) -> Option<Candle> {
+    if entry.len() < 6 {
+        return None;
+    }
+    let ts = entry.get(0)?.as_i64()?;
+    let timestamp = DateTime::<Utc>::from_timestamp_millis(ts)?;
+    let open = entry.get(1)?.as_str()?.parse::<Decimal>().ok()?;
+    let high = entry.get(2)?.as_str()?.parse::<Decimal>().ok()?;
+    let low = entry.get(3)?.as_str()?.parse::<Decimal>().ok()?;
+    let close = entry.get(4)?.as_str()?.parse::<Decimal>().ok()?;
+    let volume = entry.get(5)?.as_str()?.parse::<Decimal>().ok()?;
+    Some(Candle {
+        symbol: Symbol::from(symbol),
+        interval,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        timestamp,
+    })
 }
 
 fn truncate(body: &str, max: usize) -> String {
