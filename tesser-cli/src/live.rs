@@ -21,16 +21,14 @@ use serde_json::{json, Value};
 use tesser_binance::{
     fill_from_update, order_from_update,
     ws::{extract_order_update, BinanceUserDataStream, UserDataStreamEventsResponse},
-    BinanceClient, BinanceConfig, BinanceCredentials, BinanceMarketStream, BinanceSubscription,
+    BinanceClient,
 };
 use tesser_broker::{
     get_connector_factory, BrokerResult, ConnectorFactory, ConnectorStream, ConnectorStreamConfig,
-    ExecutionClient, MarketStream,
+    ExecutionClient,
 };
 use tesser_bybit::ws::{BybitWsExecution, BybitWsOrder, PrivateMessage};
-use tesser_bybit::{
-    BybitClient, BybitConfig, BybitCredentials, BybitMarketStream, BybitSubscription, PublicChannel,
-};
+use tesser_bybit::{BybitClient, BybitCredentials, PublicChannel};
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
     Candle, Fill, Interval, Order, OrderBook, OrderStatus, Position, Price, Quantity, Side, Signal,
@@ -84,7 +82,6 @@ const STRATEGY_CALL_WARN_THRESHOLD: Duration = Duration::from_millis(250);
 
 #[async_trait::async_trait]
 trait LiveMarketStream: Send {
-    async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()>;
     async fn next_tick(&mut self) -> BrokerResult<Option<Tick>>;
     async fn next_candle(&mut self) -> BrokerResult<Option<Candle>>;
     async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>>;
@@ -102,96 +99,6 @@ impl FactoryStreamAdapter {
 
 #[async_trait::async_trait]
 impl LiveMarketStream for FactoryStreamAdapter {
-    async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
-        self.inner.subscribe(symbols, interval).await
-    }
-
-    async fn next_tick(&mut self) -> BrokerResult<Option<Tick>> {
-        self.inner.next_tick().await
-    }
-
-    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
-        self.inner.next_candle().await
-    }
-
-    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
-        self.inner.next_order_book().await
-    }
-}
-
-struct BybitStream {
-    inner: BybitMarketStream,
-    depth: usize,
-}
-
-#[async_trait::async_trait]
-impl LiveMarketStream for BybitStream {
-    async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
-        for symbol in symbols {
-            self.inner
-                .subscribe(BybitSubscription::Trades {
-                    symbol: symbol.clone(),
-                })
-                .await?;
-            self.inner
-                .subscribe(BybitSubscription::Kline {
-                    symbol: symbol.clone(),
-                    interval,
-                })
-                .await?;
-            self.inner
-                .subscribe(BybitSubscription::OrderBook {
-                    symbol: symbol.clone(),
-                    depth: self.depth,
-                })
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn next_tick(&mut self) -> BrokerResult<Option<Tick>> {
-        self.inner.next_tick().await
-    }
-
-    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
-        self.inner.next_candle().await
-    }
-
-    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
-        self.inner.next_order_book().await
-    }
-}
-
-struct BinanceStream {
-    inner: BinanceMarketStream,
-    depth: usize,
-}
-
-#[async_trait::async_trait]
-impl LiveMarketStream for BinanceStream {
-    async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
-        for symbol in symbols {
-            self.inner
-                .subscribe(BinanceSubscription::Trades {
-                    symbol: symbol.clone(),
-                })
-                .await?;
-            self.inner
-                .subscribe(BinanceSubscription::Kline {
-                    symbol: symbol.clone(),
-                    interval,
-                })
-                .await?;
-            self.inner
-                .subscribe(BinanceSubscription::OrderBook {
-                    symbol: symbol.clone(),
-                    depth: self.depth,
-                })
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn next_tick(&mut self) -> BrokerResult<Option<Tick>> {
         self.inner.next_tick().await
     }
@@ -265,86 +172,31 @@ pub async fn run_live_with_shutdown(
     } else {
         None
     };
-    let connector_payload = build_exchange_payload(&exchange);
-    let connector_factory = get_connector_factory(&settings.driver);
-    let mut market_stream: Option<Box<dyn LiveMarketStream>> = None;
-    if let Some(factory) = connector_factory.clone() {
-        let stream_config = ConnectorStreamConfig {
-            ws_url: Some(exchange.ws_url.clone()),
-            metadata: json!({
-                "category": settings.category.as_path(),
-                "symbols": symbols.clone(),
-                "orderbook_depth": settings.orderbook_depth,
-            }),
-            connection_status: Some(public_connection.clone()),
-        };
-        match factory
-            .create_market_stream(&connector_payload, stream_config)
-            .await
-        {
-            Ok(mut stream) => {
-                stream
-                    .subscribe(&symbols, settings.interval)
-                    .await
-                    .map_err(|err| anyhow!("failed to subscribe via connector: {err}"))?;
-                market_stream = Some(Box::new(FactoryStreamAdapter::new(stream)));
-            }
-            Err(err) => {
-                warn!(
-                    driver = %settings.driver,
-                    error = %err,
-                    "connector factory stream failed; using built-in connector"
-                );
-            }
-        }
-    }
-    let market_stream: Box<dyn LiveMarketStream> = match market_stream {
-        Some(stream) => stream,
-        None => match settings.driver.as_str() {
-            "bybit" | "" => {
-                let stream = BybitMarketStream::connect_public(
-                    &exchange.ws_url,
-                    settings.category,
-                    Some(public_connection.clone()),
-                )
-                .await
-                .context("failed to connect to Bybit WebSocket")?;
-                let mut wrapper = BybitStream {
-                    inner: stream,
-                    depth: settings.orderbook_depth,
-                };
-                wrapper
-                    .subscribe(&symbols, settings.interval)
-                    .await
-                    .context("failed to subscribe to Bybit streams")?;
-                Box::new(wrapper)
-            }
-            "binance" => {
-                let stream =
-                    BinanceMarketStream::connect(&exchange.ws_url, Some(public_connection.clone()))
-                        .await
-                        .context("failed to connect to Binance WebSocket")?;
-                let mut wrapper = BinanceStream {
-                    inner: stream,
-                    depth: settings.orderbook_depth,
-                };
-                wrapper
-                    .subscribe(&symbols, settings.interval)
-                    .await
-                    .context("failed to subscribe to Binance streams")?;
-                Box::new(wrapper)
-            }
-            other => bail!("unknown exchange driver '{other}'"),
-        },
+    let connector_payload = build_exchange_payload(&exchange, &settings);
+    let connector_factory = get_connector_factory(&settings.driver)
+        .ok_or_else(|| anyhow!("driver {} is not registered", settings.driver))?;
+    let stream_config = ConnectorStreamConfig {
+        ws_url: Some(exchange.ws_url.clone()),
+        metadata: json!({
+            "category": settings.category.as_path(),
+            "symbols": symbols.clone(),
+            "orderbook_depth": settings.orderbook_depth,
+        }),
+        connection_status: Some(public_connection.clone()),
     };
+    let mut connector_stream = connector_factory
+        .create_market_stream(&connector_payload, stream_config)
+        .await
+        .map_err(|err| anyhow!("failed to create market stream: {err}"))?;
+    connector_stream
+        .subscribe(&symbols, settings.interval)
+        .await
+        .map_err(|err| anyhow!("failed to subscribe via connector: {err}"))?;
+    let market_stream: Box<dyn LiveMarketStream> =
+        Box::new(FactoryStreamAdapter::new(connector_stream));
 
-    let execution_client = build_execution_client(
-        &exchange,
-        &settings,
-        connector_factory.clone(),
-        &connector_payload,
-    )
-    .await?;
+    let execution_client =
+        build_execution_client(&settings, connector_factory.clone(), &connector_payload).await?;
     let market_registry = load_market_registry(execution_client.clone(), &settings).await?;
     if matches!(settings.exec_backend, ExecutionBackend::Live) {
         info!(
@@ -388,20 +240,17 @@ pub async fn run_live_with_shutdown(
 }
 
 async fn build_execution_client(
-    exchange: &ExchangeConfig,
     settings: &LiveSessionSettings,
-    connector_factory: Option<Arc<dyn ConnectorFactory>>,
+    connector_factory: Arc<dyn ConnectorFactory>,
     connector_payload: &Value,
 ) -> Result<Arc<dyn ExecutionClient>> {
     match settings.exec_backend {
         ExecutionBackend::Paper => {
             if settings.driver == "paper" {
-                if let Some(factory) = connector_factory.clone() {
-                    return factory
-                        .create_execution_client(connector_payload)
-                        .await
-                        .map_err(|err| anyhow!("failed to create execution client: {err}"));
-                }
+                return connector_factory
+                    .create_execution_client(connector_payload)
+                    .await
+                    .map_err(|err| anyhow!("failed to create execution client: {err}"));
             }
             Ok(Arc::new(PaperExecutionClient::new(
                 "paper".to_string(),
@@ -410,51 +259,10 @@ async fn build_execution_client(
                 settings.fee_bps,
             )))
         }
-        ExecutionBackend::Live => {
-            let api_key = exchange.api_key.trim();
-            let api_secret = exchange.api_secret.trim();
-            if api_key.is_empty() || api_secret.is_empty() {
-                bail!("exchange profile is missing api_key/api_secret required for live execution");
-            }
-            if let Some(factory) = connector_factory {
-                return factory
-                    .create_execution_client(connector_payload)
-                    .await
-                    .map_err(|err| anyhow!("failed to create execution client: {err}"));
-            }
-            match settings.driver.as_str() {
-                "bybit" | "" => {
-                    let client = BybitClient::new(
-                        BybitConfig {
-                            base_url: exchange.rest_url.clone(),
-                            category: settings.category.as_path().to_string(),
-                            recv_window: 5_000,
-                            ws_url: Some(exchange.ws_url.clone()),
-                        },
-                        Some(BybitCredentials {
-                            api_key: api_key.to_string(),
-                            api_secret: api_secret.to_string(),
-                        }),
-                    );
-                    Ok(Arc::new(client))
-                }
-                "binance" => {
-                    let client = BinanceClient::new(
-                        BinanceConfig {
-                            rest_url: exchange.rest_url.clone(),
-                            ws_url: exchange.ws_url.clone(),
-                            recv_window: 5_000,
-                        },
-                        Some(BinanceCredentials {
-                            api_key: api_key.to_string(),
-                            api_secret: api_secret.to_string(),
-                        }),
-                    );
-                    Ok(Arc::new(client))
-                }
-                other => bail!("unknown exchange driver '{other}'"),
-            }
-        }
+        ExecutionBackend::Live => connector_factory
+            .create_execution_client(connector_payload)
+            .await
+            .map_err(|err| anyhow!("failed to create execution client: {err}")),
     }
 }
 
@@ -1040,7 +848,7 @@ fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
     }
 }
 
-fn build_exchange_payload(exchange: &ExchangeConfig) -> Value {
+fn build_exchange_payload(exchange: &ExchangeConfig, settings: &LiveSessionSettings) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert("rest_url".into(), Value::String(exchange.rest_url.clone()));
     payload.insert("ws_url".into(), Value::String(exchange.ws_url.clone()));
@@ -1048,6 +856,14 @@ fn build_exchange_payload(exchange: &ExchangeConfig) -> Value {
     payload.insert(
         "api_secret".into(),
         Value::String(exchange.api_secret.clone()),
+    );
+    payload.insert(
+        "category".into(),
+        Value::String(settings.category.as_path().to_string()),
+    );
+    payload.insert(
+        "orderbook_depth".into(),
+        Value::Number(serde_json::Number::from(settings.orderbook_depth as u64)),
     );
     if let Value::Object(extra) = exchange.params.clone() {
         for (key, value) in extra {
