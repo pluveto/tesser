@@ -25,7 +25,7 @@ use tesser_backtester::reporting::PerformanceReport;
 use tesser_backtester::{BacktestConfig, BacktestMode, Backtester, MarketEvent, MarketEventKind};
 use tesser_broker::ExecutionClient;
 use tesser_bybit::PublicChannel;
-use tesser_config::{load_config, AppConfig, ExchangeDriver, RiskManagementConfig};
+use tesser_config::{load_config, AppConfig, RiskManagementConfig};
 use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
 use tesser_data::download::{BinanceDownloader, BybitDownloader, KlineRequest};
 use tesser_execution::{
@@ -175,8 +175,8 @@ impl DataDownloadArgs {
             "Downloading {} candles for {} ({})",
             self.interval, self.symbol, self.exchange
         );
-        let mut candles = match exchange_cfg.driver {
-            ExchangeDriver::Bybit => {
+        let mut candles = match exchange_cfg.driver.as_str() {
+            "bybit" | "" => {
                 let downloader = BybitDownloader::new(&exchange_cfg.rest_url);
                 let request = KlineRequest::new(&self.category, &self.symbol, interval, start, end);
                 downloader
@@ -184,7 +184,7 @@ impl DataDownloadArgs {
                     .await
                     .with_context(|| "failed to download candles from Bybit")?
             }
-            ExchangeDriver::Binance => {
+            "binance" => {
                 let downloader = BinanceDownloader::new(&exchange_cfg.rest_url);
                 let request = KlineRequest::new("", &self.symbol, interval, start, end);
                 downloader
@@ -192,6 +192,7 @@ impl DataDownloadArgs {
                     .await
                     .with_context(|| "failed to download candles from Binance")?
             }
+            other => bail!("unknown exchange driver '{other}' for {}", self.exchange),
         };
 
         if candles.is_empty() {

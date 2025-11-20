@@ -7,6 +7,7 @@ use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 
 mod deserializer;
 
@@ -48,16 +49,10 @@ pub struct ExchangeConfig {
     pub api_key: String,
     #[serde(default)]
     pub api_secret: String,
-    #[serde(default = "default_exchange_driver")]
-    pub driver: ExchangeDriver,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ExchangeDriver {
-    #[default]
-    Bybit,
-    Binance,
+    #[serde(default = "default_exchange_driver_name")]
+    pub driver: String,
+    #[serde(default, flatten)]
+    pub params: Value,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -164,8 +159,8 @@ fn default_initial_balances() -> HashMap<String, Decimal> {
     balances
 }
 
-fn default_exchange_driver() -> ExchangeDriver {
-    ExchangeDriver::Bybit
+fn default_exchange_driver_name() -> String {
+    "bybit".to_string()
 }
 
 fn default_state_path() -> PathBuf {

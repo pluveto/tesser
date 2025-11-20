@@ -27,7 +27,7 @@ use tesser_bybit::ws::{BybitWsExecution, BybitWsOrder, PrivateMessage};
 use tesser_bybit::{
     BybitClient, BybitConfig, BybitCredentials, BybitMarketStream, BybitSubscription, PublicChannel,
 };
-use tesser_config::{AlertingConfig, ExchangeConfig, ExchangeDriver, RiskManagementConfig};
+use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
     Candle, Fill, Interval, Order, OrderBook, OrderStatus, Position, Price, Quantity, Side, Signal,
     Symbol, Tick,
@@ -183,7 +183,7 @@ pub struct LiveSessionSettings {
     pub risk: RiskManagementConfig,
     pub reconciliation_interval: Duration,
     pub reconciliation_threshold: Decimal,
-    pub driver: ExchangeDriver,
+    pub driver: String,
 }
 
 impl LiveSessionSettings {
@@ -225,8 +225,8 @@ pub async fn run_live_with_shutdown(
     } else {
         None
     };
-    let market_stream: Box<dyn LiveMarketStream> = match settings.driver {
-        ExchangeDriver::Bybit => {
+    let market_stream: Box<dyn LiveMarketStream> = match settings.driver.as_str() {
+        "bybit" | "" => {
             let stream = BybitMarketStream::connect_public(
                 &exchange.ws_url,
                 settings.category,
@@ -241,7 +241,7 @@ pub async fn run_live_with_shutdown(
                 .context("failed to subscribe to Bybit streams")?;
             Box::new(wrapper)
         }
-        ExchangeDriver::Binance => {
+        "binance" => {
             let stream =
                 BinanceMarketStream::connect(&exchange.ws_url, Some(public_connection.clone()))
                     .await
@@ -253,6 +253,7 @@ pub async fn run_live_with_shutdown(
                 .context("failed to subscribe to Binance streams")?;
             Box::new(wrapper)
         }
+        other => bail!("unknown exchange driver '{other}'"),
     };
 
     let execution_client = build_execution_client(&exchange, &settings)?;
@@ -315,8 +316,8 @@ fn build_execution_client(
             if api_key.is_empty() || api_secret.is_empty() {
                 bail!("exchange profile is missing api_key/api_secret required for live execution");
             }
-            match settings.driver {
-                ExchangeDriver::Bybit => {
+            match settings.driver.as_str() {
+                "bybit" | "" => {
                     let client = BybitClient::new(
                         BybitConfig {
                             base_url: exchange.rest_url.clone(),
@@ -331,7 +332,7 @@ fn build_execution_client(
                     );
                     Ok(Arc::new(client))
                 }
-                ExchangeDriver::Binance => {
+                "binance" => {
                     let client = BinanceClient::new(
                         BinanceConfig {
                             rest_url: exchange.rest_url.clone(),
@@ -345,6 +346,7 @@ fn build_execution_client(
                     );
                     Ok(Arc::new(client))
                 }
+                other => bail!("unknown exchange driver '{other}'"),
             }
         }
     }
@@ -502,8 +504,8 @@ impl LiveRuntime {
         if !settings.exec_backend.is_paper() {
             let execution_engine = orchestrator.execution_engine();
             let exec_client = execution_engine.client();
-            match settings.driver {
-                ExchangeDriver::Bybit => {
+            match settings.driver.as_str() {
+                "bybit" | "" => {
                     let bybit = exec_client
                         .as_ref()
                         .as_any()
@@ -524,7 +526,7 @@ impl LiveRuntime {
                         shutdown.clone(),
                     );
                 }
-                ExchangeDriver::Binance => {
+                "binance" => {
                     spawn_binance_private_stream(
                         exec_client.clone(),
                         exchange_ws_url.clone(),
@@ -533,6 +535,9 @@ impl LiveRuntime {
                         metrics.clone(),
                         shutdown.clone(),
                     );
+                }
+                other => {
+                    bail!("private stream unsupported for driver '{other}'");
                 }
             }
         }
