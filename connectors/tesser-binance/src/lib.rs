@@ -11,11 +11,16 @@ use binance_sdk::{
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::Deserialize;
+use serde_json::Value;
 use std::{any::Any, sync::Arc};
-use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient};
+use tesser_broker::{
+    register_connector_factory, BrokerError, BrokerInfo, BrokerResult, ConnectorFactory,
+    ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream,
+};
 use tesser_core::{
-    AccountBalance, Fill, Instrument, InstrumentKind, Order, OrderRequest, OrderStatus, OrderType,
-    Position, Side, TimeInForce,
+    AccountBalance, Candle, Fill, Instrument, InstrumentKind, Order, OrderBook, OrderRequest,
+    OrderStatus, OrderType, Position, Side, TimeInForce,
 };
 use uuid::Uuid;
 
@@ -515,6 +520,155 @@ pub fn order_from_update(order: &websocket_streams::OrderTradeUpdateO) -> Option
         created_at: timestamp_from_ms(order.t_uppercase),
         updated_at: timestamp_from_ms(order.t_uppercase),
     })
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BinanceConnectorConfig {
+    #[serde(default = "default_rest_url")]
+    rest_url: String,
+    #[serde(default = "default_ws_url")]
+    ws_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    api_secret: String,
+    #[serde(default = "default_recv_window")]
+    recv_window: u64,
+}
+
+fn default_rest_url() -> String {
+    "https://fapi.binance.com".into()
+}
+
+fn default_ws_url() -> String {
+    "wss://fstream.binance.com/stream".into()
+}
+
+fn default_recv_window() -> u64 {
+    5_000
+}
+
+#[derive(Default)]
+pub struct BinanceFactory;
+
+impl BinanceFactory {
+    fn parse_config(&self, value: &Value) -> BrokerResult<BinanceConnectorConfig> {
+        serde_json::from_value(value.clone()).map_err(|err| {
+            BrokerError::InvalidRequest(format!("invalid binance connector config: {err}"))
+        })
+    }
+
+    fn credentials(cfg: &BinanceConnectorConfig) -> Option<BinanceCredentials> {
+        if cfg.api_key.trim().is_empty() || cfg.api_secret.trim().is_empty() {
+            None
+        } else {
+            Some(BinanceCredentials {
+                api_key: cfg.api_key.clone(),
+                api_secret: cfg.api_secret.clone(),
+            })
+        }
+    }
+}
+
+const BINANCE_DEFAULT_DEPTH: usize = 50;
+
+pub fn register_factory() {
+    register_connector_factory(Arc::new(BinanceFactory::default()));
+}
+
+#[async_trait]
+impl ConnectorFactory for BinanceFactory {
+    fn name(&self) -> &str {
+        "binance"
+    }
+
+    async fn create_execution_client(
+        &self,
+        config: &Value,
+    ) -> BrokerResult<Arc<dyn ExecutionClient>> {
+        let cfg = self.parse_config(config)?;
+        let binance_cfg = BinanceConfig {
+            rest_url: cfg.rest_url.clone(),
+            ws_url: cfg.ws_url.clone(),
+            recv_window: cfg.recv_window,
+        };
+        Ok(Arc::new(BinanceClient::new(
+            binance_cfg,
+            Self::credentials(&cfg),
+        )))
+    }
+
+    async fn create_market_stream(
+        &self,
+        config: &Value,
+        stream_config: ConnectorStreamConfig,
+    ) -> BrokerResult<Box<dyn ConnectorStream>> {
+        let cfg = self.parse_config(config)?;
+        let stream =
+            BinanceMarketStream::connect(&cfg.ws_url, stream_config.connection_status).await?;
+        Ok(Box::new(BinanceConnectorStream::new(
+            stream,
+            stream_config
+                .metadata
+                .get("orderbook_depth")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(BINANCE_DEFAULT_DEPTH),
+        )))
+    }
+}
+
+struct BinanceConnectorStream {
+    inner: BinanceMarketStream,
+    depth: usize,
+}
+
+impl BinanceConnectorStream {
+    fn new(inner: BinanceMarketStream, depth: usize) -> Self {
+        Self { inner, depth }
+    }
+}
+
+#[async_trait]
+impl ConnectorStream for BinanceConnectorStream {
+    async fn subscribe(
+        &mut self,
+        symbols: &[String],
+        interval: tesser_core::Interval,
+    ) -> BrokerResult<()> {
+        for symbol in symbols {
+            self.inner
+                .subscribe(BinanceSubscription::Trades {
+                    symbol: symbol.clone(),
+                })
+                .await?;
+            self.inner
+                .subscribe(BinanceSubscription::Kline {
+                    symbol: symbol.clone(),
+                    interval,
+                })
+                .await?;
+            self.inner
+                .subscribe(BinanceSubscription::OrderBook {
+                    symbol: symbol.clone(),
+                    depth: self.depth,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn next_tick(&mut self) -> BrokerResult<Option<tesser_core::Tick>> {
+        self.inner.next_tick().await
+    }
+
+    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
+        self.inner.next_candle().await
+    }
+
+    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
+        self.inner.next_order_book().await
+    }
 }
 
 fn map_connector_error(err: ConnectorError) -> BrokerError {

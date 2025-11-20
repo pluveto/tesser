@@ -3,7 +3,7 @@
 //! Authentication details follow the rules described in
 //! `bybit-api-docs/docs/v5/guide.mdx`.
 
-use std::{any::Any, time::Duration};
+use std::{any::Any, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -13,10 +13,13 @@ use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use sha2::Sha256;
-use tesser_broker::{BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult, ExecutionClient};
+use tesser_broker::{
+    register_connector_factory, BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult,
+    ConnectorFactory, ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream,
+};
 use tesser_core::{
-    AccountBalance, Fill, Instrument, InstrumentKind, Order, OrderRequest, OrderStatus, Position,
-    Quantity, Side, TimeInForce,
+    AccountBalance, Candle, Fill, Instrument, InstrumentKind, Order, OrderBook, OrderRequest,
+    OrderStatus, Position, Quantity, Side, TimeInForce,
 };
 use tracing::warn;
 
@@ -691,6 +694,168 @@ struct ExecutionListItem {
     exec_fee: String,
     #[serde(rename = "execTime")]
     exec_time: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BybitConnectorConfig {
+    #[serde(default = "default_rest_url")]
+    rest_url: String,
+    #[serde(default = "default_ws_url")]
+    ws_url: String,
+    #[serde(default = "default_category")]
+    category: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    api_secret: String,
+    #[serde(default = "default_recv_window")]
+    recv_window: u64,
+}
+
+fn default_rest_url() -> String {
+    "https://api.bybit.com".into()
+}
+
+fn default_ws_url() -> String {
+    "wss://stream.bybit.com".into()
+}
+
+fn default_category() -> String {
+    "linear".into()
+}
+
+fn default_recv_window() -> u64 {
+    5_000
+}
+
+#[derive(Default)]
+pub struct BybitFactory;
+
+impl BybitFactory {
+    fn parse_config(&self, value: &Value) -> BrokerResult<BybitConnectorConfig> {
+        serde_json::from_value(value.clone()).map_err(|err| {
+            BrokerError::InvalidRequest(format!("invalid bybit connector config: {err}"))
+        })
+    }
+
+    fn credentials(cfg: &BybitConnectorConfig) -> Option<BybitCredentials> {
+        if cfg.api_key.trim().is_empty() || cfg.api_secret.trim().is_empty() {
+            None
+        } else {
+            Some(BybitCredentials {
+                api_key: cfg.api_key.clone(),
+                api_secret: cfg.api_secret.clone(),
+            })
+        }
+    }
+}
+
+const BYBIT_DEFAULT_DEPTH: usize = 50;
+
+pub fn register_factory() {
+    register_connector_factory(Arc::new(BybitFactory::default()));
+}
+
+#[async_trait]
+impl ConnectorFactory for BybitFactory {
+    fn name(&self) -> &str {
+        "bybit"
+    }
+
+    async fn create_execution_client(
+        &self,
+        config: &Value,
+    ) -> BrokerResult<Arc<dyn ExecutionClient>> {
+        let cfg = self.parse_config(config)?;
+        let bybit_cfg = BybitConfig {
+            base_url: cfg.rest_url.clone(),
+            category: cfg.category.clone(),
+            recv_window: cfg.recv_window,
+            ws_url: Some(cfg.ws_url.clone()),
+        };
+        Ok(Arc::new(BybitClient::new(
+            bybit_cfg,
+            Self::credentials(&cfg),
+        )))
+    }
+
+    async fn create_market_stream(
+        &self,
+        config: &Value,
+        stream_config: ConnectorStreamConfig,
+    ) -> BrokerResult<Box<dyn ConnectorStream>> {
+        let cfg = self.parse_config(config)?;
+        let channel = PublicChannel::from_str(&cfg.category)
+            .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
+        let stream = BybitMarketStream::connect_public(
+            &cfg.ws_url,
+            channel,
+            stream_config.connection_status,
+        )
+        .await?;
+        Ok(Box::new(BybitConnectorStream::new(
+            stream,
+            stream_config
+                .metadata
+                .get("orderbook_depth")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(BYBIT_DEFAULT_DEPTH),
+        )))
+    }
+}
+
+struct BybitConnectorStream {
+    inner: BybitMarketStream,
+    depth: usize,
+}
+
+impl BybitConnectorStream {
+    fn new(inner: BybitMarketStream, depth: usize) -> Self {
+        Self { inner, depth }
+    }
+}
+
+#[async_trait]
+impl ConnectorStream for BybitConnectorStream {
+    async fn subscribe(
+        &mut self,
+        symbols: &[String],
+        interval: tesser_core::Interval,
+    ) -> BrokerResult<()> {
+        for symbol in symbols {
+            self.inner
+                .subscribe(BybitSubscription::Trades {
+                    symbol: symbol.clone(),
+                })
+                .await?;
+            self.inner
+                .subscribe(BybitSubscription::Kline {
+                    symbol: symbol.clone(),
+                    interval,
+                })
+                .await?;
+            self.inner
+                .subscribe(BybitSubscription::OrderBook {
+                    symbol: symbol.clone(),
+                    depth: self.depth.min(200).max(1),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn next_tick(&mut self) -> BrokerResult<Option<tesser_core::Tick>> {
+        self.inner.next_tick().await
+    }
+
+    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
+        self.inner.next_candle().await
+    }
+
+    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
+        self.inner.next_order_book().await
+    }
 }
 
 #[cfg(test)]

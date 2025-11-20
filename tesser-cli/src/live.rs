@@ -75,6 +75,10 @@ impl ExecutionBackend {
 }
 
 const DEFAULT_ORDER_BOOK_DEPTH: usize = 50;
+
+pub const fn default_order_book_depth() -> usize {
+    DEFAULT_ORDER_BOOK_DEPTH
+}
 const STRATEGY_LOCK_WARN_THRESHOLD: Duration = Duration::from_millis(25);
 const STRATEGY_CALL_WARN_THRESHOLD: Duration = Duration::from_millis(250);
 
@@ -117,6 +121,7 @@ impl LiveMarketStream for FactoryStreamAdapter {
 
 struct BybitStream {
     inner: BybitMarketStream,
+    depth: usize,
 }
 
 #[async_trait::async_trait]
@@ -137,7 +142,7 @@ impl LiveMarketStream for BybitStream {
             self.inner
                 .subscribe(BybitSubscription::OrderBook {
                     symbol: symbol.clone(),
-                    depth: DEFAULT_ORDER_BOOK_DEPTH,
+                    depth: self.depth,
                 })
                 .await?;
         }
@@ -159,6 +164,7 @@ impl LiveMarketStream for BybitStream {
 
 struct BinanceStream {
     inner: BinanceMarketStream,
+    depth: usize,
 }
 
 #[async_trait::async_trait]
@@ -179,7 +185,7 @@ impl LiveMarketStream for BinanceStream {
             self.inner
                 .subscribe(BinanceSubscription::OrderBook {
                     symbol: symbol.clone(),
-                    depth: DEFAULT_ORDER_BOOK_DEPTH,
+                    depth: self.depth,
                 })
                 .await?;
         }
@@ -217,6 +223,7 @@ pub struct LiveSessionSettings {
     pub reconciliation_interval: Duration,
     pub reconciliation_threshold: Decimal,
     pub driver: String,
+    pub orderbook_depth: usize,
 }
 
 impl LiveSessionSettings {
@@ -266,7 +273,8 @@ pub async fn run_live_with_shutdown(
             ws_url: Some(exchange.ws_url.clone()),
             metadata: json!({
                 "category": settings.category.as_path(),
-                "symbols": symbols,
+                "symbols": symbols.clone(),
+                "orderbook_depth": settings.orderbook_depth,
             }),
             connection_status: Some(public_connection.clone()),
         };
@@ -301,7 +309,10 @@ pub async fn run_live_with_shutdown(
                 )
                 .await
                 .context("failed to connect to Bybit WebSocket")?;
-                let mut wrapper = BybitStream { inner: stream };
+                let mut wrapper = BybitStream {
+                    inner: stream,
+                    depth: settings.orderbook_depth,
+                };
                 wrapper
                     .subscribe(&symbols, settings.interval)
                     .await
@@ -313,7 +324,10 @@ pub async fn run_live_with_shutdown(
                     BinanceMarketStream::connect(&exchange.ws_url, Some(public_connection.clone()))
                         .await
                         .context("failed to connect to Binance WebSocket")?;
-                let mut wrapper = BinanceStream { inner: stream };
+                let mut wrapper = BinanceStream {
+                    inner: stream,
+                    depth: settings.orderbook_depth,
+                };
                 wrapper
                     .subscribe(&symbols, settings.interval)
                     .await

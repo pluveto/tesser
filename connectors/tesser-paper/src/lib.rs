@@ -1493,7 +1493,8 @@ fn parse_timestamp(record: &StringRecord, headers: &StringRecord) -> BrokerResul
     DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
         .or_else(|_| {
-            NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").map(|dt| Utc.from_utc_datetime(&dt))
+            NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| Utc.from_utc_datetime(&dt))
         })
         .map_err(|err| BrokerError::InvalidRequest(format!("invalid timestamp '{raw}': {err}")))
 }

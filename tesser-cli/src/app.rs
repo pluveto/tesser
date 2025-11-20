@@ -845,6 +845,9 @@ impl LiveRunArgs {
         let history = self.history.max(32);
         let reconciliation_interval = self.reconciliation_interval(config);
         let reconciliation_threshold = self.reconciliation_threshold(config);
+        let orderbook_depth = self
+            .orderbook_depth
+            .unwrap_or(super::live::default_order_book_depth());
 
         let settings = LiveSessionSettings {
             category,
@@ -864,6 +867,7 @@ impl LiveRunArgs {
             reconciliation_interval,
             reconciliation_threshold,
             driver,
+            orderbook_depth,
         };
 
         info!(
