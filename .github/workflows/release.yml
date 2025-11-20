@@ -221,34 +221,37 @@ jobs:
             'C:\Program Files\OpenSSL',
             'C:\Program Files (x86)\OpenSSL-Win32'
           )
+
           $opensslRoot = $null
-          foreach ($path in $candidates) {
-            if (Test-Path $path) {
-              $opensslRoot = $path
-              break
-            }
-          }
-          if (-not $opensslRoot) {
-            throw "OpenSSL installation not found in expected locations."
-          }
-
-          $includeDir = Join-Path $opensslRoot 'include'
-          $sslHeader = Join-Path $includeDir 'openssl\ssl.h'
-          if (-not (Test-Path $sslHeader)) {
-            throw "OpenSSL headers not found under $includeDir"
-          }
-
-          $libSubdirs = @('lib\VC\static', 'lib\VC', 'lib64', 'lib')
+          $includeDir = $null
           $libDir = $null
-          foreach ($sub in $libSubdirs) {
-            $candidate = Join-Path $opensslRoot $sub
-            if (Test-Path (Join-Path $candidate 'libcrypto.lib')) {
-              $libDir = $candidate
-              break
+
+          foreach ($path in $candidates) {
+            if (-not (Test-Path $path)) { continue }
+
+            $includeCandidate = Join-Path $path 'include'
+            $sslHeader = Join-Path $includeCandidate 'openssl\ssl.h'
+            if (-not (Test-Path $sslHeader)) { continue }
+
+            $libSubdirs = @('lib\VC\static', 'lib\VC\x64\MD', 'lib\VC', 'lib64', 'lib')
+            $libPick = $null
+            foreach ($sub in $libSubdirs) {
+              $candidate = Join-Path $path $sub
+              if (Test-Path (Join-Path $candidate 'libcrypto.lib')) {
+                $libPick = $candidate
+                break
+              }
             }
+            if (-not $libPick) { continue }
+
+            $opensslRoot = $path
+            $includeDir = $includeCandidate
+            $libDir = $libPick
+            break
           }
-          if (-not $libDir) {
-            throw "OpenSSL libraries (libcrypto/libssl) not found under $opensslRoot"
+
+          if (-not $opensslRoot -or -not $libDir -or -not $includeDir) {
+            throw "OpenSSL installation with headers and libs not found in expected locations."
           }
 
           $certDir = Join-Path $opensslRoot 'ca'
