@@ -190,7 +190,7 @@ jobs:
             archive: zip
             artifact_suffix: x86_64-pc-windows-msvc
             use_cross: false
-            setup_cmd: choco install openssl --no-progress
+            setup_cmd: choco install openssl --no-progress -y
             cli_features: ''
     steps:
       - name: Checkout repository
@@ -216,13 +216,40 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $openssl = 'C:\Program Files\OpenSSL-Win64'
-          if (!(Test-Path $openssl)) {
-            throw "OpenSSL not found at $openssl"
+          $candidates = @(
+            'C:\Program Files\OpenSSL-Win64',
+            'C:\Program Files\OpenSSL',
+            'C:\Program Files (x86)\OpenSSL-Win32'
+          )
+          $opensslRoot = $null
+          foreach ($path in $candidates) {
+            if (Test-Path $path) {
+              $opensslRoot = $path
+              break
+            }
           }
-          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_DIR=$openssl"
-          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_LIB_DIR=$openssl\lib"
-          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_INCLUDE_DIR=$openssl\include"
+          if (-not $opensslRoot) {
+            throw "OpenSSL installation not found in expected locations."
+          }
+
+          $includeDir = Join-Path $opensslRoot 'include'
+          if (-not (Test-Path $includeDir)) {
+            throw "OpenSSL include directory not found under $opensslRoot"
+          }
+
+          $libCandidates = @(
+            (Join-Path $opensslRoot 'lib'),
+            (Join-Path $opensslRoot 'lib\VC'),
+            (Join-Path $opensslRoot 'lib64')
+          )
+          $libDir = $libCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $libDir) {
+            throw "OpenSSL library directory not found under $opensslRoot"
+          }
+
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_DIR=$opensslRoot"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_LIB_DIR=$libDir"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_INCLUDE_DIR=$includeDir"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
