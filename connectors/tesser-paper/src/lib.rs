@@ -5,22 +5,238 @@ mod conditional;
 use std::{
     any::Any,
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Utc};
 use conditional::ConditionalOrderManager;
-use rust_decimal::Decimal;
-use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient, MarketStream};
-use tesser_core::{
-    AccountBalance, Candle, DepthUpdate, Fill, Instrument, LocalOrderBook, Order, OrderBook,
-    OrderId, OrderRequest, OrderStatus, OrderType, Position, Price, Quantity, Side, Symbol, Tick,
-    TimeInForce,
+use csv::StringRecord;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand_distr::StandardNormal;
+use rust_decimal::{
+    prelude::{FromPrimitive, ToPrimitive},
+    Decimal,
 };
-use tokio::sync::Mutex as AsyncMutex;
-use tracing::info;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tesser_broker::{
+    register_connector_factory, BrokerError, BrokerInfo, BrokerResult, ConnectorFactory,
+    ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream,
+};
+use tesser_core::{
+    AccountBalance, Candle, DepthUpdate, Fill, Instrument, Interval, LocalOrderBook, Order,
+    OrderBook, OrderId, OrderRequest, OrderStatus, OrderType, Position, Price, Quantity, Side,
+    Symbol, Tick, TimeInForce,
+};
+use tokio::{
+    select,
+    sync::{mpsc, oneshot, Mutex as AsyncMutex},
+    time::{interval, sleep, Duration as TokioDuration},
+};
+use tracing::{error, info};
 use uuid::Uuid;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PaperMarketConfig {
+    RandomWalk {
+        #[serde(default = "default_start_price")]
+        start_price: Decimal,
+        #[serde(default = "default_volatility")]
+        volatility: f64,
+        #[serde(default = "default_tick_interval")]
+        interval_ms: u64,
+    },
+    Replay {
+        path: PathBuf,
+        #[serde(default = "default_replay_speed")]
+        speed: f64,
+    },
+}
+
+impl Default for PaperMarketConfig {
+    fn default() -> Self {
+        Self::RandomWalk {
+            start_price: default_start_price(),
+            volatility: default_volatility(),
+            interval_ms: default_tick_interval(),
+        }
+    }
+}
+
+impl PaperMarketConfig {
+    fn initial_price(&self) -> Decimal {
+        match self {
+            Self::RandomWalk { start_price, .. } => *start_price,
+            Self::Replay { .. } => Decimal::from(25_000),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PaperConnectorConfig {
+    #[serde(default = "default_symbol")]
+    pub symbol: Symbol,
+    #[serde(default = "default_balance_currency")]
+    pub balance_currency: String,
+    #[serde(default = "default_initial_balance")]
+    pub initial_balance: Decimal,
+    #[serde(default)]
+    pub slippage_bps: Decimal,
+    #[serde(default)]
+    pub fee_bps: Decimal,
+    #[serde(default)]
+    pub market: PaperMarketConfig,
+}
+
+impl Default for PaperConnectorConfig {
+    fn default() -> Self {
+        Self {
+            symbol: default_symbol(),
+            balance_currency: default_balance_currency(),
+            initial_balance: default_initial_balance(),
+            slippage_bps: Decimal::ZERO,
+            fee_bps: Decimal::ZERO,
+            market: PaperMarketConfig::default(),
+        }
+    }
+}
+
+impl PaperConnectorConfig {
+    fn cache_key(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.symbol.clone())
+    }
+}
+
+struct PaperRuntimeState {
+    client: Arc<PaperExecutionClient>,
+    config: PaperConnectorConfig,
+    initialized: AsyncMutex<bool>,
+}
+
+impl PaperRuntimeState {
+    fn new(config: PaperConnectorConfig) -> Self {
+        let stream_name = format!("paper-{}", config.symbol.to_lowercase());
+        let client = Arc::new(PaperExecutionClient::new(
+            stream_name,
+            vec![config.symbol.clone()],
+            config.slippage_bps,
+            config.fee_bps,
+        ));
+        Self {
+            client,
+            config,
+            initialized: AsyncMutex::new(false),
+        }
+    }
+
+    async fn ensure_initialized(&self) {
+        let mut guard = self.initialized.lock().await;
+        if *guard {
+            return;
+        }
+        self.client
+            .initialize_balance(&self.config.balance_currency, self.config.initial_balance)
+            .await;
+        self.client
+            .update_price(&self.config.symbol, self.config.market.initial_price());
+        *guard = true;
+    }
+}
+
+#[derive(Default)]
+pub struct PaperFactory {
+    runtimes: RwLock<HashMap<String, Arc<PaperRuntimeState>>>,
+}
+
+impl PaperFactory {
+    fn parse_config(&self, value: &Value) -> BrokerResult<PaperConnectorConfig> {
+        serde_json::from_value(value.clone()).map_err(|err| {
+            BrokerError::InvalidRequest(format!("invalid paper connector config: {err}"))
+        })
+    }
+
+    fn runtime_for(&self, cfg: PaperConnectorConfig) -> Arc<PaperRuntimeState> {
+        let key = cfg.cache_key();
+        if let Some(runtime) = self.runtimes.read().unwrap().get(&key) {
+            return runtime.clone();
+        }
+        let runtime = Arc::new(PaperRuntimeState::new(cfg));
+        self.runtimes.write().unwrap().insert(key, runtime.clone());
+        runtime
+    }
+}
+
+#[async_trait]
+impl ConnectorFactory for PaperFactory {
+    fn name(&self) -> &str {
+        "paper"
+    }
+
+    async fn create_execution_client(
+        &self,
+        config: &Value,
+    ) -> BrokerResult<Arc<dyn ExecutionClient>> {
+        let cfg = self.parse_config(config)?;
+        let runtime = self.runtime_for(cfg);
+        runtime.ensure_initialized().await;
+        Ok(runtime.client.clone())
+    }
+
+    async fn create_market_stream(
+        &self,
+        config: &Value,
+        stream_config: ConnectorStreamConfig,
+    ) -> BrokerResult<Box<dyn ConnectorStream>> {
+        let cfg = self.parse_config(config)?;
+        let runtime = self.runtime_for(cfg.clone());
+        runtime.ensure_initialized().await;
+        let stream = LivePaperStream::new(
+            cfg.symbol.clone(),
+            cfg.market.clone(),
+            runtime.client.clone(),
+            stream_config.connection_status,
+        )?;
+        Ok(Box::new(stream))
+    }
+}
+
+pub fn register_factory() {
+    register_connector_factory(Arc::new(PaperFactory::default()));
+}
+
+fn default_symbol() -> Symbol {
+    "BTCUSDT".to_string()
+}
+
+fn default_balance_currency() -> String {
+    "USDT".into()
+}
+
+fn default_initial_balance() -> Decimal {
+    Decimal::from(10_000)
+}
+
+fn default_start_price() -> Decimal {
+    Decimal::from(25_000)
+}
+
+fn default_volatility() -> f64 {
+    0.003
+}
+
+fn default_tick_interval() -> u64 {
+    500
+}
+
+fn default_replay_speed() -> f64 {
+    1.0
+}
 
 /// In-memory execution client that fills orders immediately at the provided limit (or last) price.
 #[derive(Clone)]
@@ -81,6 +297,23 @@ impl PaperExecutionClient {
     pub fn update_price(&self, symbol: &Symbol, price: Price) {
         let mut prices = self.last_prices.lock().unwrap();
         prices.insert(symbol.clone(), price);
+    }
+
+    /// Reset the available balance to a configured amount.
+    pub async fn initialize_balance(&self, currency: &str, amount: Decimal) {
+        let mut balances = self.balances.lock().await;
+        if let Some(entry) = balances.iter_mut().find(|b| b.currency == currency) {
+            entry.total = amount;
+            entry.available = amount;
+            entry.updated_at = Utc::now();
+        } else {
+            balances.push(AccountBalance {
+                currency: currency.into(),
+                total: amount,
+                available: amount,
+                updated_at: Utc::now(),
+            });
+        }
     }
 
     /// Create a Fill object from an order with proper fee calculation.
@@ -866,6 +1099,431 @@ impl ExecutionClient for PaperExecutionClient {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+struct CandleBuilder {
+    symbol: Symbol,
+    open: Option<Decimal>,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
+    start: Option<DateTime<Utc>>,
+}
+
+impl CandleBuilder {
+    fn new(symbol: Symbol) -> Self {
+        Self {
+            symbol,
+            open: None,
+            high: Decimal::ZERO,
+            low: Decimal::ZERO,
+            close: Decimal::ZERO,
+            volume: Decimal::ZERO,
+            start: None,
+        }
+    }
+
+    fn update(
+        &mut self,
+        price: Decimal,
+        timestamp: DateTime<Utc>,
+        qty: Decimal,
+        interval: ChronoDuration,
+    ) -> Option<Candle> {
+        if self.open.is_none() {
+            self.open = Some(price);
+            self.high = price;
+            self.low = price;
+            self.close = price;
+            self.volume = qty;
+            self.start = Some(timestamp);
+            return None;
+        }
+
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
+        self.volume += qty;
+
+        let start = self.start.unwrap_or(timestamp);
+        if timestamp - start >= interval {
+            let candle = Candle {
+                symbol: self.symbol.clone(),
+                interval: Interval::OneMinute, // placeholder, updated by caller if needed
+                open: self.open.unwrap_or(price),
+                high: self.high,
+                low: self.low,
+                close: self.close,
+                volume: self.volume,
+                timestamp: start,
+            };
+            self.reset(price, timestamp, qty);
+            Some(candle)
+        } else {
+            None
+        }
+    }
+
+    fn reset(&mut self, price: Decimal, timestamp: DateTime<Utc>, volume: Decimal) {
+        self.open = Some(price);
+        self.high = price;
+        self.low = price;
+        self.close = price;
+        self.volume = volume;
+        self.start = Some(timestamp);
+    }
+}
+
+struct ReplaySample {
+    timestamp: DateTime<Utc>,
+    price: Decimal,
+    size: Decimal,
+    side: Side,
+}
+
+pub struct LivePaperStream {
+    symbol: Symbol,
+    tick_rx: AsyncMutex<mpsc::Receiver<Tick>>,
+    candle_rx: AsyncMutex<mpsc::Receiver<Candle>>,
+    candle_interval: Arc<AsyncMutex<ChronoDuration>>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+impl LivePaperStream {
+    fn new(
+        symbol: Symbol,
+        market: PaperMarketConfig,
+        exec_client: Arc<PaperExecutionClient>,
+        connection_status: Option<Arc<AtomicBool>>,
+    ) -> BrokerResult<Self> {
+        let (tick_tx, tick_rx) = mpsc::channel(2048);
+        let (candle_tx, candle_rx) = mpsc::channel(512);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let candle_interval = Arc::new(AsyncMutex::new(ChronoDuration::minutes(1)));
+        spawn_market_generator(
+            symbol.clone(),
+            market,
+            exec_client,
+            tick_tx,
+            candle_tx,
+            candle_interval.clone(),
+            shutdown_rx,
+            connection_status,
+        );
+        Ok(Self {
+            symbol,
+            tick_rx: AsyncMutex::new(tick_rx),
+            candle_rx: AsyncMutex::new(candle_rx),
+            candle_interval,
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+}
+
+impl Drop for LivePaperStream {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[async_trait]
+impl ConnectorStream for LivePaperStream {
+    async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
+        if !symbols.is_empty() && !symbols.iter().any(|s| s == &self.symbol) {
+            return Err(BrokerError::InvalidRequest(format!(
+                "paper stream only supports symbol {}",
+                self.symbol
+            )));
+        }
+        let mut guard = self.candle_interval.lock().await;
+        *guard = interval.as_duration();
+        Ok(())
+    }
+
+    async fn next_tick(&mut self) -> BrokerResult<Option<Tick>> {
+        let mut rx = self.tick_rx.lock().await;
+        Ok(rx.recv().await)
+    }
+
+    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
+        let mut rx = self.candle_rx.lock().await;
+        Ok(rx.recv().await)
+    }
+
+    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
+        Ok(None)
+    }
+}
+
+fn spawn_market_generator(
+    symbol: Symbol,
+    market: PaperMarketConfig,
+    exec_client: Arc<PaperExecutionClient>,
+    tick_tx: mpsc::Sender<Tick>,
+    candle_tx: mpsc::Sender<Candle>,
+    candle_interval: Arc<AsyncMutex<ChronoDuration>>,
+    shutdown_rx: oneshot::Receiver<()>,
+    connection_status: Option<Arc<AtomicBool>>,
+) {
+    tokio::spawn(async move {
+        if let Some(flag) = &connection_status {
+            flag.store(true, Ordering::SeqCst);
+        }
+        let result = match market {
+            PaperMarketConfig::RandomWalk {
+                start_price,
+                volatility,
+                interval_ms,
+            } => {
+                run_random_walk(
+                    symbol.clone(),
+                    start_price,
+                    volatility,
+                    interval_ms,
+                    exec_client,
+                    tick_tx,
+                    candle_tx,
+                    candle_interval,
+                    shutdown_rx,
+                )
+                .await
+            }
+            PaperMarketConfig::Replay { path, speed } => {
+                run_replay(
+                    symbol.clone(),
+                    path,
+                    speed,
+                    exec_client,
+                    tick_tx,
+                    candle_tx,
+                    candle_interval,
+                    shutdown_rx,
+                )
+                .await
+            }
+        };
+        if let Err(err) = result {
+            error!(symbol = %symbol, error = %err, "paper generator exited");
+        }
+        if let Some(flag) = connection_status {
+            flag.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
+async fn run_random_walk(
+    symbol: Symbol,
+    start_price: Decimal,
+    volatility: f64,
+    interval_ms: u64,
+    exec_client: Arc<PaperExecutionClient>,
+    tick_tx: mpsc::Sender<Tick>,
+    candle_tx: mpsc::Sender<Candle>,
+    candle_interval: Arc<AsyncMutex<ChronoDuration>>,
+    mut shutdown: oneshot::Receiver<()>,
+) -> BrokerResult<()> {
+    let mut rng = StdRng::from_entropy();
+    let mut price = start_price.to_f64().unwrap_or(25_000.0).max(1.0);
+    let mut ticker = interval(TokioDuration::from_millis(interval_ms.max(10)));
+    let mut candle_builder = CandleBuilder::new(symbol.clone());
+    loop {
+        select! {
+            _ = ticker.tick() => {},
+            _ = &mut shutdown => break,
+        }
+        let noise: f64 = rng.sample(StandardNormal);
+        let delta = 1.0 + noise * volatility.clamp(0.0001, 0.1);
+        price = (price * delta).max(1.0);
+        let price_decimal =
+            Decimal::from_f64(price).unwrap_or_else(|| Decimal::from_f64(25_000.0).unwrap());
+        exec_client.update_price(&symbol, price_decimal);
+        let now = Utc::now();
+        let size = Decimal::ONE;
+        let tick = Tick {
+            symbol: symbol.clone(),
+            price: price_decimal,
+            size,
+            side: if delta >= 1.0 { Side::Buy } else { Side::Sell },
+            exchange_timestamp: now,
+            received_at: now,
+        };
+        if tick_tx.send(tick).await.is_err() {
+            break;
+        }
+        let interval = *candle_interval.lock().await;
+        if let Some(mut candle) = candle_builder.update(
+            price_decimal,
+            now,
+            size,
+            interval.max(ChronoDuration::seconds(1)),
+        ) {
+            candle.interval = interval_to_core(interval);
+            if candle_tx.send(candle).await.is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_replay(
+    symbol: Symbol,
+    path: PathBuf,
+    speed: f64,
+    exec_client: Arc<PaperExecutionClient>,
+    tick_tx: mpsc::Sender<Tick>,
+    candle_tx: mpsc::Sender<Candle>,
+    candle_interval: Arc<AsyncMutex<ChronoDuration>>,
+    mut shutdown: oneshot::Receiver<()>,
+) -> BrokerResult<()> {
+    let samples = load_replay_samples(&path)?;
+    if samples.is_empty() {
+        return Err(BrokerError::InvalidRequest(format!(
+            "replay dataset '{}' is empty",
+            path.display()
+        )));
+    }
+    let mut candle_builder = CandleBuilder::new(symbol.clone());
+    let mut idx = 0usize;
+    loop {
+        let sample = &samples[idx];
+        let delay = if idx == 0 {
+            TokioDuration::from_millis(10)
+        } else {
+            let prev = &samples[(idx + samples.len() - 1) % samples.len()];
+            let delta = (sample.timestamp - prev.timestamp).max(ChronoDuration::milliseconds(1));
+            scale_duration(chrono_to_std(delta), speed)
+        };
+        select! {
+            _ = sleep(delay) => {},
+            _ = &mut shutdown => break,
+        }
+        exec_client.update_price(&symbol, sample.price);
+        let tick = Tick {
+            symbol: symbol.clone(),
+            price: sample.price,
+            size: sample.size,
+            side: sample.side,
+            exchange_timestamp: sample.timestamp,
+            received_at: Utc::now(),
+        };
+        if tick_tx.send(tick).await.is_err() {
+            break;
+        }
+        let interval = *candle_interval.lock().await;
+        if let Some(mut candle) = candle_builder.update(
+            sample.price,
+            sample.timestamp,
+            sample.size,
+            interval.max(ChronoDuration::seconds(1)),
+        ) {
+            candle.interval = interval_to_core(interval);
+            if candle_tx.send(candle).await.is_err() {
+                break;
+            }
+        }
+        idx = (idx + 1) % samples.len();
+    }
+    Ok(())
+}
+
+fn scale_duration(duration: TokioDuration, speed: f64) -> TokioDuration {
+    if speed <= 0.0 {
+        return duration;
+    }
+    let scaled = duration.as_secs_f64() / speed.max(0.0001);
+    TokioDuration::from_secs_f64(scaled.max(0.000_001))
+}
+
+fn chrono_to_std(duration: ChronoDuration) -> TokioDuration {
+    if duration.num_nanoseconds().unwrap_or(0) <= 0 {
+        return TokioDuration::from_millis(1);
+    }
+    TokioDuration::from_nanos(duration.num_nanoseconds().unwrap_or(1) as u64)
+}
+
+fn interval_to_core(duration: ChronoDuration) -> Interval {
+    let seconds = duration.num_seconds();
+    match seconds {
+        0..=1 => Interval::OneSecond,
+        2..=90 => Interval::OneMinute,
+        91..=600 => Interval::FiveMinutes,
+        601..=1800 => Interval::FifteenMinutes,
+        1801..=7200 => Interval::OneHour,
+        7201..=28800 => Interval::FourHours,
+        _ => Interval::OneDay,
+    }
+}
+
+fn load_replay_samples(path: &PathBuf) -> BrokerResult<Vec<ReplaySample>> {
+    let mut reader =
+        csv::Reader::from_path(path).map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
+    let headers = reader
+        .headers()
+        .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?
+        .clone();
+    let mut records = Vec::new();
+    for result in reader.records() {
+        let record = result.map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
+        let timestamp = parse_timestamp(&record, &headers)?;
+        let price = parse_decimal_field(&record, &headers, "price")?;
+        let size = parse_decimal_field(&record, &headers, "size").unwrap_or_else(|_| Decimal::ONE);
+        let side = parse_side_field(&record, &headers);
+        records.push(ReplaySample {
+            timestamp,
+            price,
+            size,
+            side,
+        });
+    }
+    Ok(records)
+}
+
+fn parse_timestamp(record: &StringRecord, headers: &StringRecord) -> BrokerResult<DateTime<Utc>> {
+    let idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("timestamp"))
+        .unwrap_or(0);
+    let raw = record
+        .get(idx)
+        .ok_or_else(|| BrokerError::InvalidRequest("missing timestamp column".into()))?;
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").map(|dt| Utc.from_utc_datetime(&dt))
+        })
+        .map_err(|err| BrokerError::InvalidRequest(format!("invalid timestamp '{raw}': {err}")))
+}
+
+fn parse_decimal_field(
+    record: &StringRecord,
+    headers: &StringRecord,
+    field: &str,
+) -> BrokerResult<Decimal> {
+    let idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case(field))
+        .ok_or_else(|| BrokerError::InvalidRequest(format!("missing column '{field}'")))?;
+    record
+        .get(idx)
+        .ok_or_else(|| BrokerError::InvalidRequest(format!("missing value for column '{field}'")))?
+        .parse::<Decimal>()
+        .map_err(|err| BrokerError::InvalidRequest(format!("invalid {field}: {err}")))
+}
+
+fn parse_side_field(record: &StringRecord, headers: &StringRecord) -> Side {
+    headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("side"))
+        .and_then(|idx| record.get(idx))
+        .map(|raw| match raw.to_lowercase().as_str() {
+            "sell" => Side::Sell,
+            _ => Side::Buy,
+        })
+        .unwrap_or(Side::Buy)
 }
 
 /// Deterministic data source backed by vectors of ticks/candles.

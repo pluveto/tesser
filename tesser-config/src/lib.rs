@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod deserializer;
@@ -41,7 +41,7 @@ pub struct BacktestConfig {
     pub markets_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct ExchangeConfig {
     pub rest_url: String,
     pub ws_url: String,

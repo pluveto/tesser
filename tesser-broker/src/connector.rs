@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
 use async_trait::async_trait;
@@ -9,6 +9,17 @@ use serde_json::Value;
 use tesser_core::{Candle, Interval, OrderBook, Tick};
 
 use crate::{BrokerError, BrokerResult, ExecutionClient};
+
+/// Configuration passed to market stream factories describing runtime metadata.
+#[derive(Clone, Default)]
+pub struct ConnectorStreamConfig {
+    /// Optional WebSocket endpoint override.
+    pub ws_url: Option<String>,
+    /// Arbitrary connector-specific metadata (e.g., categories).
+    pub metadata: Value,
+    /// Connection status flag shared with health monitoring.
+    pub connection_status: Option<Arc<AtomicBool>>,
+}
 
 /// Trait describing the minimal market stream capabilities required by higher-level tooling.
 #[async_trait]
@@ -40,7 +51,11 @@ pub trait ConnectorFactory: Send + Sync {
 
     /// Construct a market data stream using the provided configuration blob.
     #[allow(unused_variables)]
-    async fn create_market_stream(&self, config: &Value) -> BrokerResult<Box<dyn ConnectorStream>> {
+    async fn create_market_stream(
+        &self,
+        config: &Value,
+        stream_config: ConnectorStreamConfig,
+    ) -> BrokerResult<Box<dyn ConnectorStream>> {
         Err(BrokerError::Other(format!(
             "{} does not implement market stream factory",
             self.name()

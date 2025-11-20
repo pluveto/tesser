@@ -12,8 +12,12 @@ readme = "README.md"
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+csv.workspace = true
+rand = { version = "0.8", features = ["std"] }
+rand_distr = "0.4"
 tesser-broker = { version = "0.4.1", path = "../../tesser-broker" }
 tesser-core = { version = "0.4.1", path = "../../tesser-core" }
 uuid.workspace = true

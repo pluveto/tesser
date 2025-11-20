@@ -256,7 +256,7 @@ Key CLI flags:
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--exchange` | Exchange profile defined under `[exchange.*]` | `bybit_testnet` |
+| `--exchange` | Exchange profile defined under `[exchange.*]` | `paper_sandbox` |
 | `--category` | Bybit channel (`linear`, `inverse`, `spot`, …). Ignored for Binance. | `linear` |
 | `--interval` | Candle interval understood by `tesser_core::Interval` | `1m` |
 | `--quantity` | Fixed order size routed through `FixedOrderSizer` | `1.0` |

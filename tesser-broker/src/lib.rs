@@ -173,5 +173,5 @@ impl<T> PayloadExt for T where T: DeserializeOwned {}
 mod connector;
 pub use connector::{
     get_connector_factory, register_connector_factory, registered_connectors, ConnectorFactory,
-    ConnectorStream,
+    ConnectorStream, ConnectorStreamConfig,
 };

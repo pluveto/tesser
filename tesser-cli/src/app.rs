@@ -403,7 +403,7 @@ pub struct BacktestBatchArgs {
 pub struct LiveRunArgs {
     #[arg(long)]
     strategy_config: PathBuf,
-    #[arg(long, default_value = "bybit_testnet")]
+    #[arg(long, default_value = "paper_sandbox")]
     exchange: String,
     #[arg(long, default_value = "linear")]
     category: String,
