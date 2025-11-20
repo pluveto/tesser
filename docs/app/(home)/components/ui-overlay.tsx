@@ -531,35 +531,6 @@ function CTASection() {
 export function UIOverlay() {
   return (
     <main className="flex flex-col w-full min-h-screen font-sans selection:bg-blue-500/30 selection:text-white">
-      <nav className="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-6 py-6 md:px-12 pointer-events-none mix-blend-difference text-white">
-        <div className="pointer-events-auto flex items-center gap-2">
-           <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center">
-              <div className="w-4 h-4 bg-black rounded-sm rotate-45" />
-           </div>
-           <span className="font-bold text-xl tracking-tight">tesser</span>
-        </div>
-        <div className="pointer-events-auto hidden md:flex gap-8 text-sm font-medium">
-          <Link href="/docs" className="hover:opacity-70 transition-opacity">Documentation</Link>
-          <a 
-            href="https://github.com/tesserspace/tesser" 
-            target="_blank" 
-            rel="noreferrer" 
-            className="hover:opacity-70 transition-opacity"
-          >
-            GitHub
-          </a>
-          <Link href="/blog" className="hover:opacity-70 transition-opacity">Blog</Link>
-        </div>
-        <div className="pointer-events-auto">
-          <Link 
-            href="/docs" 
-            className="hidden md:block px-5 py-2 text-sm font-bold border border-white/20 rounded-full hover:bg-white hover:text-black transition-all"
-          >
-            Launch App
-          </Link>
-        </div>
-      </nav>
-
       <HeroSection />
       <ProblemSection />
       <SolutionArchitecture />

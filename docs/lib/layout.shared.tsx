@@ -12,6 +12,14 @@ const homeLinks: LinkItemType[] = [
     on: 'nav',
     active: 'nested-url',
   },
+  {
+    type: 'main',
+    text: 'Blog',
+    description: 'Hear from the Tesser team and community',
+    url: '/blog',
+    on: 'nav',
+    active: 'nested-url',
+  },
 ];
 
 type BaseOptionsConfig = {

@@ -1,0 +1,56 @@
+---
+title: "Introducing Tesser: An Operating System for Quant Funds"
+description: "Why we are building a unified, Rust-first stack that lets investors and engineers spin up institutional-grade trading workflows in days instead of months."
+author: "The Tesser Core Team"
+date: "2024-07-15"
+---
+
+Quant funds and digital asset desks share the same frustration: strategy research happens in disposable notebooks while real capital is deployed from a completely different stack. Every translation adds latency, fragility, and human risk. Tesser was born to collapse that gap by giving investors and developers a single programmable surface that runs from simulation to execution without rewriting a line of logic.
+
+## The Opportunity We See
+
+- **Latency parity between research and live trading.** By treating backtests, paper trading, and production engines as configurations of the same Rust core, Tesser keeps strategy behavior identical across environments. The same `Strategy` implementation that hits the simulator also drives live connectors.
+- **Infrastructure reuse across venues.** We maintain battle-tested connectors for venues such as Bybit, Binance, dYdX, and Coinbase. Every improvement on one exchange compounds across the rest of the network.
+- **Deterministic observability for operations.** Structured tracing, deterministic replay, and typed event busses turn "mystery fills" into debuggable data.
+
+For investors, this translates into less operational drag, faster iteration cycles, and a real moat around IP. For engineers, it means the tooling finally matches the sophistication of their ideas.
+
+## What Investors Should Know
+
+1. **Modular revenue model.** Tesser is open source under MIT for individual builders, while enterprise desks pay for managed infrastructure, premium connectors, and 24/7 venue monitoring. Every module—`tesser-core`, `tesser-execution`, `tesser-portfolio`, and `tesser-rpc`—can be licensed individually or as a managed bundle.
+2. **Aligned incentives.** Funds retain full custody of code and keys. We monetize the boring parts (infrastructure, compliance guardrails, exchange relationships) so teams stay focused on alpha.
+3. **Regulated-ready architecture.** The messaging fabric enforces audit trails, deterministic replays, and read-only mirrors for risk teams. This keeps us compatible with future regulatory scrutiny without slowing down builders.
+
+We already use the stack internally to underwrite exchange integrations and internal capital, which keeps our incentives aligned with our partners.
+
+## Why Developers Choose Tesser
+
+### 1. Native Rust Core
+
+The core is written in safe Rust with `< 50µs` latency for order routing. Strategy authors can extend it with macros (`tesser-strategy-macros`) that remove boilerplate while keeping full control over memory and compute.
+
+### 2. Batteries-Included Tooling
+
+- **`tesser-cli`:** scaffolds projects, watches live markets, and deploys workloads to local clusters or colocation boxes.
+- **Strategy SDK:** ships typed market data streams, technical indicators, and risk primitives in one crate so you can compose research code like Lego bricks.
+- **Backtester + portfolio services:** deterministic engine that shares the same math library and persistence layer as production.
+
+### 3. Connectivity & Automation
+
+Exchange connectors, FIX/WebSocket clients, and risk daemons are all maintained in-tree. Operators can wire them together with YAML + TOML config, or talk to the platform over gRPC/JSON-RPC via `tesser-rpc`.
+
+### 4. Observability by Default
+
+Every module emits structured spans. You can stream them to ClickHouse, Kafka, or any OpenTelemetry sink. Replaying a live trading session for forensic analysis becomes a CLI call, not a week-long archaeology dig.
+
+## Roadmap & How to Engage
+
+Short term we are focused on:
+
+1. **Cross-market portfolio nets.** Deterministic inventory netting across spot, perpetuals, and options.
+2. **Deterministic execution sandboxes.** Replay live sessions with alternative parameters for controlled counterfactuals.
+3. **Capital partner program.** Curated access for funds that want managed infrastructure but keep their strategy IP in-house.
+
+Whether you're underwriting the next fund or building its tooling, we would love to talk. Start with the [docs](/docs), explore the repo on [GitHub](https://github.com/tesserspace/tesser), or reach out to the core team at `hello@tesser.space` to discuss dedicated support, custom integrations, or capital partnerships.
+
+Let's build the operating system for programmable markets—together.
