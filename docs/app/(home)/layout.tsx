@@ -10,25 +10,27 @@ export default function Layout({ children }: LayoutProps<'/'>) {
   const navConfig = options.nav ?? {};
 
   return (
-    <HomeLayout
-      {...options}
-      className="pt-0"
-      nav={{
-        ...navConfig,
-        transparentMode: navConfig.transparentMode ?? 'always',
-        component: (
-          <OverlayNavigation
-            title={navConfig.title}
-            url={navConfig.url}
-            links={options.links}
-            githubUrl={options.githubUrl}
-            siteLabel={SITE_NAME}
-          />
-        ),
-      }}
-    >
-      {children}
-    </HomeLayout>
+    <div className="dark min-h-screen bg-black text-white antialiased">
+      <HomeLayout
+        {...options}
+        className="pt-0 text-white"
+        nav={{
+          ...navConfig,
+          transparentMode: navConfig.transparentMode ?? 'always',
+          component: (
+            <OverlayNavigation
+              title={navConfig.title}
+              url={navConfig.url}
+              links={options.links}
+              githubUrl={options.githubUrl}
+              siteLabel={SITE_NAME}
+            />
+          ),
+        }}
+      >
+        {children}
+      </HomeLayout>
+    </div>
   );
 }
 
