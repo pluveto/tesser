@@ -167,8 +167,8 @@ jobs:
             target: x86_64-unknown-linux-musl
             archive: tar.gz
             artifact_suffix: linux-musl
-            use_cross: true
-            setup_cmd: ''
+            use_cross: false
+            setup_cmd: sudo apt-get update && sudo apt-get install -y musl-tools
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
