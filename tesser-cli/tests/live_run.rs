@@ -1,3 +1,4 @@
+#![cfg(feature = "bybit")]
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -161,12 +162,16 @@ async fn live_run_executes_round_trip() -> Result<()> {
         risk: RiskManagementConfig::default(),
         reconciliation_interval: Duration::from_secs(1),
         reconciliation_threshold: Decimal::new(1, 3),
+        driver: "bybit".into(),
+        orderbook_depth: 50,
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
         ws_url: exchange.ws_url(),
         api_key: "test-key".into(),
         api_secret: "test-secret".into(),
+        driver: "bybit".into(),
+        params: JsonValue::Null,
     };
     let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
     let shutdown = ShutdownSignal::new();
@@ -282,12 +287,16 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         risk: RiskManagementConfig::default(),
         reconciliation_interval: Duration::from_millis(200),
         reconciliation_threshold: Decimal::new(1, 4),
+        driver: "bybit".into(),
+        orderbook_depth: 50,
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
         ws_url: exchange.ws_url(),
         api_key: "test-key".into(),
         api_secret: "test-secret".into(),
+        driver: "bybit".into(),
+        params: JsonValue::Null,
     };
     let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(SYMBOL));
     let shutdown = ShutdownSignal::new();
@@ -423,12 +432,16 @@ async fn alerts_on_rejected_order() -> Result<()> {
         risk: RiskManagementConfig::default(),
         reconciliation_interval: Duration::from_secs(1),
         reconciliation_threshold: Decimal::new(1, 3),
+        driver: "bybit".into(),
+        orderbook_depth: 50,
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
         ws_url: exchange.ws_url(),
         api_key: "test-key".into(),
         api_secret: "test-secret".into(),
+        driver: "bybit".into(),
+        params: JsonValue::Null,
     };
     let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
     let shutdown = ShutdownSignal::new();

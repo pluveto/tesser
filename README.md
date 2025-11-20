@@ -43,6 +43,7 @@ tesser/
 |
 └── connectors/         # Directory for specific exchange implementations
     ├── tesser-bybit    # Concrete Bybit connector (REST + WebSocket)
+    ├── tesser-binance  # Concrete Binance connector (REST + WebSocket)
     └── tesser-paper    # A simulated exchange for backtesting/paper fills
 ```
 
@@ -113,7 +114,7 @@ tesser/
 *   **Rule**: All code that is specific to one exchange (e.g., endpoint URLs, authentication methods, JSON payload formats) must be confined to a crate within this directory.
 
 ##### `tesser-bybit`
-* Implements the Bybit v5 REST API (`ExecutionClient`) plus a resilient WebSocket stream (`MarketStream`) that powers live trading. Configurable via `config/[env].toml` exchange profiles.
+* Implements the Bybit v5 and Binance USD-M REST/WebSocket APIs (`ExecutionClient` + `MarketStream`) that power live trading. Select the driver via `config/[env].toml` exchange profiles (`driver = "bybit"` or `"binance"`).
 
 ##### `tesser-paper`
 * Simulates fills instantly and replays deterministic ticks/candles. Used by the backtester and as the default execution target for `live run` until you're ready to wire real capital.
@@ -200,7 +201,7 @@ Commands:
   data download|validate|resample   # Download/inspect historical data
   backtest run --strategy-config    # Executes a single backtest (supports multiple --data inputs)
   backtest batch --config ...       # Runs multiple configs and writes an optional summary CSV
-  live run --strategy-config        # Runs the live Bybit stream + paper execution loop
+  live run --strategy-config        # Runs the live exchange stream (Bybit/Binance) + paper execution loop
   state inspect [--path <file>]     # Prints the persisted SQLite state snapshot (use --raw for JSON)
   strategies                        # Lists compiled strategies
 ```
@@ -224,7 +225,7 @@ cargo run -p tesser-cli -- \
   --interval 1m
 ```
 
-Add `--exec live` (and populate your `[exchange.<name>]` `api_key`/`api_secret`) to forward orders to the real Bybit REST API instead of the paper engine. **This will route live capital**; use the testnet profile while validating your setup.
+Add `--exec live` (and populate your `[exchange.<name>]` `api_key`/`api_secret`) to forward orders to the real exchange REST API instead of the paper engine. **This will route live capital**; use the exchange testnet profile while validating your setup.
 
 What happens under the hood:
 
@@ -248,15 +249,15 @@ The SQLite file referenced by `config.live.state_path` is the source of truth fo
 3. **Online backup**: when a session must stay up, use SQLite's native snapshotting: `sqlite3 reports/live_state.db ".backup 'reports/live_state.db.bak'"`. The command is safe because the repository enables WAL journaling.
 4. **Restoring**: replace the file with a known-good backup and restart `tesser-cli live run`; the runtime will hydrate the portfolio from the restored snapshot.
 
-> ⚠️ **Risk warning**: `--exec live` forwards orders exactly as produced by your strategy—there is no extra confirmation prompt, and portfolio PnL stays paper-based until a future release. Always dry-run on Bybit testnet before pointing to mainnet keys.
-> ⚠️ **Risk warning**: `--exec live` is a real trading mode. With the new reconciliation features, the portfolio PnL is now based on real fills, but risks inherent to automated trading remain. Always dry-run on Bybit testnet before pointing to mainnet keys.
+> ⚠️ **Risk warning**: `--exec live` forwards orders exactly as produced by your strategy—there is no extra confirmation prompt, and portfolio PnL stays paper-based until a future release. Always dry-run on the exchange testnet before pointing to mainnet keys.
+> ⚠️ **Risk warning**: `--exec live` is a real trading mode. With the new reconciliation features, the portfolio PnL is now based on real fills, but risks inherent to automated trading remain. Always dry-run on the exchange testnet before pointing to mainnet keys.
 
 Key CLI flags:
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--exchange` | Exchange profile defined under `[exchange.*]` | `bybit_testnet` |
-| `--category` | Bybit channel (`linear`, `inverse`, `spot`, …) | `linear` |
+| `--exchange` | Exchange profile defined under `[exchange.*]` | `paper_sandbox` |
+| `--category` | Bybit channel (`linear`, `inverse`, `spot`, …). Ignored for Binance. | `linear` |
 | `--interval` | Candle interval understood by `tesser_core::Interval` | `1m` |
 | `--quantity` | Fixed order size routed through `FixedOrderSizer` | `1.0` |
 | `--exec` | Execution backend (`paper` or `live`) | `paper` |

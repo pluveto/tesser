@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Once,
 };
 use std::time::{Duration, Instant};
 
@@ -17,10 +17,79 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, trace, warn};
 
-use tesser_broker::{ExecutionClient, MarketStream};
+use serde_json::{json, Value};
+#[cfg(not(feature = "bybit"))]
+mod fallback_channel {
+    use super::*;
+    use std::str::FromStr;
+    #[derive(Clone, Copy, Debug)]
+    pub enum PublicChannel {
+        Linear,
+        Inverse,
+        Spot,
+        Option,
+        Spread,
+    }
+
+    impl PublicChannel {
+        pub fn as_path(&self) -> &'static str {
+            match self {
+                Self::Linear => "linear",
+                Self::Inverse => "inverse",
+                Self::Spot => "spot",
+                Self::Option => "option",
+                Self::Spread => "spread",
+            }
+        }
+    }
+
+    impl FromStr for PublicChannel {
+        type Err = BrokerError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            match value.to_lowercase().as_str() {
+                "linear" => Ok(Self::Linear),
+                "inverse" => Ok(Self::Inverse),
+                "spot" => Ok(Self::Spot),
+                "option" => Ok(Self::Option),
+                "spread" => Ok(Self::Spread),
+                other => Err(BrokerError::InvalidRequest(format!(
+                    "unsupported Bybit public channel '{other}'"
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "bybit"))]
+use fallback_channel::PublicChannel;
+
+fn ensure_builtin_connectors_registered() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        register_connector_factory(Arc::new(PaperFactory::default()));
+        #[cfg(feature = "bybit")]
+        register_bybit_factory();
+        #[cfg(feature = "binance")]
+        register_binance_factory();
+    });
+}
+
+#[cfg(feature = "binance")]
+use tesser_binance::{
+    fill_from_update, order_from_update, register_factory as register_binance_factory,
+    ws::{extract_order_update, BinanceUserDataStream, UserDataStreamEventsResponse},
+    BinanceClient,
+};
+use tesser_broker::{
+    get_connector_factory, register_connector_factory, BrokerResult, ConnectorFactory,
+    ConnectorStream, ConnectorStreamConfig, ExecutionClient,
+};
+#[cfg(feature = "bybit")]
 use tesser_bybit::ws::{BybitWsExecution, BybitWsOrder, PrivateMessage};
+#[cfg(feature = "bybit")]
 use tesser_bybit::{
-    BybitClient, BybitConfig, BybitCredentials, BybitMarketStream, BybitSubscription, PublicChannel,
+    register_factory as register_bybit_factory, BybitClient, BybitCredentials, PublicChannel,
 };
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
@@ -36,7 +105,7 @@ use tesser_execution::{
     RiskContext, RiskLimits, SqliteAlgoStateRepository,
 };
 use tesser_markets::MarketRegistry;
-use tesser_paper::PaperExecutionClient;
+use tesser_paper::{PaperExecutionClient, PaperFactory};
 use tesser_portfolio::{
     LiveState, Portfolio, PortfolioConfig, SqliteStateRepository, StateRepository,
 };
@@ -66,8 +135,44 @@ impl ExecutionBackend {
 }
 
 const DEFAULT_ORDER_BOOK_DEPTH: usize = 50;
+
+pub const fn default_order_book_depth() -> usize {
+    DEFAULT_ORDER_BOOK_DEPTH
+}
 const STRATEGY_LOCK_WARN_THRESHOLD: Duration = Duration::from_millis(25);
 const STRATEGY_CALL_WARN_THRESHOLD: Duration = Duration::from_millis(250);
+
+#[async_trait::async_trait]
+trait LiveMarketStream: Send {
+    async fn next_tick(&mut self) -> BrokerResult<Option<Tick>>;
+    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>>;
+    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>>;
+}
+
+struct FactoryStreamAdapter {
+    inner: Box<dyn ConnectorStream>,
+}
+
+impl FactoryStreamAdapter {
+    fn new(inner: Box<dyn ConnectorStream>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl LiveMarketStream for FactoryStreamAdapter {
+    async fn next_tick(&mut self) -> BrokerResult<Option<Tick>> {
+        self.inner.next_tick().await
+    }
+
+    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
+        self.inner.next_candle().await
+    }
+
+    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
+        self.inner.next_order_book().await
+    }
+}
 
 pub struct LiveSessionSettings {
     pub category: PublicChannel,
@@ -86,6 +191,8 @@ pub struct LiveSessionSettings {
     pub risk: RiskManagementConfig,
     pub reconciliation_interval: Duration,
     pub reconciliation_threshold: Decimal,
+    pub driver: String,
+    pub orderbook_depth: usize,
 }
 
 impl LiveSessionSettings {
@@ -127,43 +234,39 @@ pub async fn run_live_with_shutdown(
     } else {
         None
     };
-    let mut stream = BybitMarketStream::connect_public(
-        &exchange.ws_url,
-        settings.category,
-        Some(public_connection.clone()),
-    )
-    .await
-    .context("failed to connect to Bybit WebSocket")?;
-    for symbol in &symbols {
-        stream
-            .subscribe(BybitSubscription::Trades {
-                symbol: symbol.clone(),
-            })
-            .await
-            .with_context(|| format!("failed to subscribe to trades for {symbol}"))?;
-        stream
-            .subscribe(BybitSubscription::Kline {
-                symbol: symbol.clone(),
-                interval: settings.interval,
-            })
-            .await
-            .with_context(|| format!("failed to subscribe to klines for {symbol}"))?;
-        stream
-            .subscribe(BybitSubscription::OrderBook {
-                symbol: symbol.clone(),
-                depth: DEFAULT_ORDER_BOOK_DEPTH,
-            })
-            .await
-            .with_context(|| format!("failed to subscribe to order books for {symbol}"))?;
-    }
+    ensure_builtin_connectors_registered();
+    let connector_payload = build_exchange_payload(&exchange, &settings);
+    let connector_factory = get_connector_factory(&settings.driver)
+        .ok_or_else(|| anyhow!("driver {} is not registered", settings.driver))?;
+    let stream_config = ConnectorStreamConfig {
+        ws_url: Some(exchange.ws_url.clone()),
+        metadata: json!({
+            "category": settings.category.as_path(),
+            "symbols": symbols.clone(),
+            "orderbook_depth": settings.orderbook_depth,
+        }),
+        connection_status: Some(public_connection.clone()),
+    };
+    let mut connector_stream = connector_factory
+        .create_market_stream(&connector_payload, stream_config)
+        .await
+        .map_err(|err| anyhow!("failed to create market stream: {err}"))?;
+    connector_stream
+        .subscribe(&symbols, settings.interval)
+        .await
+        .map_err(|err| anyhow!("failed to subscribe via connector: {err}"))?;
+    let market_stream: Box<dyn LiveMarketStream> =
+        Box::new(FactoryStreamAdapter::new(connector_stream));
 
-    let execution_client = build_execution_client(&exchange, &settings)?;
+    let execution_client =
+        build_execution_client(&settings, connector_factory.clone(), &connector_payload).await?;
     let market_registry = load_market_registry(execution_client.clone(), &settings).await?;
     if matches!(settings.exec_backend, ExecutionBackend::Live) {
         info!(
             rest = %exchange.rest_url,
-            category = ?settings.category,
-            "live execution enabled via Bybit REST"
+            driver = ?settings.driver,
+            "live execution enabled via {:?} REST",
+            settings.driver
         );
     }
     let risk_checker: Arc<dyn PreTradeRiskChecker> =
@@ -184,11 +287,12 @@ pub async fn run_live_with_shutdown(
     let orchestrator = OrderOrchestrator::new(Arc::new(execution), algo_state_repo).await?;
 
     let runtime = LiveRuntime::new(
-        stream,
+        market_stream,
         strategy,
         symbols,
         orchestrator,
         settings,
+        exchange.ws_url.clone(),
         market_registry,
         shutdown,
         public_connection,
@@ -198,42 +302,35 @@ pub async fn run_live_with_shutdown(
     runtime.run().await
 }
 
-fn build_execution_client(
-    exchange: &ExchangeConfig,
+async fn build_execution_client(
     settings: &LiveSessionSettings,
+    connector_factory: Arc<dyn ConnectorFactory>,
+    connector_payload: &Value,
 ) -> Result<Arc<dyn ExecutionClient>> {
     match settings.exec_backend {
-        ExecutionBackend::Paper => Ok(Arc::new(PaperExecutionClient::new(
-            "paper".to_string(),
-            vec!["BTCUSDT".to_string()],
-            settings.slippage_bps,
-            settings.fee_bps,
-        ))),
-        ExecutionBackend::Live => {
-            let api_key = exchange.api_key.trim();
-            let api_secret = exchange.api_secret.trim();
-            if api_key.is_empty() || api_secret.is_empty() {
-                bail!("exchange profile is missing api_key/api_secret required for live execution");
+        ExecutionBackend::Paper => {
+            if settings.driver == "paper" {
+                return connector_factory
+                    .create_execution_client(connector_payload)
+                    .await
+                    .map_err(|err| anyhow!("failed to create execution client: {err}"));
             }
-            let client = BybitClient::new(
-                BybitConfig {
-                    base_url: exchange.rest_url.clone(),
-                    category: settings.category.as_path().to_string(),
-                    recv_window: 5_000,
-                    ws_url: Some(exchange.ws_url.clone()),
-                },
-                Some(BybitCredentials {
-                    api_key: api_key.to_string(),
-                    api_secret: api_secret.to_string(),
-                }),
-            );
-            Ok(Arc::new(client))
+            Ok(Arc::new(PaperExecutionClient::new(
+                "paper".to_string(),
+                vec!["BTCUSDT".to_string()],
+                settings.slippage_bps,
+                settings.fee_bps,
+            )))
         }
+        ExecutionBackend::Live => connector_factory
+            .create_execution_client(connector_payload)
+            .await
+            .map_err(|err| anyhow!("failed to create execution client: {err}")),
     }
 }
 
 struct LiveRuntime {
-    stream: BybitMarketStream,
+    market: Box<dyn LiveMarketStream>,
     orchestrator: Arc<OrderOrchestrator>,
     state_repo: Arc<dyn StateRepository>,
     persisted: Arc<Mutex<LiveState>>,
@@ -257,11 +354,12 @@ struct LiveRuntime {
 impl LiveRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn new(
-        stream: BybitMarketStream,
+        market: Box<dyn LiveMarketStream>,
         mut strategy: Box<dyn Strategy>,
         symbols: Vec<String>,
         orchestrator: OrderOrchestrator,
         settings: LiveSessionSettings,
+        exchange_ws_url: String,
         market_registry: Arc<MarketRegistry>,
         shutdown: ShutdownSignal,
         public_connection: Arc<AtomicBool>,
@@ -337,13 +435,13 @@ impl LiveRuntime {
         }
         persisted.portfolio = Some(portfolio.snapshot());
 
-        let mut market = HashMap::new();
+        let mut market_snapshots = HashMap::new();
         for symbol in &symbols {
             let mut snapshot = MarketSnapshot::default();
             if let Some(price) = persisted.last_prices.get(symbol).copied() {
                 snapshot.last_trade = Some(price);
             }
-            market.insert(symbol.clone(), snapshot);
+            market_snapshots.insert(symbol.clone(), snapshot);
         }
 
         let metrics = LiveMetrics::new();
@@ -382,165 +480,64 @@ impl LiveRuntime {
 
         if !settings.exec_backend.is_paper() {
             let execution_engine = orchestrator.execution_engine();
-            let bybit_creds = match execution_engine.credentials() {
-                Some(creds) => creds,
-                None => bail!("live execution requires Bybit credentials"),
-            };
-            let ws_url = execution_engine.ws_url();
-            let private_tx = private_event_tx.clone();
             let exec_client = execution_engine.client();
-            let symbols_for_private = symbols.clone();
-            let last_sync_handle = last_private_sync.clone();
-            let private_connection_flag = private_connection.clone();
-            let metrics_for_private = metrics.clone();
-            tokio::spawn(async move {
-                let creds = bybit_creds;
-                let endpoint = ws_url;
-                let client = exec_client;
-                let symbols = symbols_for_private;
-                let last_sync = last_sync_handle;
-                loop {
-                    match tesser_bybit::ws::connect_private(
-                        &endpoint,
-                        &creds,
-                        private_connection_flag.clone(),
-                    )
-                    .await
+            match settings.driver.as_str() {
+                "bybit" | "" => {
+                    #[cfg(feature = "bybit")]
                     {
-                        Ok(mut socket) => {
-                            if let Some(flag) = &private_connection_flag {
-                                flag.store(true, Ordering::SeqCst);
-                            }
-                            metrics_for_private.update_connection_status("private", true);
-                            info!("Connected to Bybit private WebSocket stream");
-                            // Incremental reconciliation right after a successful reconnect
-                            // 1) Sync open orders
-                            for symbol in &symbols {
-                                match client.list_open_orders(symbol).await {
-                                    Ok(orders) => {
-                                        for order in orders {
-                                            if let Err(err) = private_tx
-                                                .send(BrokerEvent::OrderUpdate(order))
-                                                .await
-                                            {
-                                                error!(
-                                                    "failed to send reconciled order update: {err}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("failed to reconcile open orders for {symbol}: {e}");
-                                    }
-                                }
-                            }
-
-                            // 2) Fetch any executions since the last sync timestamp
-                            if let Some(bybit) =
-                                client.as_any().downcast_ref::<tesser_bybit::BybitClient>()
-                            {
-                                let since = {
-                                    let guard = last_sync.lock().await;
-                                    // Default to 30 minutes ago if missing
-                                    guard.unwrap_or_else(|| {
-                                        Utc::now() - chrono::Duration::minutes(30)
-                                    })
-                                };
-                                match bybit.list_executions_since(since).await {
-                                    Ok(fills) => {
-                                        for fill in fills {
-                                            if let Err(err) =
-                                                private_tx.send(BrokerEvent::Fill(fill)).await
-                                            {
-                                                error!("failed to send reconciled fill: {err}");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "failed to reconcile executions since {:?}: {}",
-                                            since, e
-                                        );
-                                    }
-                                }
-                                // Update last sync time to now regardless to avoid tight loops
-                                let mut guard = last_sync.lock().await;
-                                *guard = Some(Utc::now());
-                            }
-
-                            while let Some(msg) = socket.next().await {
-                                if let Ok(Message::Text(text)) = msg {
-                                    if let Ok(value) =
-                                        serde_json::from_str::<serde_json::Value>(&text)
-                                    {
-                                        if let Some(topic) =
-                                            value.get("topic").and_then(|v| v.as_str())
-                                        {
-                                            match topic {
-                                                "order" => {
-                                                    if let Ok(msg) = serde_json::from_value::<
-                                                        PrivateMessage<BybitWsOrder>,
-                                                    >(
-                                                        value.clone()
-                                                    ) {
-                                                        for update in msg.data {
-                                                            match update.to_tesser_order(None) {
-                                                                Ok(order) => {
-                                                                    if let Err(err) = private_tx.send(BrokerEvent::OrderUpdate(order)).await {
-                                                                        error!("failed to send private order update: {err}");
-                                                                    }
-                                                                }
-                                                                Err(err) => error!("failed to convert order update: {err}"),
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "execution" => {
-                                                    if let Ok(msg) = serde_json::from_value::<
-                                                        PrivateMessage<BybitWsExecution>,
-                                                    >(
-                                                        value.clone()
-                                                    ) {
-                                                        for exec in msg.data {
-                                                            match exec.to_tesser_fill() {
-                                                                Ok(fill) => {
-                                                                    if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await {
-                                                                        error!("failed to send private fill event: {err}");
-                                                                    }
-                                                                }
-                                                                Err(err) => error!("failed to parse execution: {err}"),
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(flag) = &private_connection_flag {
-                                flag.store(false, Ordering::SeqCst);
-                            }
-                            metrics_for_private.update_connection_status("private", false);
-                            error!("Private WebSocket connection failed: {e}. Retrying...");
-                        }
+                        let bybit = exec_client
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<BybitClient>()
+                            .ok_or_else(|| anyhow!("execution client is not Bybit"))?;
+                        let creds = bybit
+                            .get_credentials()
+                            .ok_or_else(|| anyhow!("live execution requires Bybit credentials"))?;
+                        spawn_bybit_private_stream(
+                            creds,
+                            bybit.get_ws_url(),
+                            private_event_tx.clone(),
+                            exec_client.clone(),
+                            symbols.clone(),
+                            last_private_sync.clone(),
+                            private_connection.clone(),
+                            metrics.clone(),
+                            shutdown.clone(),
+                        );
                     }
-                    if let Some(flag) = &private_connection_flag {
-                        flag.store(false, Ordering::SeqCst);
+                    #[cfg(not(feature = "bybit"))]
+                    {
+                        bail!("driver 'bybit' is unavailable without the 'bybit' feature");
                     }
-                    metrics_for_private.update_connection_status("private", false);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-            });
+                "binance" => {
+                    #[cfg(feature = "binance")]
+                    {
+                        spawn_binance_private_stream(
+                            exec_client.clone(),
+                            exchange_ws_url.clone(),
+                            private_event_tx.clone(),
+                            private_connection.clone(),
+                            metrics.clone(),
+                            shutdown.clone(),
+                        );
+                    }
+                    #[cfg(not(feature = "binance"))]
+                    {
+                        bail!("driver 'binance' is unavailable without the 'binance' feature");
+                    }
+                }
+                "paper" => {}
+                other => {
+                    bail!("private stream unsupported for driver '{other}'");
+                }
+            }
         }
 
         let strategy = Arc::new(Mutex::new(strategy));
         let strategy_ctx = Arc::new(Mutex::new(strategy_ctx));
         let portfolio = Arc::new(Mutex::new(portfolio));
-        let market = Arc::new(Mutex::new(market));
+        let market_cache = Arc::new(Mutex::new(market_snapshots));
         let persisted = Arc::new(Mutex::new(persisted));
         let orchestrator = Arc::new(orchestrator);
         let event_bus = Arc::new(EventBus::new(2048));
@@ -571,7 +568,7 @@ impl LiveRuntime {
             portfolio.clone(),
             metrics.clone(),
             alerts.clone(),
-            market.clone(),
+            market_cache.clone(),
             state_repo.clone(),
             persisted.clone(),
             settings.exec_backend,
@@ -593,12 +590,12 @@ impl LiveRuntime {
         );
 
         for symbol in &symbols {
-            let ctx = shared_risk_context(symbol, &portfolio, &market, &persisted).await;
+            let ctx = shared_risk_context(symbol, &portfolio, &market_cache, &persisted).await;
             orchestrator.update_risk_context(symbol.clone(), ctx);
         }
 
         Ok(Self {
-            stream,
+            market,
             orchestrator,
             state_repo,
             persisted,
@@ -632,18 +629,18 @@ impl LiveRuntime {
         while !self.shutdown.triggered() {
             let mut progressed = false;
 
-            if let Some(tick) = self.stream.next_tick().await? {
+            if let Some(tick) = self.market.next_tick().await? {
                 progressed = true;
                 self.event_bus.publish(Event::Tick(TickEvent { tick }));
             }
 
-            if let Some(candle) = self.stream.next_candle().await? {
+            if let Some(candle) = self.market.next_candle().await? {
                 progressed = true;
                 self.event_bus
                     .publish(Event::Candle(CandleEvent { candle }));
             }
 
-            if let Some(book) = self.stream.next_order_book().await? {
+            if let Some(book) = self.market.next_order_book().await? {
                 progressed = true;
                 self.event_bus
                     .publish(Event::OrderBook(OrderBookEvent { order_book: book }));
@@ -704,19 +701,16 @@ impl LiveRuntime {
         for handle in self.connection_monitors.drain(..) {
             handle.abort();
         }
-        if let Err(err) = self.save_state().await {
-            warn!(error = %err, "failed to persist shutdown state");
-        }
-        Ok(())
-    }
-
-    async fn save_state(&self) -> Result<()> {
-        persist_state(
+        if let Err(err) = persist_state(
             self.state_repo.clone(),
             self.persisted.clone(),
             Some(self.strategy.clone()),
         )
         .await
+        {
+            warn!(error = %err, "failed to persist shutdown state");
+        }
+        Ok(())
     }
 }
 
@@ -931,6 +925,31 @@ fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
     }
 }
 
+fn build_exchange_payload(exchange: &ExchangeConfig, settings: &LiveSessionSettings) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("rest_url".into(), Value::String(exchange.rest_url.clone()));
+    payload.insert("ws_url".into(), Value::String(exchange.ws_url.clone()));
+    payload.insert("api_key".into(), Value::String(exchange.api_key.clone()));
+    payload.insert(
+        "api_secret".into(),
+        Value::String(exchange.api_secret.clone()),
+    );
+    payload.insert(
+        "category".into(),
+        Value::String(settings.category.as_path().to_string()),
+    );
+    payload.insert(
+        "orderbook_depth".into(),
+        Value::Number(serde_json::Number::from(settings.orderbook_depth as u64)),
+    );
+    if let Value::Object(extra) = exchange.params.clone() {
+        for (key, value) in extra {
+            payload.insert(key, value);
+        }
+    }
+    Value::Object(payload)
+}
+
 #[derive(Default)]
 struct MarketSnapshot {
     last_trade: Option<Price>,
@@ -973,6 +992,13 @@ impl ShutdownSignal {
 
     fn triggered(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
+    }
+
+    async fn wait(&self) {
+        if self.triggered() {
+            return;
+        }
+        self.notify.notified().await;
     }
 
     async fn sleep(&self, duration: Duration) -> bool {
@@ -1736,4 +1762,237 @@ async fn load_market_registry(
     let registry =
         MarketRegistry::from_instruments(instruments).map_err(|err| anyhow!(err.to_string()))?;
     Ok(Arc::new(registry))
+}
+
+#[cfg(feature = "bybit")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_bybit_private_stream(
+    creds: BybitCredentials,
+    ws_url: String,
+    private_tx: mpsc::Sender<BrokerEvent>,
+    exec_client: Arc<dyn ExecutionClient>,
+    symbols: Vec<String>,
+    last_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
+    private_connection_flag: Option<Arc<AtomicBool>>,
+    metrics: Arc<LiveMetrics>,
+    shutdown: ShutdownSignal,
+) {
+    tokio::spawn(async move {
+        loop {
+            match tesser_bybit::ws::connect_private(
+                &ws_url,
+                &creds,
+                private_connection_flag.clone(),
+            )
+            .await
+            {
+                Ok(mut socket) => {
+                    if let Some(flag) = &private_connection_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    metrics.update_connection_status("private", true);
+                    info!("Connected to Bybit private WebSocket stream");
+                    for symbol in &symbols {
+                        match exec_client.list_open_orders(symbol).await {
+                            Ok(orders) => {
+                                for order in orders {
+                                    if let Err(err) =
+                                        private_tx.send(BrokerEvent::OrderUpdate(order)).await
+                                    {
+                                        error!("failed to send reconciled order update: {err}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("failed to reconcile open orders for {symbol}: {e}");
+                            }
+                        }
+                    }
+                    if let Some(bybit) = exec_client.as_any().downcast_ref::<BybitClient>() {
+                        let since = {
+                            let guard = last_sync.lock().await;
+                            guard.unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(30))
+                        };
+                        match bybit.list_executions_since(since).await {
+                            Ok(fills) => {
+                                for fill in fills {
+                                    if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await
+                                    {
+                                        error!("failed to send reconciled fill: {err}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("failed to reconcile executions since {:?}: {}", since, e);
+                            }
+                        }
+                        let mut guard = last_sync.lock().await;
+                        *guard = Some(Utc::now());
+                    }
+
+                    while let Some(msg) = socket.next().await {
+                        if shutdown.triggered() {
+                            break;
+                        }
+                        if let Ok(Message::Text(text)) = msg {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
+                                    match topic {
+                                        "order" => {
+                                            if let Ok(msg) = serde_json::from_value::<
+                                                PrivateMessage<BybitWsOrder>,
+                                            >(
+                                                value.clone()
+                                            ) {
+                                                for update in msg.data {
+                                                    if let Ok(order) = update.to_tesser_order(None)
+                                                    {
+                                                        if let Err(err) = private_tx
+                                                            .send(BrokerEvent::OrderUpdate(order))
+                                                            .await
+                                                        {
+                                                            error!(
+                                                                "failed to send private order update: {err}"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "execution" => {
+                                            if let Ok(msg) = serde_json::from_value::<
+                                                PrivateMessage<BybitWsExecution>,
+                                            >(
+                                                value.clone()
+                                            ) {
+                                                for exec in msg.data {
+                                                    if let Ok(fill) = exec.to_tesser_fill() {
+                                                        if let Err(err) = private_tx
+                                                            .send(BrokerEvent::Fill(fill))
+                                                            .await
+                                                        {
+                                                            error!(
+                                                                "failed to send private fill event: {err}"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(flag) = &private_connection_flag {
+                        flag.store(false, Ordering::SeqCst);
+                    }
+                    metrics.update_connection_status("private", false);
+                    error!("Bybit private WebSocket connection failed: {e}. Retrying...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+            if shutdown.triggered() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(feature = "binance")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_binance_private_stream(
+    exec_client: Arc<dyn ExecutionClient>,
+    ws_url: String,
+    private_tx: mpsc::Sender<BrokerEvent>,
+    private_connection_flag: Option<Arc<AtomicBool>>,
+    metrics: Arc<LiveMetrics>,
+    shutdown: ShutdownSignal,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Some(binance) = exec_client
+                .as_ref()
+                .as_any()
+                .downcast_ref::<BinanceClient>()
+            else {
+                warn!("execution client is not Binance");
+                return;
+            };
+            let listen_key = match binance.start_user_stream().await {
+                Ok(key) => key,
+                Err(err) => {
+                    error!("failed to start Binance user stream: {err}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            match BinanceUserDataStream::connect(&ws_url, &listen_key).await {
+                Ok(user_stream) => {
+                    if let Some(flag) = &private_connection_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    metrics.update_connection_status("private", true);
+                    let (reconnect_tx, mut reconnect_rx) = mpsc::channel(1);
+                    let tx_orders = private_tx.clone();
+                    user_stream.on_event(move |event| {
+                        if let Some(update) = extract_order_update(&event) {
+                            if let Some(order) = order_from_update(update) {
+                                let _ = tx_orders.blocking_send(BrokerEvent::OrderUpdate(order));
+                            }
+                            if let Some(fill) = fill_from_update(update) {
+                                let _ = tx_orders.blocking_send(BrokerEvent::Fill(fill));
+                            }
+                        }
+                        if matches!(event, UserDataStreamEventsResponse::ListenKeyExpired(_)) {
+                            let _ = reconnect_tx.try_send(());
+                        }
+                    });
+                    let keepalive_client = exec_client.clone();
+                    let keepalive_handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
+                        loop {
+                            interval.tick().await;
+                            let Some(client) = keepalive_client
+                                .as_ref()
+                                .as_any()
+                                .downcast_ref::<BinanceClient>()
+                            else {
+                                break;
+                            };
+                            if client.keepalive_user_stream().await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    tokio::select! {
+                        _ = reconnect_rx.recv() => {
+                            warn!("binance listen key expired; reconnecting");
+                        }
+                        _ = shutdown.wait() => {
+                            keepalive_handle.abort();
+                            let _ = user_stream.unsubscribe().await;
+                            return;
+                        }
+                    }
+                    keepalive_handle.abort();
+                    let _ = user_stream.unsubscribe().await;
+                }
+                Err(err) => {
+                    error!("failed to connect to Binance user stream: {err}");
+                }
+            }
+            if let Some(flag) = &private_connection_flag {
+                flag.store(false, Ordering::SeqCst);
+            }
+            metrics.update_connection_status("private", false);
+            if shutdown.triggered() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 }

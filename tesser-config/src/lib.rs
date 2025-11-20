@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 mod deserializer;
 
@@ -40,7 +41,7 @@ pub struct BacktestConfig {
     pub markets_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct ExchangeConfig {
     pub rest_url: String,
     pub ws_url: String,
@@ -48,6 +49,10 @@ pub struct ExchangeConfig {
     pub api_key: String,
     #[serde(default)]
     pub api_secret: String,
+    #[serde(default = "default_exchange_driver_name")]
+    pub driver: String,
+    #[serde(default, flatten)]
+    pub params: Value,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -152,6 +157,10 @@ fn default_initial_balances() -> HashMap<String, Decimal> {
     let mut balances = HashMap::new();
     balances.insert(default_reporting_currency(), default_equity());
     balances
+}
+
+fn default_exchange_driver_name() -> String {
+    "bybit".to_string()
 }
 
 fn default_state_path() -> PathBuf {

@@ -1,7 +1,12 @@
+#![allow(ambiguous_glob_reexports)]
+
 //! Tesser aggregate crate that re-exports the main components for downstream users.
 
 pub use tesser_backtester as backtester;
+#[cfg(feature = "binance")]
+pub use tesser_binance as binance;
 pub use tesser_broker as broker;
+#[cfg(feature = "bybit")]
 pub use tesser_bybit as bybit;
 pub use tesser_cli;
 pub use tesser_config as config;
@@ -24,7 +29,10 @@ pub async fn run_cli() -> anyhow::Result<()> {
 /// Convenience prelude to pull commonly used items into scope.
 pub mod prelude {
     pub use tesser_backtester::{BacktestConfig, BacktestMode, BacktestReport, Backtester};
+    #[cfg(feature = "binance")]
+    pub use tesser_binance::*;
     pub use tesser_broker::*;
+    #[cfg(feature = "bybit")]
     pub use tesser_bybit::*;
     pub use tesser_config::*;
     pub use tesser_core::*;

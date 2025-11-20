@@ -11,9 +11,35 @@ description: All knobs that shape a Tesser deployment.
 
 ## Key Sections
 
-- `[execution]` – Selects the connector (`paper`, `bybit`) and execution hints per strategy.
+- `[execution]` – Selects the connector driver (`paper`, `bybit`, `binance`, …) and execution hints per strategy.
 - `[risk]` – Max drawdown, per-asset notional caps, and participation throttles.
 - `[data]` – Market data adapters, retention windows, and replay options.
+- `[exchange.<name>]` – REST/WebSocket endpoints, credentials, plus arbitrary connector-specific parameters captured under a `driver` string. Everything under the table is forwarded to the connector factory, so you can add keys without editing core code.
+
+### Connector Drivers and Parameters
+
+Each `[exchange.<name>]` entry defines a logical profile. At minimum you provide the REST/WS URLs and a `driver` matching a registered connector factory. The remaining fields are passed through as a JSON object to the factory, so you can include custom keys without touching Rust.
+
+For example, the built-in “paper sandbox” profile ships with:
+
+```toml
+[exchange.paper_sandbox]
+driver = "paper"
+rest_url = "sandbox"
+ws_url = "sandbox"
+balance_currency = "USDT"
+initial_balance = 10000.0
+slippage_bps = 0.0
+fee_bps = 0.0
+
+[exchange.paper_sandbox.market]
+mode = "random_walk"
+start_price = 25000.0
+volatility = 0.003
+interval_ms = 500
+```
+
+Because the paper connector understands `balance_currency`, `initial_balance`, and the nested `market` configuration, you can tune its behavior without changing code. Custom connectors follow the same pattern: expose whatever JSON fields you need, and deserialize them inside your `ConnectorFactory` implementation.
 
 ## Overrides
 

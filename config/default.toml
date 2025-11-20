@@ -17,15 +17,49 @@ max_order_quantity = 1.0
 max_position_quantity = 2.0
 max_drawdown = 0.05
 
+[exchange.paper_sandbox]
+driver = "paper"
+rest_url = "sandbox"
+ws_url = "sandbox"
+api_key = ""
+api_secret = ""
+symbol = "BTCUSDT"
+balance_currency = "USDT"
+initial_balance = 10000.0
+slippage_bps = 0.0
+fee_bps = 0.0
+
+[exchange.paper_sandbox.market]
+mode = "random_walk"
+start_price = 25000.0
+volatility = 0.003
+interval_ms = 500
+
 [exchange.bybit_testnet]
+driver = "bybit"
 rest_url = "https://api-testnet.bybit.com"
 ws_url = "wss://stream-testnet.bybit.com"
 api_key = ""
 api_secret = ""
 
 [exchange.bybit_mainnet]
+driver = "bybit"
 rest_url = "https://api.bybit.com"
 ws_url = "wss://stream.bybit.com"
+api_key = ""
+api_secret = ""
+
+[exchange.binance_testnet]
+driver = "binance"
+rest_url = "https://testnet.binancefuture.com"
+ws_url = "wss://stream.binancefuture.com/stream"
+api_key = ""
+api_secret = ""
+
+[exchange.binance_mainnet]
+driver = "binance"
+rest_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com/stream"
 api_key = ""
 api_secret = ""
 
