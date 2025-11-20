@@ -190,7 +190,7 @@ jobs:
             archive: zip
             artifact_suffix: x86_64-pc-windows-msvc
             use_cross: false
-            setup_cmd: ''
+            setup_cmd: choco install openssl --no-progress
             cli_features: ''
     steps:
       - name: Checkout repository
@@ -211,6 +211,18 @@ jobs:
       - name: Install system dependencies
         if: matrix.setup_cmd != ''
         run: ${{ matrix.setup_cmd }}
+
+      - name: Configure OpenSSL on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $openssl = 'C:\Program Files\OpenSSL-Win64'
+          if (!(Test-Path $openssl)) {
+            throw "OpenSSL not found at $openssl"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_DIR=$openssl"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_LIB_DIR=$openssl\lib"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_INCLUDE_DIR=$openssl\include"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
