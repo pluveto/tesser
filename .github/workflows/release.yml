@@ -212,12 +212,9 @@ jobs:
         if: runner.os == 'Linux' && matrix.setup_cmd != ''
         run: ${{ matrix.setup_cmd }}
 
-      - name: Install OpenSSL via vcpkg (Windows)
+      - name: Install NASM (Windows vendored OpenSSL)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          vcpkg install openssl:x64-windows-static-md
-          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_NO_VENDOR=1"
+        run: choco install nasm -y --no-progress
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
