@@ -7,7 +7,7 @@
 * **Hardware Agnostic**: Switch between CPU (AVX-512), CUDA, and TensorRT using configuration only—no code changes required.
 * **Zero-Copy Dataflow**: `FeatureBuffer` maps market data directly into ONNX Runtime tensors without heap allocations in the hot path.
 * **Stateful Inference**: Optimized for time-series models such as LSTM/GRU with efficient warm-up and hidden state management.
-* **Microsecond Latency**: Tuned for CPU cache locality, consistently delivering <25 μs inference latency on commodity hardware.
+* **Microsecond Latency**: Tuned for CPU cache locality, consistently delivering &lt;25 μs inference latency on commodity hardware.
 
 ## Usage
 
