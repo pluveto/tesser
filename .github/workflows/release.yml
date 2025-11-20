@@ -56,16 +56,17 @@ jobs:
         run: cargo check --release
 
   # 2. State Mutation Phase
-  tag-and-push:
-    name: Bump Version and Tag
+  bump-version:
+    name: Bump Version
     needs: check-dry-run
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
-      tag_name: ${{ steps.tag.outputs.tag_name }}
-      is_prerelease: ${{ steps.tag.outputs.is_prerelease }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
       changelog: ${{ steps.changelog.outputs.body }}
+      commit_sha: ${{ steps.version.outputs.commit_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -97,24 +98,17 @@ jobs:
         # --no-confirm: Crucial for CI automation
         run: cargo release ${{ github.event.inputs.version }} --execute --no-publish --no-push --no-confirm --no-tag
 
-      - name: Create Single Tag and Detect Prerelease
-        id: tag
+      - name: Determine release version
+        id: version
         shell: bash
         run: |
-          # 1. Get exact version from Cargo metadata
           VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r ".packages[] | select(.name == \"${{ env.PACKAGE_NAME }}\") | .version")
-          
           if [ -z "$VERSION" ]; then
             echo "::error::Could not determine version!"
             exit 1
           fi
-          
+
           TAG="v$VERSION"
-          
-          # 2. Manually create tag
-          git tag -a "$TAG" -m "Release $TAG"
-          
-          # 3. Detect if this is a pre-release (contains a hyphen, e.g., 0.2.0-alpha.1)
           if [[ "$VERSION" == *"-"* ]]; then
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
             echo "Detected PRE-RELEASE version."
@@ -122,8 +116,9 @@ jobs:
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
             echo "Detected STABLE version."
           fi
-          
+
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Generate changelog
         id: changelog
@@ -136,12 +131,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Push changes
-        run: git push origin HEAD:refs/heads/main --tags
+        run: git push origin HEAD:refs/heads/main
 
   # 3. Build Phase
   build-artifacts:
     name: Build Artifacts
-    needs: tag-and-push
+    needs: bump-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -181,7 +176,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.tag-and-push.outputs.tag_name }}
+          ref: ${{ needs.bump-version.outputs.commit_sha }}
 
       - name: Install system dependencies
         if: matrix.setup_cmd != ''
@@ -220,7 +215,7 @@ jobs:
             CLI_NAME="${{ env.PACKAGE_NAME }}.exe"
           fi
           
-          ARTIFACT_NAME="${{ env.PACKAGE_NAME }}-${{ needs.tag-and-push.outputs.tag_name }}-${{ matrix.artifact_suffix }}"
+          ARTIFACT_NAME="${{ env.PACKAGE_NAME }}-${{ needs.bump-version.outputs.tag_name }}-${{ matrix.artifact_suffix }}"
           mkdir -p "$ARTIFACT_NAME"
           
           cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_NAME/"
@@ -245,7 +240,7 @@ jobs:
   # 4. Publication Phase
   publish-final:
     name: Publish to Registry and GitHub
-    needs: [tag-and-push, build-artifacts]
+    needs: [bump-version, build-artifacts]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -253,7 +248,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.tag-and-push.outputs.tag_name }}
+          ref: ${{ needs.bump-version.outputs.commit_sha }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Create and push tag
+        env:
+          TAG_NAME: ${{ needs.bump-version.outputs.tag_name }}
+        run: |
+          git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+          git push origin "$TAG_NAME"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -274,13 +281,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ needs.tag-and-push.outputs.tag_name }}
-          name: ${{ needs.tag-and-push.outputs.tag_name }}
-          body: ${{ needs.tag-and-push.outputs.changelog }}
+          tag_name: ${{ needs.bump-version.outputs.tag_name }}
+          name: ${{ needs.bump-version.outputs.tag_name }}
+          body: ${{ needs.bump-version.outputs.changelog }}
           files: dist/*
           draft: false
           # Automatically check the "Prerelease" box if it is alpha/beta/rc
-          prerelease: ${{ needs.tag-and-push.outputs.is_prerelease }}
+          prerelease: ${{ needs.bump-version.outputs.is_prerelease }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute publish order
@@ -316,7 +323,7 @@ jobs:
                 published=true
                 break
               fi
-              if curl -sSf "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null; then
+          if curl -sSf "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null; then
                 echo "::warning::${crate} v${version} already published, skipping"
                 published=true
                 break
@@ -341,8 +348,8 @@ jobs:
     name: Publish SDKs
     needs:
       - publish-final
-      - tag-and-push
+      - bump-version
     uses: ./.github/workflows/publish-sdks.yml
     with:
-      ref: ${{ needs.tag-and-push.outputs.tag_name }}
+      ref: ${{ needs.bump-version.outputs.tag_name }}
     secrets: inherit
