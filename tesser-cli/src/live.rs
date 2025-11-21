@@ -1437,6 +1437,7 @@ async fn process_candle_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_order_book_event(
     book: OrderBook,
     strategy: Arc<Mutex<Box<dyn Strategy>>>,
