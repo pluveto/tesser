@@ -372,7 +372,7 @@ impl<E: SinkEncoder> DataSink<E> {
 
     async fn push(&mut self, record: E::Record) -> Result<()> {
         let partition = E::partition_for(&record);
-        if self.partition.map_or(true, |current| current != partition) {
+        if self.partition != Some(partition) {
             self.flush().await?;
             self.close_writer().await?;
             self.partition = Some(partition);

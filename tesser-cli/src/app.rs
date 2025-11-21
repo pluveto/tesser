@@ -354,7 +354,7 @@ impl DataInspectParquetArgs {
         };
         let file = File::open(&self.path)
             .with_context(|| format!("failed to open {}", self.path.display()))?;
-        let batch_size = limit.min(8192).max(1);
+        let batch_size = limit.clamp(1, 8192);
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_batch_size(batch_size)
             .build()?;
