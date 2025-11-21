@@ -368,7 +368,7 @@ fn side_sign(side: Side) -> Decimal {
     }
 }
 
-fn collect_parquet_files(dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn collect_parquet_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }

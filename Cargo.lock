@@ -3677,6 +3677,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures",
  "itertools 0.13.0",
  "rust_decimal",
  "tesser-broker",

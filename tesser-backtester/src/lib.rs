@@ -4,17 +4,20 @@ pub mod reporting;
 
 use std::{
     collections::{HashMap, VecDeque},
+    pin::Pin,
     sync::Arc,
 };
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
+use futures::{stream, Stream, StreamExt};
 use reporting::{PerformanceReport, Reporter};
 use rust_decimal::Decimal;
 use tesser_broker::MarketStream;
 use tesser_core::{
     Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
 };
+use tesser_data::merger::{UnifiedEvent, UnifiedEventKind};
 use tesser_execution::{ExecutionEngine, RiskContext};
 use tesser_markets::MarketRegistry;
 use tesser_paper::{MatchingEngine, PaperExecutionClient};
@@ -25,7 +28,6 @@ use tracing::{info, warn};
 /// Configuration used by the backtest harness.
 pub struct BacktestConfig {
     pub symbol: Symbol,
-    pub lob_events: Vec<MarketEvent>,
     pub order_quantity: Quantity,
     pub history: usize,
     pub initial_balances: HashMap<Symbol, Decimal>,
@@ -39,7 +41,6 @@ impl BacktestConfig {
     pub fn new(symbol: Symbol) -> Self {
         Self {
             symbol,
-            lob_events: Vec::new(),
             order_quantity: Decimal::ONE,
             history: 512,
             initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
@@ -98,6 +99,28 @@ pub enum MarketEventKind {
     Trade(Tick),
 }
 
+impl From<UnifiedEvent> for MarketEvent {
+    fn from(event: UnifiedEvent) -> Self {
+        let kind = match event.kind {
+            UnifiedEventKind::OrderBook(book) => MarketEventKind::OrderBook(book),
+            UnifiedEventKind::Depth(update) => MarketEventKind::Depth(update),
+            UnifiedEventKind::Trade(trade) => MarketEventKind::Trade(trade),
+        };
+        Self {
+            timestamp: event.timestamp,
+            kind,
+        }
+    }
+}
+
+/// Stream type alias used for LOB-driven backtests.
+pub type MarketEventStream = Pin<Box<dyn Stream<Item = anyhow::Result<MarketEvent>> + Send>>;
+
+/// Convenience helper to wrap iterators of market events.
+pub fn stream_from_events(events: Vec<MarketEvent>) -> MarketEventStream {
+    Box::pin(stream::iter(events.into_iter().map(Ok)))
+}
+
 /// Summary metrics returned after a backtest completes.
 pub struct BacktestReport {
     pub signals_emitted: usize,
@@ -119,6 +142,7 @@ pub struct Backtester {
     pending: VecDeque<PendingFill>,
     matching_engine: Option<Arc<MatchingEngine>>,
     market_stream: Option<BacktestStream>,
+    lob_stream: Option<MarketEventStream>,
     candle_index: usize,
 }
 
@@ -136,6 +160,7 @@ impl Backtester {
         matching_engine: Option<Arc<MatchingEngine>>,
         market_registry: Arc<MarketRegistry>,
         market_stream: Option<BacktestStream>,
+        lob_stream: Option<MarketEventStream>,
     ) -> Self {
         let portfolio_config = PortfolioConfig {
             initial_balances: config.initial_balances.clone(),
@@ -151,6 +176,7 @@ impl Backtester {
             pending: VecDeque::new(),
             matching_engine,
             market_stream,
+            lob_stream,
             candle_index: 0,
         }
     }
@@ -375,8 +401,18 @@ impl Backtester {
         let mut all_fills = Vec::new();
         let mut last_trade_price: Option<Price> = None;
 
-        let events = self.config.lob_events.clone();
-        for event in events {
+        loop {
+            let next_event = {
+                let stream = self
+                    .lob_stream
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("tick mode requires a market event stream"))?;
+                stream.next().await
+            };
+            let Some(event) = next_event else {
+                break;
+            };
+            let event = event?;
             match &event.kind {
                 MarketEventKind::OrderBook(book) => {
                     matching.load_market_snapshot(book);

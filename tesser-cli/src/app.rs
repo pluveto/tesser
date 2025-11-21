@@ -20,6 +20,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use csv::Writer;
+use futures::StreamExt;
 use rust_decimal::{
     prelude::{FromPrimitive, ToPrimitive},
     Decimal,
@@ -27,13 +28,15 @@ use rust_decimal::{
 use serde::{Deserialize, Serialize};
 use tesser_backtester::reporting::PerformanceReport;
 use tesser_backtester::{
-    BacktestConfig, BacktestMode, BacktestStream, Backtester, MarketEvent, MarketEventKind,
+    stream_from_events, BacktestConfig, BacktestMode, BacktestStream, Backtester, MarketEvent,
+    MarketEventKind, MarketEventStream,
 };
 use tesser_broker::ExecutionClient;
 use tesser_config::{load_config, AppConfig, RiskManagementConfig};
 use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
 use tesser_data::analytics::ExecutionAnalysisRequest;
 use tesser_data::download::{BinanceDownloader, BybitDownloader, KlineRequest};
+use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
 use tesser_execution::{
     ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
@@ -470,11 +473,16 @@ pub struct BacktestRunArgs {
     /// Selects the data source driving fills (`candle` or `tick`)
     #[arg(long, value_enum, default_value = "candle")]
     mode: BacktestModeArg,
-    /// One or more JSONL files containing tick/order book events (required for `--mode tick`)
+    /// One or more JSONL files or a flight-recorder directory containing tick/order book events (required for `--mode tick`)
     #[arg(long = "lob-data", value_name = "PATH", num_args = 0.., action = clap::ArgAction::Append)]
     lob_paths: Vec<PathBuf>,
     #[arg(long)]
     markets_file: Option<PathBuf>,
+}
+
+enum LobSource {
+    Json(Vec<PathBuf>),
+    FlightRecorder(PathBuf),
 }
 
 #[derive(Args)]
@@ -792,12 +800,12 @@ impl BacktestRunArgs {
             })?,
         );
 
-        let (market_stream, lob_events, execution_client, matching_engine) = match mode {
+        let (market_stream, event_stream, execution_client, matching_engine) = match mode {
             BacktestMode::Candle => {
                 let stream = self.build_candle_stream(&symbols)?;
                 (
                     Some(stream),
-                    Vec::new(),
+                    None,
                     Arc::new(PaperExecutionClient::default()) as Arc<dyn ExecutionClient>,
                     None,
                 )
@@ -806,18 +814,27 @@ impl BacktestRunArgs {
                 if self.lob_paths.is_empty() {
                     bail!("--lob-data is required when --mode tick");
                 }
-                let events = load_lob_events_from_paths(&self.lob_paths)?;
-                if events.is_empty() {
-                    bail!("no order book events loaded from --lob-data");
-                }
+                let source = self.detect_lob_source()?;
                 let engine = Arc::new(MatchingEngine::new(
                     "matching-engine",
                     symbols.clone(),
                     reporting_balance(&config.backtest),
                 ));
+                let stream = match source {
+                    LobSource::Json(paths) => {
+                        let events = load_lob_events_from_paths(&paths)?;
+                        if events.is_empty() {
+                            bail!("no order book events loaded from --lob-data");
+                        }
+                        stream_from_events(events)
+                    }
+                    LobSource::FlightRecorder(root) => self
+                        .build_flight_recorder_stream(&root, &symbols)
+                        .context("failed to initialize flight recorder stream")?,
+                };
                 (
                     None,
-                    events,
+                    Some(stream),
                     engine.clone() as Arc<dyn ExecutionClient>,
                     Some(engine),
                 )
@@ -829,7 +846,6 @@ impl BacktestRunArgs {
         let execution = ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
 
         let mut cfg = BacktestConfig::new(symbols[0].clone());
-        cfg.lob_events = lob_events;
         cfg.order_quantity = order_quantity;
         cfg.initial_balances = clone_initial_balances(&config.backtest);
         cfg.reporting_currency = config.backtest.reporting_currency.clone();
@@ -845,6 +861,7 @@ impl BacktestRunArgs {
             matching_engine,
             market_registry,
             market_stream,
+            event_stream,
         )
         .run()
         .await
@@ -881,6 +898,32 @@ impl BacktestRunArgs {
             }
             DataFormat::Parquet => Ok(parquet_market_stream(symbols, self.data_paths.clone())),
         }
+    }
+
+    fn detect_lob_source(&self) -> Result<LobSource> {
+        if self.lob_paths.len() == 1 {
+            let path = &self.lob_paths[0];
+            if path.is_dir() {
+                return Ok(LobSource::FlightRecorder(path.clone()));
+            }
+        }
+        if self.lob_paths.iter().all(|path| path.is_file()) {
+            return Ok(LobSource::Json(self.lob_paths.clone()));
+        }
+        bail!(
+            "tick mode expects either JSONL files or a single flight-recorder directory via --lob-data"
+        )
+    }
+
+    fn build_flight_recorder_stream(
+        &self,
+        root: &Path,
+        symbols: &[Symbol],
+    ) -> Result<MarketEventStream> {
+        let stream = UnifiedEventStream::from_flight_recorder(root, symbols)?
+            .into_stream()
+            .map(|event| event.map(MarketEvent::from));
+        Ok(Box::pin(stream))
     }
 }
 
@@ -950,6 +993,7 @@ impl BacktestBatchArgs {
                 None,
                 market_registry.clone(),
                 Some(stream),
+                None,
             )
             .run()
             .await

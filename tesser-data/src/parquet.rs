@@ -153,7 +153,7 @@ fn map_err(err: anyhow::Error) -> BrokerError {
     BrokerError::Other(err.to_string())
 }
 
-struct TickCursor {
+pub(crate) struct TickCursor {
     loader: BatchLoader,
     columns: Option<TickColumns>,
 }
@@ -161,14 +161,14 @@ struct TickCursor {
 unsafe impl Sync for TickCursor {}
 
 impl TickCursor {
-    fn new(paths: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             loader: BatchLoader::new(paths),
             columns: None,
         }
     }
 
-    async fn next(&mut self) -> Result<Option<Tick>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<Tick>> {
         loop {
             if !self.loader.ensure_batch().await? {
                 return Ok(None);
@@ -221,7 +221,7 @@ impl CandleCursor {
     }
 }
 
-struct OrderBookCursor {
+pub(crate) struct OrderBookCursor {
     loader: BatchLoader,
     columns: Option<OrderBookColumns>,
 }
@@ -229,14 +229,14 @@ struct OrderBookCursor {
 unsafe impl Sync for OrderBookCursor {}
 
 impl OrderBookCursor {
-    fn new(paths: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             loader: BatchLoader::new(paths),
             columns: None,
         }
     }
 
-    async fn next(&mut self) -> Result<Option<OrderBook>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<OrderBook>> {
         loop {
             if !self.loader.ensure_batch().await? {
                 return Ok(None);
@@ -255,7 +255,7 @@ impl OrderBookCursor {
     }
 }
 
-struct DepthCursor {
+pub(crate) struct DepthCursor {
     loader: BatchLoader,
     columns: Option<DepthColumns>,
 }
@@ -263,14 +263,14 @@ struct DepthCursor {
 unsafe impl Sync for DepthCursor {}
 
 impl DepthCursor {
-    fn new(paths: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             loader: BatchLoader::new(paths),
             columns: None,
         }
     }
 
-    async fn next(&mut self) -> Result<Option<DepthUpdate>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<DepthUpdate>> {
         loop {
             if !self.loader.ensure_batch().await? {
                 return Ok(None);

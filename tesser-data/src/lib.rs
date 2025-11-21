@@ -3,6 +3,7 @@
 pub mod analytics;
 pub mod download;
 pub mod encoding;
+pub mod merger;
 pub mod parquet;
 pub mod recorder;
 

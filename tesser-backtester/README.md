@@ -10,8 +10,12 @@ Event-driven simulation engine that replays historical data through strategies a
 ## Usage
 Most users drive the backtester through `tesser-cli backtest run`, but you can embed it yourself:
 ```rust
-let cfg = BacktestConfig::new(symbol.clone(), candles);
-let report = Backtester::new(cfg, strategy, execution, None).run().await?;
+let cfg = BacktestConfig::new(symbol.clone());
+let market_registry = Arc::new(MarketRegistry::load_from_file("config/markets.toml")?);
+let stream: BacktestStream = Box::new(PaperMarketStream::from_data(symbol.clone(), Vec::new(), candles));
+let report = Backtester::new(cfg, strategy, execution, None, market_registry, Some(stream), None)
+    .run()
+    .await?;
 ```
 
 ## Tests
