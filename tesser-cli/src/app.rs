@@ -25,17 +25,20 @@ use rust_decimal::{
 };
 use serde::{Deserialize, Serialize};
 use tesser_backtester::reporting::PerformanceReport;
-use tesser_backtester::{BacktestConfig, BacktestMode, Backtester, MarketEvent, MarketEventKind};
+use tesser_backtester::{
+    BacktestConfig, BacktestMode, BacktestStream, Backtester, MarketEvent, MarketEventKind,
+};
 use tesser_broker::ExecutionClient;
 use tesser_config::{load_config, AppConfig, RiskManagementConfig};
 use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
 use tesser_data::download::{BinanceDownloader, BybitDownloader, KlineRequest};
+use tesser_data::parquet::ParquetMarketStream;
 use tesser_execution::{
     ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
     RiskAdjustedSizer,
 };
 use tesser_markets::MarketRegistry;
-use tesser_paper::{MatchingEngine, PaperExecutionClient};
+use tesser_paper::{MatchingEngine, PaperExecutionClient, PaperMarketStream};
 use tesser_strategy::{builtin_strategy_names, load_strategy};
 use tracing::{info, warn};
 
@@ -738,36 +741,11 @@ impl BacktestRunArgs {
             })?,
         );
 
-        type CandleModeBundle = (
-            Vec<Candle>,
-            Vec<MarketEvent>,
-            Arc<dyn ExecutionClient>,
-            Option<Arc<MatchingEngine>>,
-        );
-
-        let (candles, lob_events, execution_client, matching_engine): CandleModeBundle = match mode
-        {
+        let (market_stream, lob_events, execution_client, matching_engine) = match mode {
             BacktestMode::Candle => {
-                let mut candles = if self.data_paths.is_empty() {
-                    let mut generated = Vec::new();
-                    for (idx, symbol) in symbols.iter().enumerate() {
-                        let offset = idx as i64 * 10;
-                        generated.extend(synth_candles(symbol, self.candles, offset));
-                    }
-                    generated
-                } else {
-                    load_candles_from_paths(&self.data_paths)?
-                };
-
-                if candles.is_empty() {
-                    return Err(anyhow!(
-                        "no candles loaded; provide --data or allow synthetic generation"
-                    ));
-                }
-
-                candles.sort_by_key(|c| c.timestamp);
+                let stream = self.build_candle_stream(&symbols)?;
                 (
-                    candles,
+                    Some(stream),
                     Vec::new(),
                     Arc::new(PaperExecutionClient::default()) as Arc<dyn ExecutionClient>,
                     None,
@@ -787,7 +765,7 @@ impl BacktestRunArgs {
                     reporting_balance(&config.backtest),
                 ));
                 (
-                    Vec::new(),
+                    None,
                     events,
                     engine.clone() as Arc<dyn ExecutionClient>,
                     Some(engine),
@@ -799,7 +777,7 @@ impl BacktestRunArgs {
         let order_quantity = self.quantity;
         let execution = ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
 
-        let mut cfg = BacktestConfig::new(symbols[0].clone(), candles);
+        let mut cfg = BacktestConfig::new(symbols[0].clone());
         cfg.lob_events = lob_events;
         cfg.order_quantity = order_quantity;
         cfg.initial_balances = clone_initial_balances(&config.backtest);
@@ -809,12 +787,49 @@ impl BacktestRunArgs {
         cfg.execution.latency_candles = self.latency_candles.max(1);
         cfg.mode = mode;
 
-        let report = Backtester::new(cfg, strategy, execution, matching_engine, market_registry)
-            .run()
-            .await
-            .context("backtest failed")?;
+        let report = Backtester::new(
+            cfg,
+            strategy,
+            execution,
+            matching_engine,
+            market_registry,
+            market_stream,
+        )
+        .run()
+        .await
+        .context("backtest failed")?;
         print_report(&report);
         Ok(())
+    }
+
+    fn build_candle_stream(&self, symbols: &[Symbol]) -> Result<BacktestStream> {
+        if symbols.is_empty() {
+            bail!("strategy did not declare any subscriptions");
+        }
+        if self.data_paths.is_empty() {
+            let mut generated = Vec::new();
+            for (idx, symbol) in symbols.iter().enumerate() {
+                let offset = idx as i64 * 10;
+                generated.extend(synth_candles(symbol, self.candles, offset));
+            }
+            generated.sort_by_key(|c| c.timestamp);
+            if generated.is_empty() {
+                bail!("no synthetic candles generated; provide --data files instead");
+            }
+            return Ok(memory_market_stream(&symbols[0], generated));
+        }
+
+        match detect_data_format(&self.data_paths)? {
+            DataFormat::Csv => {
+                let mut candles = load_candles_from_paths(&self.data_paths)?;
+                if candles.is_empty() {
+                    bail!("no candles loaded from --data paths");
+                }
+                candles.sort_by_key(|c| c.timestamp);
+                Ok(memory_market_stream(&symbols[0], candles))
+            }
+            DataFormat::Parquet => Ok(parquet_market_stream(symbols, self.data_paths.clone())),
+        }
     }
 }
 
@@ -838,6 +853,7 @@ impl BacktestBatchArgs {
                 format!("failed to load markets from {}", markets_path.display())
             })?,
         );
+        let data_format = detect_data_format(&self.data_paths)?;
         let mut aggregated = Vec::new();
         for config_path in &self.config_paths {
             let contents = std::fs::read_to_string(config_path).with_context(|| {
@@ -849,13 +865,26 @@ impl BacktestBatchArgs {
                 .with_context(|| format!("failed to configure strategy {}", def.name))?;
             let sizer = parse_sizer(&self.sizer, Some(self.quantity))?;
             let order_quantity = self.quantity;
-            let mut candles = load_candles_from_paths(&self.data_paths)?;
-            candles.sort_by_key(|c| c.timestamp);
+            let symbols = strategy.subscriptions();
+            if symbols.is_empty() {
+                bail!("strategy {} did not declare subscriptions", strategy.name());
+            }
+            let stream = match data_format {
+                DataFormat::Csv => {
+                    let mut candles = load_candles_from_paths(&self.data_paths)?;
+                    if candles.is_empty() {
+                        bail!("no candles loaded from --data paths");
+                    }
+                    candles.sort_by_key(|c| c.timestamp);
+                    memory_market_stream(&symbols[0], candles)
+                }
+                DataFormat::Parquet => parquet_market_stream(&symbols, self.data_paths.clone()),
+            };
             let execution_client: Arc<dyn ExecutionClient> =
                 Arc::new(PaperExecutionClient::default());
             let execution =
                 ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
-            let mut cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
+            let mut cfg = BacktestConfig::new(symbols[0].clone());
             cfg.order_quantity = order_quantity;
             cfg.initial_balances = clone_initial_balances(&config.backtest);
             cfg.reporting_currency = config.backtest.reporting_currency.clone();
@@ -863,10 +892,17 @@ impl BacktestBatchArgs {
             cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
             cfg.execution.latency_candles = self.latency_candles.max(1);
 
-            let report = Backtester::new(cfg, strategy, execution, None, market_registry.clone())
-                .run()
-                .await
-                .with_context(|| format!("backtest failed for {}", config_path.display()))?;
+            let report = Backtester::new(
+                cfg,
+                strategy,
+                execution,
+                None,
+                market_registry.clone(),
+                Some(stream),
+            )
+            .run()
+            .await
+            .with_context(|| format!("backtest failed for {}", config_path.display()))?;
             aggregated.push(BatchRow {
                 config: config_path.display().to_string(),
                 signals: 0, // Legacy field, can be removed or calculated from report
@@ -1164,6 +1200,48 @@ fn load_candles_from_paths(paths: &[PathBuf]) -> Result<Vec<Candle>> {
         }
     }
     Ok(candles)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataFormat {
+    Csv,
+    Parquet,
+}
+
+fn detect_data_format(paths: &[PathBuf]) -> Result<DataFormat> {
+    let mut detected: Option<DataFormat> = None;
+    for path in paths {
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .unwrap_or_else(|| String::from(""));
+        let current = if ext == "parquet" {
+            DataFormat::Parquet
+        } else {
+            DataFormat::Csv
+        };
+        if let Some(existing) = detected {
+            if existing != current {
+                bail!("cannot mix CSV and Parquet inputs in --data");
+            }
+        } else {
+            detected = Some(current);
+        }
+    }
+    detected.ok_or_else(|| anyhow!("no data paths provided"))
+}
+
+fn memory_market_stream(symbol: &str, candles: Vec<Candle>) -> BacktestStream {
+    Box::new(PaperMarketStream::from_data(
+        symbol.to_string(),
+        Vec::new(),
+        candles,
+    ))
+}
+
+fn parquet_market_stream(symbols: &[Symbol], paths: Vec<PathBuf>) -> BacktestStream {
+    Box::new(ParquetMarketStream::with_candles(symbols.to_vec(), paths))
 }
 
 #[derive(Deserialize)]

@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use reporting::{PerformanceReport, Reporter};
 use rust_decimal::Decimal;
+use tesser_broker::MarketStream;
 use tesser_core::{
     Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
 };
@@ -24,7 +25,6 @@ use tracing::{info, warn};
 /// Configuration used by the backtest harness.
 pub struct BacktestConfig {
     pub symbol: Symbol,
-    pub candles: Vec<Candle>,
     pub lob_events: Vec<MarketEvent>,
     pub order_quantity: Quantity,
     pub history: usize,
@@ -36,10 +36,9 @@ pub struct BacktestConfig {
 
 impl BacktestConfig {
     /// Convenience constructor for a single symbol.
-    pub fn new(symbol: Symbol, candles: Vec<Candle>) -> Self {
+    pub fn new(symbol: Symbol) -> Self {
         Self {
             symbol,
-            candles,
             lob_events: Vec::new(),
             order_quantity: Decimal::ONE,
             history: 512,
@@ -107,6 +106,9 @@ pub struct BacktestReport {
     pub dropped_orders: usize,
 }
 
+/// Trait object used by the streaming backtester to read recorded market data.
+pub type BacktestStream = Box<dyn MarketStream<Subscription = ()> + Send + Sync>;
+
 /// The engine wiring strategies to execution and portfolio components.
 pub struct Backtester {
     config: BacktestConfig,
@@ -116,11 +118,13 @@ pub struct Backtester {
     portfolio: Portfolio,
     pending: VecDeque<PendingFill>,
     matching_engine: Option<Arc<MatchingEngine>>,
+    market_stream: Option<BacktestStream>,
+    candle_index: usize,
 }
 
 struct PendingFill {
     order: Order,
-    due_index: usize,
+    due_after: usize,
 }
 
 impl Backtester {
@@ -131,6 +135,7 @@ impl Backtester {
         execution: ExecutionEngine,
         matching_engine: Option<Arc<MatchingEngine>>,
         market_registry: Arc<MarketRegistry>,
+        market_stream: Option<BacktestStream>,
     ) -> Self {
         let portfolio_config = PortfolioConfig {
             initial_balances: config.initial_balances.clone(),
@@ -145,6 +150,8 @@ impl Backtester {
             execution,
             pending: VecDeque::new(),
             matching_engine,
+            market_stream,
+            candle_index: 0,
         }
     }
 
@@ -159,81 +166,138 @@ impl Backtester {
     async fn run_candle(&mut self) -> anyhow::Result<PerformanceReport> {
         let mut equity_curve: Vec<(DateTime<Utc>, Decimal)> = Vec::new();
         let mut all_fills = Vec::new();
+        if self.market_stream.is_none() {
+            return Err(anyhow!("candle mode requires a market stream"));
+        }
 
-        for idx in 0..self.config.candles.len() {
-            let candle = self.config.candles[idx].clone();
+        loop {
+            let mut progressed = false;
 
-            if let Some(paper_client) = self
-                .execution
-                .client()
-                .as_any()
-                .downcast_ref::<PaperExecutionClient>()
-            {
-                let triggered_fills = paper_client
-                    .check_triggers(&candle)
+            let tick = {
+                let stream = self
+                    .market_stream
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("market stream missing"))?;
+                stream.next_tick().await?
+            };
+            if let Some(tick) = tick {
+                self.handle_tick_event(tick)
                     .await
-                    .context("failed to check paper triggers")?;
-                for fill in triggered_fills {
-                    info!(
-                        order_id = %fill.order_id,
-                        price = %fill.fill_price,
-                        "triggered paper conditional order"
-                    );
-                    self.record_fill(&fill, &mut all_fills)
-                        .await
-                        .context("failed to record triggered fill")?;
-                }
+                    .context("failed to process tick event")?;
+                progressed = true;
             }
 
-            self.process_pending_fills(idx, &candle, &mut all_fills)
-                .await
-                .context("failed to settle pending fills")?;
-
-            self.strategy_ctx.push_candle(candle.clone());
-            self.strategy
-                .on_candle(&self.strategy_ctx, &candle)
-                .await
-                .context("strategy failed on candle")?;
-            let signals = self.strategy.drain_signals();
-            for signal in signals {
-                let ctx = RiskContext {
-                    signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
-                    portfolio_equity: self.portfolio.equity(),
-                    last_price: candle.close,
-                    liquidate_only: false,
-                };
-                if let Some(order) = self.execution.handle_signal(signal, ctx).await? {
-                    let latency = self.config.execution.latency_candles.max(1);
-                    let due_index = idx + latency;
-                    if due_index >= self.config.candles.len() {
-                        warn!(
-                            order_id = %order.id,
-                            due_index,
-                            "dropping order; not enough candles remain to honor latency"
-                        );
-                        continue;
-                    }
-                    self.pending.push_back(PendingFill { order, due_index });
-                }
+            let candle = {
+                let stream = self
+                    .market_stream
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("market stream missing"))?;
+                stream.next_candle().await?
+            };
+            if let Some(candle) = candle {
+                self.handle_candle_event(candle, &mut equity_curve, &mut all_fills)
+                    .await
+                    .context("failed to process candle event")?;
+                progressed = true;
             }
 
-            if let Err(err) = self
-                .portfolio
-                .update_market_data(&candle.symbol, candle.close)
-            {
-                warn!(
-                    symbol = %candle.symbol,
-                    error = %err,
-                    "failed to refresh market data"
-                );
+            if !progressed {
+                break;
             }
+        }
 
-            let equity = self.portfolio.equity();
-            equity_curve.push((candle.timestamp, equity));
+        if !self.pending.is_empty() {
+            warn!(
+                pending = self.pending.len(),
+                "pending fills remained when market stream ended"
+            );
         }
 
         let reporter = Reporter::new(self.portfolio.initial_equity(), equity_curve, all_fills);
         reporter.calculate()
+    }
+
+    async fn handle_tick_event(&mut self, tick: Tick) -> anyhow::Result<()> {
+        self.strategy_ctx.push_tick(tick.clone());
+        self.strategy
+            .on_tick(&self.strategy_ctx, &tick)
+            .await
+            .context("strategy failed on tick")?;
+        if let Err(err) = self.portfolio.update_market_data(&tick.symbol, tick.price) {
+            warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
+        }
+        Ok(())
+    }
+
+    async fn handle_candle_event(
+        &mut self,
+        candle: Candle,
+        equity_curve: &mut Vec<(DateTime<Utc>, Decimal)>,
+        all_fills: &mut Vec<Fill>,
+    ) -> anyhow::Result<()> {
+        let idx = self.candle_index;
+        self.candle_index += 1;
+
+        if let Some(paper_client) = self
+            .execution
+            .client()
+            .as_any()
+            .downcast_ref::<PaperExecutionClient>()
+        {
+            let triggered_fills = paper_client
+                .check_triggers(&candle)
+                .await
+                .context("failed to check paper triggers")?;
+            for fill in triggered_fills {
+                info!(
+                    order_id = %fill.order_id,
+                    price = %fill.fill_price,
+                    "triggered paper conditional order"
+                );
+                self.record_fill(&fill, all_fills)
+                    .await
+                    .context("failed to record triggered fill")?;
+            }
+        }
+
+        self.process_pending_fills(idx, &candle, all_fills)
+            .await
+            .context("failed to settle pending fills")?;
+
+        self.strategy_ctx.push_candle(candle.clone());
+        self.strategy
+            .on_candle(&self.strategy_ctx, &candle)
+            .await
+            .context("strategy failed on candle")?;
+        let signals = self.strategy.drain_signals();
+        for signal in signals {
+            let ctx = RiskContext {
+                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                portfolio_equity: self.portfolio.equity(),
+                last_price: candle.close,
+                liquidate_only: false,
+            };
+            if let Some(order) = self.execution.handle_signal(signal, ctx).await? {
+                let latency = self.config.execution.latency_candles.max(1);
+                let due_after = idx.saturating_add(latency);
+                self.pending.push_back(PendingFill { order, due_after });
+            }
+        }
+
+        if let Err(err) = self
+            .portfolio
+            .update_market_data(&candle.symbol, candle.close)
+        {
+            warn!(
+                symbol = %candle.symbol,
+                error = %err,
+                "failed to refresh market data"
+            );
+        }
+
+        let equity = self.portfolio.equity();
+        equity_curve.push((candle.timestamp, equity));
+        Ok(())
     }
 
     async fn process_pending_fills(
@@ -244,7 +308,7 @@ impl Backtester {
     ) -> anyhow::Result<()> {
         let mut remaining = VecDeque::new();
         while let Some(pending) = self.pending.pop_front() {
-            if pending.due_index == candle_index {
+            if pending.due_after <= candle_index {
                 let fill = self.build_fill(&pending.order, candle);
                 self.record_fill(&fill, all_fills)
                     .await

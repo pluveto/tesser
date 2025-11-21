@@ -2,6 +2,7 @@
 
 pub mod download;
 pub mod encoding;
+pub mod parquet;
 pub mod recorder;
 
 /// Data distribution utilities that consume [`tesser_broker::MarketStream`].
