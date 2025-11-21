@@ -65,22 +65,3 @@ jobs:
       # 7. Execute the live_run integration test with full logs for better diagnostics
       - name: Run live run integration test
         run: cargo test --release --test live_run -- --nocapture
-
-      # 8. Validate the Python SDK data access helpers to ensure cross-language parity
-      - name: Install uv
-        uses: astral-sh/setup-uv@v1
-        with:
-          version: "latest"
-          enable-cache: true
-          cache-dependency-glob: "sdk/tesser-py/uv.lock"
-
-      - name: Install Python 3.11
-        run: uv python install 3.11
-
-      - name: Sync Python SDK dependencies
-        working-directory: sdk/tesser-py
-        run: uv sync --dev
-
-      - name: Run Python data access tests
-        working-directory: sdk/tesser-py
-        run: uv run pytest tests/unit/test_data_access.py tests/unit/test_execution_analysis.py

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Sequence
+from typing import List, Sequence
 
 import pandas as pd
 
@@ -47,8 +47,9 @@ def calculate_slippage(
 
     fills = fills_df.copy()
     if "fee" not in fills:
-        fills["fee"] = ZERO
-    fills["fee"] = fills["fee"].apply(lambda value: value if value is not None else ZERO)
+        fills["fee"] = [ZERO for _ in range(len(fills))]
+    else:
+        fills["fee"] = [value if value is not None else ZERO for value in fills["fee"]]
     fills["notional"] = fills["fill_price"] * fills["fill_quantity"]
     fill_summary = (
         fills.groupby("order_id", dropna=False)
@@ -121,8 +122,9 @@ def summarize_fills(
     _require_columns(fills_df, set(group_cols), "fills")
     fills = fills_df.copy()
     if "fee" not in fills:
-        fills["fee"] = ZERO
-    fills["fee"] = fills["fee"].apply(lambda value: value if value is not None else ZERO)
+        fills["fee"] = [ZERO for _ in range(len(fills))]
+    else:
+        fills["fee"] = [value if value is not None else ZERO for value in fills["fee"]]
     fills["notional"] = fills["fill_price"] * fills["fill_quantity"]
 
     agg_kwargs = {
@@ -137,10 +139,13 @@ def summarize_fills(
         agg_kwargs["last_fill"] = ("timestamp", "max")
 
     grouped = fills.groupby(group_cols, dropna=False).agg(**agg_kwargs).reset_index()
-    grouped["avg_fill_price"] = grouped.apply(
-        lambda row: row["notional"] / row["filled_quantity"] if row["filled_quantity"] not in (ZERO, 0) else None,
-        axis=1,
-    )
+    avg_values: List[Decimal | None] = []
+    for notional, quantity in zip(grouped["notional"], grouped["filled_quantity"]):
+        if quantity in (ZERO, 0):
+            avg_values.append(None)
+        else:
+            avg_values.append(notional / quantity)
+    grouped["avg_fill_price"] = avg_values
     return grouped
 
 
@@ -230,5 +235,5 @@ def _arrival_prices(orders: pd.DataFrame, ticks_df: pd.DataFrame | None) -> pd.S
         allow_exact_matches=True,
     )
     arrivals = pd.Series([None] * len(orders), index=orders.index)
-    arrivals.loc[aligned["__order_idx"].values] = aligned["price"].values
+    arrivals.loc[aligned["__order_idx"]] = aligned["price"].values
     return arrivals

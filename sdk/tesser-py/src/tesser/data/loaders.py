@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, Sequence, Tuple, Union, TYPE_CHECKING
+from typing import Literal, Sequence, Tuple, Union, TYPE_CHECKING, cast
 
 import pandas as pd
 import pyarrow as pa
@@ -190,7 +190,7 @@ def _materialize(table, engine: Literal["pandas", "polars"]) -> FrameLike:
             import polars as pl
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("polars is not installed. Install the 'data' extra to enable it.") from exc
-        return pl.from_arrow(table)
+        return cast(FrameLike, pl.from_arrow(table))
     raise ValueError(f"unsupported engine '{engine}'")
 
 
@@ -207,5 +207,5 @@ def _empty_frame(
             import polars as pl
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("polars is not installed. Install the 'data' extra to enable it.") from exc
-        return pl.DataFrame({name: [] for name in names})
+        return cast(FrameLike, pl.DataFrame({name: [] for name in names}))
     raise ValueError(f"unsupported engine '{engine}'")
