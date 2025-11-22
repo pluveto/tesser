@@ -2,19 +2,41 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
-use serde_json;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{self, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
+/// Persisted algorithm snapshot stored by the orchestrator.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StoredAlgoState {
+    pub algo_type: String,
+    pub state: Value,
+}
+
+impl StoredAlgoState {
+    /// Decode a stored payload, tolerating legacy entries that only stored the raw state.
+    pub fn decode(value: Value) -> Self {
+        serde_json::from_value::<StoredAlgoState>(value.clone()).unwrap_or(StoredAlgoState {
+            algo_type: "TWAP".to_string(),
+            state: value,
+        })
+    }
+}
+
 /// Trait for persisting algorithm state.
 pub trait AlgoStateRepository: Send + Sync {
+    /// Structured payload saved by the repository.
+    type State: Serialize + DeserializeOwned + Send + Sync + 'static;
+
     /// Save algorithm state.
-    fn save(&self, id: &Uuid, state: serde_json::Value) -> Result<()>;
+    fn save(&self, id: &Uuid, state: &Self::State) -> Result<()>;
 
     /// Load all persisted algorithm states.
-    fn load_all(&self) -> Result<HashMap<Uuid, serde_json::Value>>;
+    fn load_all(&self) -> Result<HashMap<Uuid, Self::State>>;
 
     /// Delete algorithm state.
     fn delete(&self, id: &Uuid) -> Result<()>;
@@ -68,8 +90,10 @@ impl SqliteAlgoStateRepository {
 }
 
 impl AlgoStateRepository for SqliteAlgoStateRepository {
-    fn save(&self, id: &Uuid, state: serde_json::Value) -> Result<()> {
-        let payload = serde_json::to_string(&state)?;
+    type State = StoredAlgoState;
+
+    fn save(&self, id: &Uuid, state: &StoredAlgoState) -> Result<()> {
+        let payload = serde_json::to_string(state)?;
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -86,7 +110,7 @@ impl AlgoStateRepository for SqliteAlgoStateRepository {
         Ok(())
     }
 
-    fn load_all(&self) -> Result<HashMap<Uuid, serde_json::Value>> {
+    fn load_all(&self) -> Result<HashMap<Uuid, StoredAlgoState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, payload FROM algo_states")?;
 
@@ -101,7 +125,11 @@ impl AlgoStateRepository for SqliteAlgoStateRepository {
         for row in rows {
             let (id_str, payload_str) = row?;
             let id = Uuid::parse_str(&id_str)?;
-            let payload = serde_json::from_str(&payload_str)?;
+            let payload =
+                serde_json::from_str(&payload_str).or_else(|_| -> Result<StoredAlgoState> {
+                    let raw: Value = serde_json::from_str(&payload_str)?;
+                    Ok(StoredAlgoState::decode(raw))
+                })?;
             states.insert(id, payload);
         }
 
@@ -128,10 +156,13 @@ mod tests {
     fn test_save_and_load() -> Result<()> {
         let repo = SqliteAlgoStateRepository::new_in_memory()?;
         let id = Uuid::new_v4();
-        let state = json!({"status": "Working", "progress": 50});
+        let state = StoredAlgoState {
+            algo_type: "TWAP".to_string(),
+            state: json!({"status": "Working", "progress": 50}),
+        };
 
         // Save state
-        repo.save(&id, state.clone())?;
+        repo.save(&id, &state)?;
 
         // Load all states
         let states = repo.load_all()?;
@@ -145,14 +176,20 @@ mod tests {
     fn test_update_existing() -> Result<()> {
         let repo = SqliteAlgoStateRepository::new_in_memory()?;
         let id = Uuid::new_v4();
-        let initial_state = json!({"status": "Working", "progress": 25});
-        let updated_state = json!({"status": "Working", "progress": 75});
+        let initial_state = StoredAlgoState {
+            algo_type: "TWAP".to_string(),
+            state: json!({"status": "Working", "progress": 25}),
+        };
+        let updated_state = StoredAlgoState {
+            algo_type: "TWAP".to_string(),
+            state: json!({"status": "Working", "progress": 75}),
+        };
 
         // Save initial state
-        repo.save(&id, initial_state)?;
+        repo.save(&id, &initial_state)?;
 
         // Update state
-        repo.save(&id, updated_state.clone())?;
+        repo.save(&id, &updated_state)?;
 
         // Load and verify
         let states = repo.load_all()?;
@@ -166,10 +203,13 @@ mod tests {
     fn test_delete() -> Result<()> {
         let repo = SqliteAlgoStateRepository::new_in_memory()?;
         let id = Uuid::new_v4();
-        let state = json!({"status": "Cancelled"});
+        let state = StoredAlgoState {
+            algo_type: "TWAP".to_string(),
+            state: json!({"status": "Cancelled"}),
+        };
 
         // Save and verify
-        repo.save(&id, state)?;
+        repo.save(&id, &state)?;
         assert_eq!(repo.load_all()?.len(), 1);
 
         // Delete and verify

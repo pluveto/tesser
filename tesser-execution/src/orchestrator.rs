@@ -3,8 +3,6 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::Duration;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
@@ -14,7 +12,7 @@ use crate::algorithm::{
     AlgoStatus, ChildOrderRequest, ExecutionAlgorithm, IcebergAlgorithm, PeggedBestAlgorithm,
     SniperAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
-use crate::repository::AlgoStateRepository;
+use crate::repository::{AlgoStateRepository, StoredAlgoState};
 use crate::{ExecutionEngine, RiskContext};
 use tesser_core::{
     ExecutionHint, Fill, Order, OrderRequest, OrderStatus, Price, Quantity, Signal, Tick,
@@ -31,12 +29,6 @@ struct PendingOrder {
 
 pub const ORDER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
 pub const ORDER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(15);
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct StoredAlgoState {
-    algo_type: String,
-    state: serde_json::Value,
-}
 
 /// Core orchestrator for managing algorithmic order execution.
 ///
@@ -62,14 +54,14 @@ pub struct OrderOrchestrator {
     execution_engine: Arc<ExecutionEngine>,
 
     /// State persistence backend.
-    state_repo: Arc<dyn AlgoStateRepository>,
+    state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
 }
 
 impl OrderOrchestrator {
     /// Create a new orchestrator and restore any persisted algorithms.
     pub async fn new(
         execution_engine: Arc<ExecutionEngine>,
-        state_repo: Arc<dyn AlgoStateRepository>,
+        state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
         open_orders: Vec<Order>,
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
@@ -101,9 +93,8 @@ impl OrderOrchestrator {
 
         let mut restored = 0usize;
 
-        for (id, raw_state) in states {
-            let decoded = Self::decode_stored_state(raw_state);
-            match Self::instantiate_algorithm(&decoded.algo_type, decoded.state) {
+        for (id, stored) in states {
+            match Self::instantiate_algorithm(&stored.algo_type, stored.state.clone()) {
                 Ok(algo) => {
                     tracing::info!(
                         id = %id,
@@ -116,7 +107,7 @@ impl OrderOrchestrator {
                 Err(e) => {
                     tracing::warn!(
                         id = %id,
-                        algo_type = decoded.algo_type,
+                        algo_type = stored.algo_type,
                         error = %e,
                         "Failed to restore algorithm, deleting state"
                     );
@@ -210,13 +201,6 @@ impl OrderOrchestrator {
         }
 
         Ok(())
-    }
-
-    fn decode_stored_state(value: serde_json::Value) -> StoredAlgoState {
-        serde_json::from_value::<StoredAlgoState>(value.clone()).unwrap_or(StoredAlgoState {
-            algo_type: "TWAP".to_string(),
-            state: value,
-        })
     }
 
     fn instantiate_algorithm(
@@ -819,7 +803,7 @@ impl OrderOrchestrator {
             }
         };
 
-        self.state_repo.save(id, serde_json::to_value(payload)?)?;
+        self.state_repo.save(id, &payload)?;
         Ok(())
     }
 
