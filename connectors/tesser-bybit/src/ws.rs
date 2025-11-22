@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -26,7 +27,10 @@ use crate::{millis_to_datetime as parse_millis, BybitCredentials};
 type HmacSha256 = Hmac<Sha256>;
 
 use tesser_broker::{BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult, MarketStream};
-use tesser_core::{Candle, Fill, Interval, Order, OrderRequest, OrderType, Side, Tick};
+use tesser_core::{
+    Candle, Fill, Interval, LocalOrderBook, Order, OrderBook, OrderBookLevel, OrderRequest,
+    OrderType, Side, Tick,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum PublicChannel {
@@ -87,6 +91,7 @@ impl BybitSubscription {
     }
 }
 
+#[derive(Clone, Debug)]
 enum WsCommand {
     Subscribe(String),
     Shutdown,
@@ -119,6 +124,7 @@ impl BybitMarketStream {
             flag.store(true, Ordering::SeqCst);
         }
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let command_loop = command_tx.clone();
         let (tick_tx, tick_rx) = mpsc::channel(2048);
         let (candle_tx, candle_rx) = mpsc::channel(1024);
         let (order_book_tx, order_book_rx) = mpsc::channel(256);
@@ -127,6 +133,7 @@ impl BybitMarketStream {
             if let Err(err) = run_ws_loop(
                 ws,
                 command_rx,
+                command_loop,
                 tick_tx,
                 candle_tx,
                 order_book_tx,
@@ -279,9 +286,10 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 async fn run_ws_loop(
     mut socket: WsStream,
     mut commands: mpsc::UnboundedReceiver<WsCommand>,
+    command_tx: mpsc::UnboundedSender<WsCommand>,
     tick_tx: mpsc::Sender<Tick>,
     candle_tx: mpsc::Sender<Candle>,
-    order_book_tx: mpsc::Sender<tesser_core::OrderBook>,
+    order_book_tx: mpsc::Sender<OrderBook>,
     connection_status: Option<Arc<AtomicBool>>,
 ) -> BrokerResult<()> {
     let mut heartbeat = interval(Duration::from_secs(20));
@@ -290,6 +298,8 @@ async fn run_ws_loop(
     if let Some(flag) = &connection_status {
         flag.store(true, Ordering::SeqCst);
     }
+
+    let mut book_manager = BookManager::new(order_book_tx.clone(), command_tx);
 
     loop {
         tokio::select! {
@@ -311,7 +321,7 @@ async fn run_ws_loop(
                             .await
                             .map_err(|err| BrokerError::from_display(err, BrokerErrorKind::Transport))?;
                     }
-                    Some(Ok(message)) => handle_message(message, &tick_tx, &candle_tx, &order_book_tx).await?,
+                    Some(Ok(message)) => handle_message(message, &tick_tx, &candle_tx, &mut book_manager).await?,
                     Some(Err(err)) => return Err(BrokerError::from_display(err, BrokerErrorKind::Transport)),
                     None => break,
                 }
@@ -352,15 +362,15 @@ async fn handle_message(
     message: Message,
     tick_tx: &mpsc::Sender<Tick>,
     candle_tx: &mpsc::Sender<Candle>,
-    order_book_tx: &mpsc::Sender<tesser_core::OrderBook>,
+    book_manager: &mut BookManager,
 ) -> BrokerResult<()> {
     match message {
         Message::Text(text) => {
-            process_text_message(&text, tick_tx, candle_tx, order_book_tx).await;
+            process_text_message(&text, tick_tx, candle_tx, book_manager).await;
         }
         Message::Binary(bytes) => {
             if let Ok(text) = String::from_utf8(bytes) {
-                process_text_message(&text, tick_tx, candle_tx, order_book_tx).await;
+                process_text_message(&text, tick_tx, candle_tx, book_manager).await;
             } else {
                 warn!("received non UTF-8 binary payload from Bybit ws");
             }
@@ -384,7 +394,7 @@ async fn process_text_message(
     text: &str,
     tick_tx: &mpsc::Sender<Tick>,
     candle_tx: &mpsc::Sender<Candle>,
-    order_book_tx: &mpsc::Sender<tesser_core::OrderBook>,
+    book_manager: &mut BookManager,
 ) {
     if let Ok(value) = serde_json::from_str::<Value>(text) {
         if let Some(topic) = value.get("topic").and_then(|t| t.as_str()) {
@@ -398,7 +408,7 @@ async fn process_text_message(
                 }
             } else if topic.starts_with("orderbook") {
                 if let Ok(payload) = serde_json::from_value::<OrderbookMessage>(value.clone()) {
-                    forward_order_books(payload, order_book_tx).await;
+                    book_manager.handle(payload).await;
                 }
             } else if topic == "order" {
                 if let Ok(payload) = serde_json::from_value::<PrivateMessage<BybitWsOrder>>(value) {
@@ -583,58 +593,288 @@ fn parse_interval(value: &str) -> Option<Interval> {
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct OrderbookMessage {
-    #[serde(rename = "topic")]
-    _topic: String,
-    #[serde(rename = "type")]
-    _msg_type: String, // "snapshot" or "delta"
-    ts: i64,
-    data: OrderbookData,
+fn parse_levels(entries: &[[String; 2]]) -> Option<Vec<(Decimal, Decimal)>> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let price = entry.first()?.parse().ok()?;
+        let qty = entry.get(1)?.parse().ok()?;
+        out.push((price, qty));
+    }
+    Some(out)
+}
+
+fn parse_topic(topic: &str) -> Option<(usize, String)> {
+    let mut parts = topic.split('.');
+    let kind = parts.next()?;
+    if kind != "orderbook" {
+        return None;
+    }
+    let depth = parts.next()?.parse().ok()?;
+    let symbol = parts.next()?.to_string();
+    Some((depth, symbol))
 }
 
 #[derive(Deserialize, Debug)]
+struct OrderbookMessage {
+    topic: String,
+    #[serde(rename = "type")]
+    msg_type: String, // "snapshot" or "delta"
+    ts: i64,
+    data: Vec<OrderbookData>,
+}
+
+#[derive(Clone, Deserialize, Debug)]
 struct OrderbookData {
     s: String,
     b: Vec<[String; 2]>, // Bids
     a: Vec<[String; 2]>, // Asks
     #[serde(rename = "u")]
-    _u: i64,
+    update_id: i64,
+    #[serde(rename = "seq", default)]
+    seq: Option<i64>,
+    #[serde(rename = "prev_seq", default)]
+    prev_seq: Option<i64>,
+    #[serde(rename = "pu", default)]
+    prev_update_id: Option<i64>,
 }
 
-async fn forward_order_books(
-    payload: OrderbookMessage,
-    order_book_tx: &mpsc::Sender<tesser_core::OrderBook>,
-) {
-    // Note: For a production system, you'd want to maintain a local book and apply deltas.
-    // For simplicity here, we'll treat both snapshots and deltas as full snapshots,
-    // which is sufficient for many microstructure strategies that just need the latest state.
-    if let Some(book) = build_order_book(payload) {
-        if order_book_tx.send(book).await.is_err() {
-            warn!("dropping order book; downstream receiver closed");
+impl OrderbookData {
+    fn sequence(&self) -> i64 {
+        self.seq.unwrap_or(self.update_id)
+    }
+
+    fn previous_sequence(&self) -> Option<i64> {
+        self.prev_seq.or(self.prev_update_id)
+    }
+}
+
+struct BookManager {
+    streams: HashMap<String, SymbolBook>,
+    order_book_tx: mpsc::Sender<OrderBook>,
+    command_tx: mpsc::UnboundedSender<WsCommand>,
+}
+
+impl BookManager {
+    fn new(
+        order_book_tx: mpsc::Sender<OrderBook>,
+        command_tx: mpsc::UnboundedSender<WsCommand>,
+    ) -> Self {
+        Self {
+            streams: HashMap::new(),
+            order_book_tx,
+            command_tx,
+        }
+    }
+
+    async fn handle(&mut self, payload: OrderbookMessage) {
+        let Some((depth, _)) = parse_topic(&payload.topic) else {
+            return;
+        };
+        let Some(data) = payload.data.into_iter().next() else {
+            return;
+        };
+        let symbol = data.s.clone();
+        let stream = self
+            .streams
+            .entry(payload.topic.clone())
+            .or_insert_with(|| SymbolBook::new(payload.topic.clone(), symbol, depth));
+
+        match stream.ingest(payload.msg_type.as_str(), data, payload.ts) {
+            BookUpdate::Pending => {}
+            BookUpdate::OutOfSync => {
+                warn!(topic = %payload.topic, "order book sequence gap detected; resubscribing");
+                let _ = self.command_tx.send(WsCommand::Subscribe(payload.topic));
+            }
+            BookUpdate::Updates(mut books) => {
+                for book in books.drain(..) {
+                    if self.order_book_tx.send(book).await.is_err() {
+                        warn!("dropping order book; downstream receiver closed");
+                        break;
+                    }
+                }
+            }
         }
     }
 }
 
-fn build_order_book(msg: OrderbookMessage) -> Option<tesser_core::OrderBook> {
-    let to_levels = |entries: &[[String; 2]]| -> Vec<tesser_core::OrderBookLevel> {
-        entries
-            .iter()
-            .filter_map(|entry| {
-                Some(tesser_core::OrderBookLevel {
-                    price: entry.first()?.parse().ok()?,
-                    size: entry.get(1)?.parse().ok()?,
-                })
-            })
-            .collect()
-    };
+#[derive(Clone)]
+struct BookLevel {
+    price: Decimal,
+    quantity: Decimal,
+}
 
-    Some(tesser_core::OrderBook {
-        symbol: msg.data.s,
-        bids: to_levels(&msg.data.b),
-        asks: to_levels(&msg.data.a),
-        timestamp: millis_to_datetime(msg.ts)?,
-    })
+struct PendingDelta {
+    bids: Vec<BookLevel>,
+    asks: Vec<BookLevel>,
+    seq: i64,
+    prev_seq: Option<i64>,
+    ts: i64,
+}
+
+impl PendingDelta {
+    fn from_data(data: OrderbookData, ts: i64) -> Option<Self> {
+        let bids = parse_levels(&data.b)?
+            .into_iter()
+            .map(|(price, quantity)| BookLevel { price, quantity })
+            .collect();
+        let asks = parse_levels(&data.a)?
+            .into_iter()
+            .map(|(price, quantity)| BookLevel { price, quantity })
+            .collect();
+        Some(Self {
+            bids,
+            asks,
+            seq: data.sequence(),
+            prev_seq: data.previous_sequence(),
+            ts,
+        })
+    }
+}
+
+struct SymbolBook {
+    symbol: String,
+    depth: usize,
+    book: LocalOrderBook,
+    last_seq: Option<i64>,
+    synced: bool,
+    pending: Vec<PendingDelta>,
+}
+
+impl SymbolBook {
+    fn new(_topic: String, symbol: String, depth: usize) -> Self {
+        Self {
+            symbol,
+            depth,
+            book: LocalOrderBook::new(),
+            last_seq: None,
+            synced: false,
+            pending: Vec::new(),
+        }
+    }
+
+    fn ingest(&mut self, msg_type: &str, data: OrderbookData, ts: i64) -> BookUpdate {
+        match msg_type {
+            "snapshot" => self.apply_snapshot(data, ts),
+            "delta" => self.apply_delta(data, ts),
+            _ => BookUpdate::Pending,
+        }
+    }
+
+    fn apply_snapshot(&mut self, data: OrderbookData, ts: i64) -> BookUpdate {
+        let Some(snapshot_bids) = parse_levels(&data.b) else {
+            return BookUpdate::Pending;
+        };
+        let Some(snapshot_asks) = parse_levels(&data.a) else {
+            return BookUpdate::Pending;
+        };
+        self.book.load_snapshot(&snapshot_bids, &snapshot_asks);
+        self.last_seq = Some(data.sequence());
+        self.synced = true;
+        let mut updates = Vec::new();
+        if let Some(book) = self.snapshot(ts) {
+            updates.push(book);
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for delta in pending {
+            match self.apply_pending(delta) {
+                ApplyOutcome::Gap => return BookUpdate::OutOfSync,
+                ApplyOutcome::Updates(mut book_updates) => updates.append(&mut book_updates),
+                ApplyOutcome::Pending => {}
+            }
+        }
+        BookUpdate::Updates(updates)
+    }
+
+    fn apply_delta(&mut self, data: OrderbookData, ts: i64) -> BookUpdate {
+        let Some(delta) = PendingDelta::from_data(data, ts) else {
+            return BookUpdate::Pending;
+        };
+        if !self.synced {
+            self.pending.push(delta);
+            return BookUpdate::Pending;
+        }
+        match self.apply_pending(delta) {
+            ApplyOutcome::Gap => BookUpdate::OutOfSync,
+            ApplyOutcome::Pending => BookUpdate::Pending,
+            ApplyOutcome::Updates(updates) => BookUpdate::Updates(updates),
+        }
+    }
+
+    fn apply_pending(&mut self, delta: PendingDelta) -> ApplyOutcome {
+        if let Some(last) = self.last_seq {
+            if let Some(prev) = delta.prev_seq {
+                if prev != last {
+                    self.reset();
+                    return ApplyOutcome::Gap;
+                }
+            } else if delta.seq - 1 != last {
+                self.reset();
+                return ApplyOutcome::Gap;
+            }
+        } else {
+            self.pending.push(delta);
+            return ApplyOutcome::Pending;
+        }
+
+        for level in &delta.bids {
+            self.book
+                .apply_delta(Side::Buy, level.price, level.quantity);
+        }
+        for level in &delta.asks {
+            self.book
+                .apply_delta(Side::Sell, level.price, level.quantity);
+        }
+        self.last_seq = Some(delta.seq);
+
+        if let Some(book) = self.snapshot(delta.ts) {
+            ApplyOutcome::Updates(vec![book])
+        } else {
+            ApplyOutcome::Updates(Vec::new())
+        }
+    }
+
+    fn snapshot(&self, ts: i64) -> Option<OrderBook> {
+        if self.book.is_empty() {
+            return None;
+        }
+        let timestamp = millis_to_datetime(ts)?;
+        let bids = self
+            .book
+            .bid_levels(self.depth)
+            .into_iter()
+            .map(|(price, size)| OrderBookLevel { price, size })
+            .collect::<Vec<_>>();
+        let asks = self
+            .book
+            .ask_levels(self.depth)
+            .into_iter()
+            .map(|(price, size)| OrderBookLevel { price, size })
+            .collect::<Vec<_>>();
+        Some(OrderBook {
+            symbol: self.symbol.clone(),
+            bids,
+            asks,
+            timestamp,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.synced = false;
+        self.last_seq = None;
+        self.pending.clear();
+    }
+}
+
+enum ApplyOutcome {
+    Updates(Vec<OrderBook>),
+    Pending,
+    Gap,
+}
+
+enum BookUpdate {
+    Updates(Vec<OrderBook>),
+    Pending,
+    OutOfSync,
 }
 
 fn millis_to_datetime(value: i64) -> Option<DateTime<Utc>> {
@@ -735,5 +975,119 @@ impl BybitWsExecution {
             fee,
             timestamp,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_levels(levels: &[(&str, &str)]) -> Vec<[String; 2]> {
+        levels
+            .iter()
+            .map(|(price, qty)| [price.to_string(), qty.to_string()])
+            .collect()
+    }
+
+    fn sample_data(
+        symbol: &str,
+        bids: &[(&str, &str)],
+        asks: &[(&str, &str)],
+        seq: i64,
+        prev_seq: Option<i64>,
+    ) -> OrderbookData {
+        OrderbookData {
+            s: symbol.into(),
+            b: sample_levels(bids),
+            a: sample_levels(asks),
+            update_id: seq,
+            seq: Some(seq),
+            prev_seq,
+            prev_update_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn book_manager_applies_snapshot_and_deltas() {
+        let (book_tx, mut book_rx) = mpsc::channel(8);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = BookManager::new(book_tx, cmd_tx);
+
+        let snapshot = OrderbookMessage {
+            topic: "orderbook.2.BTCUSDT".into(),
+            msg_type: "snapshot".into(),
+            ts: 1,
+            data: vec![sample_data(
+                "BTCUSDT",
+                &[("100", "1"), ("99", "2")],
+                &[("101", "1"), ("102", "2")],
+                10,
+                Some(9),
+            )],
+        };
+        manager.handle(snapshot).await;
+        let first = book_rx.recv().await.expect("snapshot missing");
+        assert_eq!(first.bids[0].price, Decimal::from(100));
+        assert_eq!(first.asks[0].price, Decimal::from(101));
+
+        let delta = OrderbookMessage {
+            topic: "orderbook.2.BTCUSDT".into(),
+            msg_type: "delta".into(),
+            ts: 2,
+            data: vec![sample_data(
+                "BTCUSDT",
+                &[("100", "0"), ("98", "1")],
+                &[("101", "2")],
+                11,
+                Some(10),
+            )],
+        };
+        manager.handle(delta).await;
+        let update = book_rx.recv().await.expect("delta missing");
+        assert_eq!(update.bids.len(), 2);
+        assert_eq!(update.bids[1].price, Decimal::from(98));
+        assert_eq!(update.asks[0].size, Decimal::from(2));
+    }
+
+    #[tokio::test]
+    async fn book_manager_requests_resub_on_gap() {
+        let (book_tx, mut book_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = BookManager::new(book_tx, cmd_tx.clone());
+
+        let snapshot = OrderbookMessage {
+            topic: "orderbook.1.BTCUSDT".into(),
+            msg_type: "snapshot".into(),
+            ts: 1,
+            data: vec![sample_data(
+                "BTCUSDT",
+                &[("100", "1")],
+                &[("101", "1")],
+                5,
+                Some(4),
+            )],
+        };
+        manager.handle(snapshot).await;
+        book_rx.recv().await.expect("snapshot missing");
+
+        let gap_delta = OrderbookMessage {
+            topic: "orderbook.1.BTCUSDT".into(),
+            msg_type: "delta".into(),
+            ts: 2,
+            data: vec![sample_data(
+                "BTCUSDT",
+                &[("100", "0")],
+                &[("101", "2")],
+                8,
+                Some(6),
+            )],
+        };
+        manager.handle(gap_delta).await;
+
+        let resub = cmd_rx.recv().await.expect("resubscribe missing");
+        match resub {
+            WsCommand::Subscribe(topic) => assert_eq!(topic, "orderbook.1.BTCUSDT"),
+            _ => panic!("unexpected command {:?}", resub),
+        }
     }
 }
