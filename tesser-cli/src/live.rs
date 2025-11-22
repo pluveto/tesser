@@ -155,7 +155,7 @@ pub struct PersistenceSettings {
 }
 
 impl PersistenceSettings {
-    fn new(engine: PersistenceEngine, state_path: PathBuf) -> Self {
+    pub fn new(engine: PersistenceEngine, state_path: PathBuf) -> Self {
         let algo_path = match engine {
             PersistenceEngine::Sqlite => state_path.with_extension("algos.db"),
             PersistenceEngine::Lmdb => state_path.clone(),

@@ -7,7 +7,7 @@ use serde_json::to_string_pretty;
 use tesser_config::PersistenceEngine;
 use tesser_core::Side;
 use tesser_journal::LmdbJournal;
-use tesser_portfolio::{LiveState, PortfolioState, SqliteStateRepository};
+use tesser_portfolio::{LiveState, PortfolioState, SqliteStateRepository, StateRepository};
 
 const MAX_ORDER_ROWS: usize = 5;
 const MAX_PRICE_ROWS: usize = 8;

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
-use heed::types::{SerdeBincode, Str};
+use heed::types::{SerdeBincode, SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use tesser_execution::{AlgoStateRepository, StoredAlgoState};
 use tesser_portfolio::{LiveState, PortfolioError, PortfolioResult, StateRepository};
@@ -21,7 +21,7 @@ pub struct LmdbJournal {
     path: PathBuf,
     env: Env,
     live_state: Database<Str, SerdeBincode<LiveState>>,
-    algo_states: Database<SerdeBincode<Uuid>, SerdeBincode<StoredAlgoState>>,
+    algo_states: Database<SerdeBincode<Uuid>, SerdeJson<StoredAlgoState>>,
 }
 
 impl LmdbJournal {
@@ -131,7 +131,7 @@ impl StateRepository for LmdbStateRepository {
 #[derive(Clone)]
 pub struct LmdbAlgoStateRepository {
     env: Env,
-    algo_states: Database<SerdeBincode<Uuid>, SerdeBincode<StoredAlgoState>>,
+    algo_states: Database<SerdeBincode<Uuid>, SerdeJson<StoredAlgoState>>,
 }
 
 impl AlgoStateRepository for LmdbAlgoStateRepository {
@@ -255,6 +255,28 @@ mod tests {
         repo.save(&id, &state).unwrap();
         let loaded = repo.load_all().unwrap();
         assert_eq!(loaded.get(&id).unwrap().algo_type, "TWAP");
+    }
+
+    #[test]
+    fn survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let journal = LmdbJournal::open(dir.path()).unwrap();
+            let repo = journal.algo_repo();
+            let id = Uuid::new_v4();
+            repo.save(
+                &id,
+                &StoredAlgoState {
+                    algo_type: "SNIPER".into(),
+                    state: json!({"idx": 1}),
+                },
+            )
+            .unwrap();
+        }
+        let journal = LmdbJournal::open(dir.path()).unwrap();
+        let loaded = journal.algo_repo().load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.values().next().unwrap().algo_type, "SNIPER");
     }
 
     #[test]
