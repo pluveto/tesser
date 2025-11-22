@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 /// Persisted algorithm snapshot stored by the orchestrator.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StoredAlgoState {
     pub algo_type: String,
     pub state: Value,
