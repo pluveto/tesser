@@ -45,10 +45,12 @@ async fn bybit_client_honors_private_rate_limit() -> Result<()> {
         .with_ticks(ticks);
     let mut exchange = MockExchange::start(config).await?;
 
-    let mut client_cfg = BybitConfig::default();
-    client_cfg.base_url = exchange.rest_url();
-    client_cfg.ws_url = Some(exchange.ws_url());
-    client_cfg.private_quota = NonZeroU32::new(1).map(Quota::per_second);
+    let client_cfg = BybitConfig {
+        base_url: exchange.rest_url(),
+        ws_url: Some(exchange.ws_url()),
+        private_quota: NonZeroU32::new(1).map(Quota::per_second),
+        ..BybitConfig::default()
+    };
     let client = BybitClient::new(
         client_cfg,
         Some(BybitCredentials {
