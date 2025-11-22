@@ -4030,6 +4030,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "chrono",
+ "csv",
  "futures",
  "once_cell",
  "parquet",

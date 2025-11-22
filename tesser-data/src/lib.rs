@@ -3,9 +3,11 @@
 pub mod analytics;
 pub mod download;
 pub mod encoding;
+pub mod io;
 pub mod merger;
 pub mod parquet;
 pub mod recorder;
+pub mod transform;
 
 /// Data distribution utilities that consume [`tesser_broker::MarketStream`].
 use anyhow::Context;
