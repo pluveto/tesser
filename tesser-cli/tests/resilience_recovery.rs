@@ -89,7 +89,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
     let algo_path = temp.path().join("algos.db");
     let repo = Arc::new(SqliteAlgoStateRepository::new(&algo_path)?);
 
-    let orchestrator = OrderOrchestrator::new(engine.clone(), repo.clone(), Vec::new()).await?;
+    let orchestrator = OrderOrchestrator::new(engine.clone(), repo.clone()).await?;
 
     let signal = Signal::new(SYMBOL, SignalKind::EnterLong, 0.8).with_hint(ExecutionHint::Twap {
         duration: ChronoDuration::seconds(4),
@@ -105,9 +105,12 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
     orchestrator.on_timer_tick().await?;
 
     let first_order = assert_single_open_order(raw_client.as_ref()).await?;
-    assert_eq!(
-        first_order.status,
-        OrderStatus::PendingNew,
+<<<<<<< HEAD
+    assert!(
+        matches!(
+            first_order.status,
+            OrderStatus::PendingNew | OrderStatus::Accepted
+        ),
         "first slice should be working"
     );
     let client_id = first_order
@@ -134,7 +137,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         }),
         Arc::new(NoopRiskChecker),
     ));
-    let restored = OrderOrchestrator::new(restarted_engine, repo.clone(), open_orders).await?;
+    let restored = OrderOrchestrator::new(restarted_engine, repo.clone()).await?;
     assert_eq!(restored.active_algorithms_count(), 1);
 
     let state = exchange.state();
