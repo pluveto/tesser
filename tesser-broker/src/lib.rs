@@ -10,6 +10,11 @@ use tesser_core::{
 };
 use thiserror::Error;
 
+pub mod limiter;
+
+pub use governor::Quota;
+pub use limiter::{RateLimiter, RateLimiterError};
+
 /// Convenience alias for broker results.
 pub type BrokerResult<T> = Result<T, BrokerError>;
 

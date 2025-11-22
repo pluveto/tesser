@@ -13,15 +13,17 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 use tesser_broker::{
     register_connector_factory, BrokerError, BrokerInfo, BrokerResult, ConnectorFactory,
-    ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream,
+    ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream, Quota, RateLimiter,
+    RateLimiterError,
 };
 use tesser_core::{
     AccountBalance, Candle, Fill, Instrument, InstrumentKind, Order, OrderBook, OrderRequest,
     OrderStatus, OrderType, Position, Side, TimeInForce,
 };
+use tokio::time::sleep;
 use uuid::Uuid;
 
 pub mod ws;
@@ -30,6 +32,12 @@ pub use ws::{
     extract_order_update, BinanceMarketStream, BinanceSubscription, BinanceUserDataStream,
     UserDataStreamEventsResponse,
 };
+
+const BINANCE_DEFAULT_WEIGHT_LIMIT: u32 = 1_200;
+const WEIGHT_BACKOFF_RATIO: f32 = 0.9;
+const ORDER_WEIGHT: u32 = 1;
+const CANCEL_WEIGHT: u32 = 1;
+const QUERY_WEIGHT: u32 = 5;
 
 #[derive(Clone)]
 pub struct BinanceCredentials {
@@ -41,6 +49,7 @@ pub struct BinanceConfig {
     pub rest_url: String,
     pub ws_url: String,
     pub recv_window: u64,
+    pub weight_limit_per_minute: u32,
 }
 
 impl Default for BinanceConfig {
@@ -49,6 +58,7 @@ impl Default for BinanceConfig {
             rest_url: "https://fapi.binance.com".to_string(),
             ws_url: "wss://fstream.binance.com/stream".to_string(),
             recv_window: 5_000,
+            weight_limit_per_minute: BINANCE_DEFAULT_WEIGHT_LIMIT,
         }
     }
 }
@@ -68,6 +78,7 @@ pub struct BinanceClient {
     info: BrokerInfo,
     credentials: Option<BinanceCredentials>,
     config: BinanceConfig,
+    weight_limiter: Option<RateLimiter>,
 }
 
 impl BinanceClient {
@@ -84,6 +95,9 @@ impl BinanceClient {
             .expect("failed to build Binance REST configuration");
         let rest = binance_futures::DerivativesTradingUsdsFuturesRestApi::from_config(rest_cfg);
         let supports_testnet = config.rest_url.contains("testnet");
+        let weight_limiter = NonZeroU32::new(config.weight_limit_per_minute)
+            .map(Quota::per_minute)
+            .map(RateLimiter::direct);
         Self {
             rest: Arc::new(rest),
             info: BrokerInfo {
@@ -93,6 +107,7 @@ impl BinanceClient {
             },
             credentials,
             config,
+            weight_limiter,
         }
     }
 
@@ -116,15 +131,72 @@ impl BinanceClient {
         Arc::clone(&self.rest)
     }
 
+    async fn throttle_weight(&self, units: u32) -> BrokerResult<()> {
+        if units == 0 {
+            return Ok(());
+        }
+        if let Some(limiter) = &self.weight_limiter {
+            if let Some(nonzero) = NonZeroU32::new(units) {
+                limiter
+                    .until_units_ready(nonzero)
+                    .await
+                    .map_err(Self::rate_limiter_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_weight_headers(&self, headers: &HashMap<String, String>) {
+        if self.config.weight_limit_per_minute == 0 {
+            return;
+        }
+        if let Some(value) = headers.get("x-mbx-used-weight-1m") {
+            if let Ok(used) = value.parse::<u32>() {
+                self.backoff_if_needed(used).await;
+            }
+        }
+    }
+
+    async fn backoff_if_needed(&self, used: u32) {
+        let limit = self.config.weight_limit_per_minute;
+        if limit == 0 {
+            return;
+        }
+        if used >= limit {
+            sleep(Duration::from_secs(1)).await;
+        } else if (used as f32) / (limit as f32) >= WEIGHT_BACKOFF_RATIO {
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn parse_response<T>(&self, result: anyhow::Result<RestApiResponse<T>>) -> BrokerResult<T>
+    where
+        T: Send + 'static,
+    {
+        let response = result.map_err(|err| BrokerError::Transport(err.to_string()))?;
+        self.handle_weight_headers(&response.headers).await;
+        response.data().await.map_err(map_connector_error)
+    }
+
+    fn rate_limiter_error(err: RateLimiterError) -> BrokerError {
+        BrokerError::Other(format!("rate limited: {err}"))
+    }
+
     pub async fn start_user_stream(&self) -> BrokerResult<String> {
-        let response = handle_response(self.rest.start_user_data_stream().await).await?;
+        self.throttle_weight(QUERY_WEIGHT).await?;
+        let response = self
+            .parse_response(self.rest.start_user_data_stream().await)
+            .await?;
         response
             .listen_key
             .ok_or_else(|| BrokerError::Other("missing listenKey".into()))
     }
 
     pub async fn keepalive_user_stream(&self) -> BrokerResult<String> {
-        let response = handle_response(self.rest.keepalive_user_data_stream().await).await?;
+        self.throttle_weight(QUERY_WEIGHT).await?;
+        let response = self
+            .parse_response(self.rest.keepalive_user_data_stream().await)
+            .await?;
         response
             .listen_key
             .ok_or_else(|| BrokerError::Other("missing listenKey".into()))
@@ -138,6 +210,7 @@ impl ExecutionClient for BinanceClient {
     }
 
     async fn place_order(&self, request: OrderRequest) -> BrokerResult<Order> {
+        self.throttle_weight(ORDER_WEIGHT).await?;
         let side = map_side(request.side);
         let order_type = map_order_type(request.order_type);
         let mut builder = NewOrderParams::builder(request.symbol.clone(), side, order_type);
@@ -174,11 +247,14 @@ impl ExecutionClient for BinanceClient {
         let params = builder
             .build()
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
-        let response = handle_response(self.rest.new_order(params).await).await?;
+        let response = self
+            .parse_response(self.rest.new_order(params).await)
+            .await?;
         Ok(build_order_from_response(response, client_request))
     }
 
     async fn cancel_order(&self, order_id: tesser_core::OrderId, symbol: &str) -> BrokerResult<()> {
+        self.throttle_weight(CANCEL_WEIGHT).await?;
         let mut builder = rest_api::CancelOrderParams::builder(symbol.to_string())
             .recv_window(Some(self.config.recv_window as i64));
         if let Ok(id) = order_id.parse::<i64>() {
@@ -189,17 +265,21 @@ impl ExecutionClient for BinanceClient {
         let params = builder
             .build()
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
-        handle_response(self.rest.cancel_order(params).await).await?;
+        self.parse_response(self.rest.cancel_order(params).await)
+            .await?;
         Ok(())
     }
 
     async fn list_open_orders(&self, symbol: &str) -> BrokerResult<Vec<Order>> {
+        self.throttle_weight(QUERY_WEIGHT).await?;
         let params = rest_api::CurrentAllOpenOrdersParams::builder()
             .symbol(Some(symbol.to_string()))
             .recv_window(Some(self.config.recv_window as i64))
             .build()
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
-        let raw = handle_response(self.rest.current_all_open_orders(params).await).await?;
+        let raw = self
+            .parse_response(self.rest.current_all_open_orders(params).await)
+            .await?;
         let mut orders = Vec::new();
         for entry in raw {
             if let Some(order) = order_from_open_order(&entry) {
@@ -210,11 +290,14 @@ impl ExecutionClient for BinanceClient {
     }
 
     async fn account_balances(&self) -> BrokerResult<Vec<AccountBalance>> {
+        self.throttle_weight(QUERY_WEIGHT).await?;
         let params = rest_api::FuturesAccountBalanceV3Params::builder()
             .recv_window(Some(self.config.recv_window as i64))
             .build()
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
-        let balances = handle_response(self.rest.futures_account_balance_v3(params).await).await?;
+        let balances = self
+            .parse_response(self.rest.futures_account_balance_v3(params).await)
+            .await?;
         Ok(balances
             .into_iter()
             .filter_map(|entry| balance_from_entry(&entry))
@@ -222,11 +305,14 @@ impl ExecutionClient for BinanceClient {
     }
 
     async fn positions(&self) -> BrokerResult<Vec<Position>> {
+        self.throttle_weight(QUERY_WEIGHT).await?;
         let params = rest_api::PositionInformationV2Params::builder()
             .recv_window(Some(self.config.recv_window as i64))
             .build()
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
-        let positions = handle_response(self.rest.position_information_v2(params).await).await?;
+        let positions = self
+            .parse_response(self.rest.position_information_v2(params).await)
+            .await?;
         Ok(positions
             .into_iter()
             .filter_map(|entry| position_from_entry(&entry))
@@ -234,7 +320,10 @@ impl ExecutionClient for BinanceClient {
     }
 
     async fn list_instruments(&self, _category: &str) -> BrokerResult<Vec<Instrument>> {
-        let info = handle_response(self.rest.exchange_information().await).await?;
+        self.throttle_weight(QUERY_WEIGHT).await?;
+        let info = self
+            .parse_response(self.rest.exchange_information().await)
+            .await?;
         let mut instruments = Vec::new();
         for symbol in info.symbols.unwrap_or_default() {
             if let Some(instr) = instrument_from_symbol(&symbol) {
@@ -247,14 +336,6 @@ impl ExecutionClient for BinanceClient {
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
-
-async fn handle_response<T>(result: anyhow::Result<RestApiResponse<T>>) -> BrokerResult<T>
-where
-    T: Send + 'static,
-{
-    let response = result.map_err(|err| BrokerError::Transport(err.to_string()))?;
-    response.data().await.map_err(map_connector_error)
 }
 
 fn build_order_from_response(response: rest_api::NewOrderResponse, request: OrderRequest) -> Order {
@@ -530,6 +611,8 @@ struct BinanceConnectorConfig {
     api_secret: String,
     #[serde(default = "default_recv_window")]
     recv_window: u64,
+    #[serde(default = "default_weight_limit_per_minute")]
+    weight_limit_per_minute: u32,
 }
 
 fn default_rest_url() -> String {
@@ -542,6 +625,10 @@ fn default_ws_url() -> String {
 
 fn default_recv_window() -> u64 {
     5_000
+}
+
+fn default_weight_limit_per_minute() -> u32 {
+    BINANCE_DEFAULT_WEIGHT_LIMIT
 }
 
 #[derive(Default)]
@@ -587,6 +674,7 @@ impl ConnectorFactory for BinanceFactory {
             rest_url: cfg.rest_url.clone(),
             ws_url: cfg.ws_url.clone(),
             recv_window: cfg.recv_window,
+            weight_limit_per_minute: cfg.weight_limit_per_minute,
         };
         Ok(Arc::new(BinanceClient::new(
             binance_cfg,

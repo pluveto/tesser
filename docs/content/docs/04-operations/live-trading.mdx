@@ -26,6 +26,35 @@ The CLI spins up three async tasks:
 
 If the process restarts it reloads everything from the SQLite snapshot and resumes from the latest offsets. Pair it with Prometheus exporters to watch latency, error rates, and per-strategy PnL in Grafana.
 
+## Connector Rate Limits
+
+Bybit and Binance connectors now enforce client-side throttling. Configure them per exchange entry in `config/{env}.toml`:
+
+```toml
+[exchange.prod]
+driver = "bybit"
+rest_url = "https://api.bybit.com"
+ws_url = "wss://stream.bybit.com"
+api_key = "..."
+api_secret = "..."
+
+[exchange.prod.params]
+rate_limit_tier = "vip"      # or override with `private_rps = 30`
+public_rps = 100               # optional, defaults to 50
+
+[exchange.prod_binance]
+driver = "binance"
+rest_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com/stream"
+api_key = "..."
+api_secret = "..."
+
+[exchange.prod_binance.params]
+weight_limit_per_minute = 600  # default is 1200, lower it for testing
+```
+
+Each connector now waits for the appropriate token bucket before issuing HTTP calls, shielding your API keys from accidental bans while still allowing you to dial in higher tiers as your VIP level increases.
+
 ## Flight Recorder
 
 Set `--record-data <path>` when you launch `tesser-cli live run` to stream every `Tick`, `Candle`, `Fill`, and order update into partitioned Parquet files. The recorder runs on its own Tokio task, buffers data in Arrow `RecordBatch`es, and rotates files per day under the provided directory (defaults to `data/flight_recorder`).

@@ -3,7 +3,7 @@
 //! Authentication details follow the rules described in
 //! `bybit-api-docs/docs/v5/guide.mdx`.
 
-use std::{any::Any, str::FromStr, sync::Arc, time::Duration};
+use std::{any::Any, num::NonZeroU32, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,7 +15,8 @@ use serde_json::Value;
 use sha2::Sha256;
 use tesser_broker::{
     register_connector_factory, BrokerError, BrokerErrorKind, BrokerInfo, BrokerResult,
-    ConnectorFactory, ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream,
+    ConnectorFactory, ConnectorStream, ConnectorStreamConfig, ExecutionClient, MarketStream, Quota,
+    RateLimiter, RateLimiterError,
 };
 use tesser_core::{
     AccountBalance, Candle, Fill, Instrument, InstrumentKind, Order, OrderBook, OrderRequest,
@@ -42,6 +43,8 @@ pub struct BybitConfig {
     pub category: String,
     pub recv_window: u64,
     pub ws_url: Option<String>,
+    pub public_quota: Option<Quota>,
+    pub private_quota: Option<Quota>,
 }
 
 impl Default for BybitConfig {
@@ -51,6 +54,8 @@ impl Default for BybitConfig {
             category: "linear".into(),
             recv_window: 5_000,
             ws_url: None,
+            public_quota: None,
+            private_quota: None,
         }
     }
 }
@@ -61,6 +66,8 @@ pub struct BybitClient {
     config: BybitConfig,
     credentials: Option<BybitCredentials>,
     info: BrokerInfo,
+    public_limiter: Option<RateLimiter>,
+    private_limiter: Option<RateLimiter>,
 }
 
 impl BybitClient {
@@ -71,6 +78,8 @@ impl BybitClient {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to create reqwest client");
+        let public_limiter = config.public_quota.map(|quota| RateLimiter::direct(quota));
+        let private_limiter = config.private_quota.map(|quota| RateLimiter::keyed(quota));
         Self {
             info: BrokerInfo {
                 name: "bybit".into(),
@@ -80,6 +89,8 @@ impl BybitClient {
             http,
             config,
             credentials,
+            public_limiter,
+            private_limiter,
         }
     }
 
@@ -99,12 +110,29 @@ impl BybitClient {
             .unwrap_or_else(|| self.config.base_url.replace("https://api", "wss://stream"))
     }
 
+    async fn throttle_public(&self) -> BrokerResult<()> {
+        if let Some(limiter) = &self.public_limiter {
+            limiter
+                .until_ready()
+                .await
+                .map_err(Self::rate_limiter_error)?;
+        }
+        Ok(())
+    }
+
+    async fn throttle_private(&self) -> BrokerResult<()> {
+        if let (Some(limiter), Some(creds)) = (&self.private_limiter, &self.credentials) {
+            limiter
+                .until_key_ready(&creds.api_key)
+                .await
+                .map_err(Self::rate_limiter_error)?;
+        }
+        Ok(())
+    }
+
     /// Fetch Bybit server time (docs/v5/market/time.mdx).
     pub async fn server_time(&self) -> BrokerResult<u128> {
-        let resp: ApiResponse<ServerTimeResult> = self
-            .public_get("/v5/market/time")
-            .await
-            .map_err(|err| BrokerError::Transport(err.to_string()))?;
+        let resp: ApiResponse<ServerTimeResult> = self.public_get("/v5/market/time").await?;
         self.ensure_success(&resp)?;
         resp.result
             .time_nano
@@ -127,23 +155,30 @@ impl BybitClient {
         }
     }
 
-    async fn public_get<T>(&self, path: &str) -> Result<ApiResponse<T>, reqwest::Error>
+    async fn public_get<T>(&self, path: &str) -> BrokerResult<ApiResponse<T>>
     where
         T: DeserializeOwned,
     {
+        self.throttle_public().await?;
         let url = self.url(path);
         self.http
             .get(url)
             .send()
-            .await?
+            .await
+            .map_err(|err| BrokerError::Transport(err.to_string()))?
             .json::<ApiResponse<T>>()
             .await
+            .map_err(|err| BrokerError::Serialization(err.to_string()))
     }
 
     fn creds(&self) -> BrokerResult<&BybitCredentials> {
         self.credentials
             .as_ref()
             .ok_or_else(|| BrokerError::Authentication("missing Bybit credentials".into()))
+    }
+
+    fn rate_limiter_error(err: RateLimiterError) -> BrokerError {
+        BrokerError::Other(format!("rate limited: {err}"))
     }
 
     async fn signed_request<T>(
@@ -157,6 +192,7 @@ impl BybitClient {
         T: DeserializeOwned,
     {
         let creds = self.creds()?;
+        self.throttle_private().await?;
         let timestamp = Utc::now().timestamp_millis();
         let query_string = query
             .as_ref()
@@ -486,16 +522,8 @@ impl ExecutionClient for BybitClient {
     }
 
     async fn list_instruments(&self, category: &str) -> BrokerResult<Vec<Instrument>> {
-        let resp = self
-            .http
-            .get(self.url("/v5/market/instruments-info"))
-            .query(&[("category", category)])
-            .send()
-            .await
-            .map_err(|err| BrokerError::Transport(err.to_string()))?
-            .json::<ApiResponse<InstrumentInfoResult>>()
-            .await
-            .map_err(|err| BrokerError::Serialization(err.to_string()))?;
+        let path = format!("/v5/market/instruments-info?category={}", category);
+        let resp: ApiResponse<InstrumentInfoResult> = self.public_get(&path).await?;
         self.ensure_success(&resp)?;
         let mut instruments = Vec::new();
         for item in resp.result.list {
@@ -710,6 +738,12 @@ struct BybitConnectorConfig {
     api_secret: String,
     #[serde(default = "default_recv_window")]
     recv_window: u64,
+    #[serde(default = "default_rate_limit_tier")]
+    rate_limit_tier: RateLimitTier,
+    #[serde(default)]
+    private_rps: Option<u32>,
+    #[serde(default)]
+    public_rps: Option<u32>,
 }
 
 fn default_rest_url() -> String {
@@ -726,6 +760,28 @@ fn default_category() -> String {
 
 fn default_recv_window() -> u64 {
     5_000
+}
+
+fn default_rate_limit_tier() -> RateLimitTier {
+    RateLimitTier::Standard
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RateLimitTier {
+    Standard,
+    Pro,
+    Vip,
+}
+
+impl RateLimitTier {
+    fn private_rps(self) -> u32 {
+        match self {
+            RateLimitTier::Standard => 10,
+            RateLimitTier::Pro => 20,
+            RateLimitTier::Vip => 50,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -751,9 +807,22 @@ impl BybitFactory {
 }
 
 const BYBIT_DEFAULT_DEPTH: usize = 50;
+const BYBIT_PUBLIC_DEFAULT_RPS: u32 = 50;
 
 pub fn register_factory() {
     register_connector_factory(Arc::new(BybitFactory));
+}
+
+fn rate_limits_from_config(cfg: &BybitConnectorConfig) -> (Option<Quota>, Option<Quota>) {
+    let private_rps = cfg
+        .private_rps
+        .unwrap_or_else(|| cfg.rate_limit_tier.private_rps());
+    let public_rps = cfg.public_rps.unwrap_or(BYBIT_PUBLIC_DEFAULT_RPS);
+    (quota_from_rps(public_rps), quota_from_rps(private_rps))
+}
+
+fn quota_from_rps(rps: u32) -> Option<Quota> {
+    NonZeroU32::new(rps).map(Quota::per_second)
 }
 
 #[async_trait]
@@ -767,11 +836,14 @@ impl ConnectorFactory for BybitFactory {
         config: &Value,
     ) -> BrokerResult<Arc<dyn ExecutionClient>> {
         let cfg = self.parse_config(config)?;
+        let (public_quota, private_quota) = rate_limits_from_config(&cfg);
         let bybit_cfg = BybitConfig {
             base_url: cfg.rest_url.clone(),
             category: cfg.category.clone(),
             recv_window: cfg.recv_window,
             ws_url: Some(cfg.ws_url.clone()),
+            public_quota,
+            private_quota,
         };
         Ok(Arc::new(BybitClient::new(
             bybit_cfg,

@@ -15,3 +15,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 tesser-core = { version = "0.7.0", path = "../tesser-core" }
 once_cell.workspace = true
+governor.workspace = true
+nonzero_ext.workspace = true
