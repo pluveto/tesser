@@ -78,8 +78,8 @@ impl BybitClient {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to create reqwest client");
-        let public_limiter = config.public_quota.map(|quota| RateLimiter::direct(quota));
-        let private_limiter = config.private_quota.map(|quota| RateLimiter::keyed(quota));
+        let public_limiter = config.public_quota.map(RateLimiter::direct);
+        let private_limiter = config.private_quota.map(RateLimiter::keyed);
         Self {
             info: BrokerInfo {
                 name: "bybit".into(),
