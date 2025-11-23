@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{
-    ArrayRef, Decimal128Builder, Float64Builder, Int8Builder, StringBuilder,
-    TimestampNanosecondBuilder,
+    ArrayRef, Decimal128Builder, Float64Builder, Int8Builder, ListBuilder, StringBuilder,
+    StructBuilder, TimestampNanosecondBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
@@ -16,8 +16,8 @@ use serde_json::{json, Map};
 use tracing::warn;
 
 use tesser_core::{
-    Candle, ExecutionHint, Fill, Interval, Order, OrderStatus, OrderType, Signal, SignalKind, Tick,
-    TimeInForce,
+    Candle, ExecutionHint, Fill, Interval, Order, OrderBook, OrderBookLevel, OrderStatus,
+    OrderType, Signal, SignalKind, Tick, TimeInForce,
 };
 
 const DECIMAL_PRECISION: u8 = 38;
@@ -110,6 +110,34 @@ static ORDER_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     ]))
 });
 
+fn order_book_level_fields() -> Fields {
+    Fields::from(vec![
+        decimal_field("price", false),
+        decimal_field("size", false),
+    ])
+}
+
+fn order_book_levels_field(name: &str) -> Field {
+    Field::new(
+        name,
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(order_book_level_fields()),
+            false,
+        ))),
+        false,
+    )
+}
+
+static ORDER_BOOK_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
+        timestamp_field("timestamp"),
+        Field::new("symbol", DataType::Utf8, false),
+        order_book_levels_field("bids"),
+        order_book_levels_field("asks"),
+    ]))
+});
+
 static SIGNAL_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -146,6 +174,11 @@ pub fn order_schema() -> SchemaRef {
 /// Returns the schema used when encoding signals.
 pub fn signal_schema() -> SchemaRef {
     SIGNAL_SCHEMA.clone()
+}
+
+/// Returns the schema used when encoding order books.
+pub fn order_book_schema() -> SchemaRef {
+    ORDER_BOOK_SCHEMA.clone()
 }
 
 /// Converts a slice of ticks into a [`RecordBatch`].
@@ -369,6 +402,65 @@ pub fn signals_to_batch(rows: &[Signal]) -> Result<RecordBatch> {
     ];
 
     RecordBatch::try_new(signal_schema(), columns).context("failed to build signal batch")
+}
+
+/// Converts a slice of order books into a [`RecordBatch`].
+pub fn order_books_to_batch(rows: &[OrderBook]) -> Result<RecordBatch> {
+    let capacity = rows.len();
+    let mut timestamps = timestamp_builder(capacity);
+    let mut symbols = string_builder(capacity);
+    let mut bids = level_list_builder(capacity);
+    let mut asks = level_list_builder(capacity);
+
+    for book in rows {
+        timestamps.append_value(timestamp_to_nanos(&book.timestamp));
+        symbols.append_value(&book.symbol);
+        append_order_book_levels(&mut bids, &book.bids)?;
+        append_order_book_levels(&mut asks, &book.asks)?;
+    }
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(timestamps.finish()),
+        Arc::new(symbols.finish()),
+        Arc::new(bids.finish()),
+        Arc::new(asks.finish()),
+    ];
+
+    RecordBatch::try_new(order_book_schema(), columns).context("failed to build order book batch")
+}
+
+fn level_list_builder(capacity: usize) -> ListBuilder<StructBuilder> {
+    let fields = order_book_level_fields();
+    let struct_builder = StructBuilder::from_fields(fields.clone(), capacity);
+    ListBuilder::with_capacity(struct_builder, capacity).with_field(Arc::new(Field::new(
+        "item",
+        DataType::Struct(fields),
+        false,
+    )))
+}
+
+fn append_order_book_levels(
+    builder: &mut ListBuilder<StructBuilder>,
+    levels: &[OrderBookLevel],
+) -> Result<()> {
+    {
+        let values = builder.values();
+        for level in levels {
+            let price = decimal_to_i128(level.price)?;
+            let size = decimal_to_i128(level.size)?;
+            values
+                .field_builder::<Decimal128Builder>(0)
+                .ok_or_else(|| anyhow!("order book builder missing price field"))?
+                .append_value(price);
+            values
+                .field_builder::<Decimal128Builder>(1)
+                .ok_or_else(|| anyhow!("order book builder missing size field"))?
+                .append_value(size);
+            values.append(true);
+        }
+    }
+    builder.append(true);
+    Ok(())
 }
 
 fn decimal_to_i128(value: Decimal) -> Result<i128> {
