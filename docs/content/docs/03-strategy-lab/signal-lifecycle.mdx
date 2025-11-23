@@ -27,3 +27,9 @@ Tuning knobs:
 - `min_chase_distance` – the newest knob; it sets the minimum price delta (in absolute quote terms) before a chase occurs, providing a guardrail against micro-ticks that would otherwise generate excessive amend calls.
 
 Because the runtime amends the resting child order in place, fills stream back against a single order ID and state is persisted through restarts. Set `min_chase_distance` according to your tick size and exchange rate limits to balance spread capture against API pressure.
+
+## TrailingStop Execution Hint
+
+`ExecutionHint::TrailingStop` gives strategies a venue-agnostic trailing-stop primitive. Provide an `activation_price` and a fractional `callback_rate`. Once ticks trade through the activation level the orchestrator records the highest price seen, refreshing that watermark as the market rallies. If price ever falls below `highest * (1 - callback_rate)`, the algorithm fires a market sell that flattens the configured quantity.
+
+This logic runs entirely inside the execution layer, so it inherits the same persistence/recovery guarantees as TWAP/VWAP. Use it to guard profits without wiring exchange-specific trailing orders or polluting strategy code with ticker state.

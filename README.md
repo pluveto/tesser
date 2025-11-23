@@ -186,6 +186,7 @@ Execution hints now support specialized algorithms (configured through your stra
 
 - `ExecutionHint::PeggedBest` – refreshes passive orders at the top of book using native amend/replace so queue position is preserved; tune `clip_size`, `refresh_secs`, and the optional `min_chase_distance` per strategy to control how aggressively it chases.
 - `ExecutionHint::Sniper` – waits for a target price before sweeping liquidity (used by the `VolatilitySkew` playbook).
+- `ExecutionHint::TrailingStop` – arms above an activation price and issues a market exit once price retraces by the configured callback percentage, implementing an exchange-native trailing stop without relying on venue-specific order types.
 - Existing hints (`Twap`, `Vwap`, `IcebergSimulated`) continue to work unchanged, and their state is persisted via SQLite so in-flight schedules recover from process restarts.
 
 Additional indicators (ATR, MACD, Ichimoku Cloud) and reference strategies (`OrderBookScalper`, `CrossExchangeArb`, `VolatilitySkew`) ship with the workspace to showcase how these hints and the matching engine interact end to end.
