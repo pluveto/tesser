@@ -19,7 +19,7 @@ Switch to `--mode tick` and provide order-book snapshots when you need depth-awa
 
 ### Streaming Tick Mode from Flight Recorder
 
-Phase 4.1 introduces a streaming tick engine that replays the same Parquet assets produced by the flight recorder. Instead of converting JSONL blobs, point `--lob-data` at the recorder root and the CLI will merge ticks, order-book snapshots, and depth deltas on the fly:
+The streaming tick engine has been added in v0.9.1 that replays the same Parquet assets produced by the flight recorder. Instead of converting JSONL blobs, point `--lob-data` at the recorder root and the CLI will merge ticks, order-book snapshots, and depth deltas on the fly:
 
 ```bash
 cargo run -p tesser-cli -- \
@@ -31,6 +31,44 @@ cargo run -p tesser-cli -- \
 ```
 
 The backtester now consumes an async stream of events, so it only keeps the active snapshot and pending fills in memory even when you replay months of high-frequency data.
+
+### Queue + Latency Simulation
+
+The streaming engine now understands how long your order sits in the matching queue and when it actually lands on the book. Use these flags to model more realistic fills:
+
+```bash
+cargo run -p tesser-cli -- \
+    backtest run \
+    --strategy-config strategies/pegged.toml \
+    --mode tick \
+    --lob-data data/flight_recorder \
+    --sim-latency-ms 75 \
+    --sim-queue-model conserv
+```
+
+- `--sim-latency-ms` adds a round-trip delay to limit submissions and cancels before they touch the book.
+- `--sim-queue-model conserv` tracks the full resting size ahead of you at each price level. Switch to `optimistic` to assume you always rest at the front of the queue.
+
+Every tick event advances the virtual clock so cancels, conditional triggers, and queue consumption occur exactly when they would have during the original session.
+
+### Custom Fee Schedules
+
+Maker/taker economics are no longer a single `fee_bps`. Point `--fee-schedule` at a TOML/JSON file to describe per-market rates and let the matching engine bill fills with the correct role:
+
+```toml
+default_maker_bps = 0
+default_taker_bps = 0.6
+
+[markets.BYBIT_BTCUSDT]
+maker_bps = 0
+taker_bps = 0.55
+
+[markets.BINANCE_BTCUSDT]
+maker_bps = 0.1
+taker_bps = 0.1
+```
+
+Combine it with `--sim-queue-model optimistic` to model zero maker fees, or keep the conservative queue logic when you want to reserve that advantage for high-priority venues. Fee schedules work in both candle and tick modes as well as batch runs.
 
 ## Reports
 

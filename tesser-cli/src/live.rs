@@ -60,7 +60,7 @@ use tesser_execution::{
 };
 use tesser_journal::LmdbJournal;
 use tesser_markets::MarketRegistry;
-use tesser_paper::{PaperExecutionClient, PaperFactory};
+use tesser_paper::{FeeScheduleConfig, PaperExecutionClient, PaperFactory};
 use tesser_portfolio::{
     LiveState, Portfolio, PortfolioConfig, SqliteStateRepository, StateRepository,
 };
@@ -387,7 +387,11 @@ async fn build_execution_client(
                 "paper".to_string(),
                 vec!["BTCUSDT".to_string()],
                 settings.slippage_bps,
-                settings.fee_bps,
+                FeeScheduleConfig::with_defaults(
+                    settings.fee_bps.max(Decimal::ZERO),
+                    settings.fee_bps.max(Decimal::ZERO),
+                )
+                .build_model(),
             )))
         }
         ExecutionBackend::Live => connector_factory

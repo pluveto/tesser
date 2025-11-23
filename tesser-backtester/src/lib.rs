@@ -413,6 +413,7 @@ impl Backtester {
                 break;
             };
             let event = event?;
+            matching.advance_time(event.timestamp).await;
             match &event.kind {
                 MarketEventKind::OrderBook(book) => {
                     matching.load_market_snapshot(book);

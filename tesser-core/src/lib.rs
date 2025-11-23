@@ -565,6 +565,19 @@ impl LocalOrderBook {
     pub fn ask_levels(&self, depth: usize) -> Vec<(Price, Quantity)> {
         self.asks().take(depth).collect()
     }
+
+    /// Returns the total resting quantity at an exact price level.
+    #[must_use]
+    pub fn volume_at_level(&self, side: Side, price: Price) -> Quantity {
+        match side {
+            Side::Buy => self
+                .bids
+                .get(&Reverse(price))
+                .copied()
+                .unwrap_or(Decimal::ZERO),
+            Side::Sell => self.asks.get(&price).copied().unwrap_or(Decimal::ZERO),
+        }
+    }
 }
 
 /// Desired order placement parameters.
@@ -815,5 +828,25 @@ mod tests {
         let checksum_full = lob.checksum(2);
         let checksum_partial = lob.checksum(1);
         assert_ne!(checksum_full, checksum_partial);
+    }
+
+    #[test]
+    fn local_order_book_reports_volume_at_level() {
+        let mut lob = LocalOrderBook::new();
+        lob.apply_delta(Side::Buy, Decimal::from(100), Decimal::from(3));
+        lob.apply_delta(Side::Sell, Decimal::from(105), Decimal::from(2));
+
+        assert_eq!(
+            lob.volume_at_level(Side::Buy, Decimal::from(100)),
+            Decimal::from(3)
+        );
+        assert_eq!(
+            lob.volume_at_level(Side::Sell, Decimal::from(105)),
+            Decimal::from(2)
+        );
+        assert_eq!(
+            lob.volume_at_level(Side::Buy, Decimal::from(101)),
+            Decimal::ZERO
+        );
     }
 }
