@@ -15,11 +15,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, warn};
 
-use tesser_core::{Candle, Fill, Order, Signal, Tick};
+use tesser_core::{Candle, Fill, Order, OrderBook, Signal, Tick};
 
 use crate::encoding::{
-    candle_schema, candles_to_batch, fill_schema, fills_to_batch, order_schema, orders_to_batch,
-    signal_schema, signals_to_batch, tick_schema, ticks_to_batch,
+    candle_schema, candles_to_batch, fill_schema, fills_to_batch, order_book_schema,
+    order_books_to_batch, order_schema, orders_to_batch, signal_schema, signals_to_batch,
+    tick_schema, ticks_to_batch,
 };
 
 /// Configuration used when spawning a [`ParquetRecorder`].
@@ -121,6 +122,15 @@ impl RecorderHandle {
         self.enqueue(RecorderMessage::Order(order), "order", &ORDER_SATURATION);
     }
 
+    /// Enqueues an order book snapshot for recording.
+    pub fn record_order_book(&self, book: OrderBook) {
+        self.enqueue(
+            RecorderMessage::OrderBook(book),
+            "order_book",
+            &ORDER_BOOK_SATURATION,
+        );
+    }
+
     /// Enqueues a signal for recording.
     pub fn record_signal(&self, signal: Signal) {
         self.enqueue(
@@ -150,6 +160,7 @@ enum RecorderMessage {
     Candle(Candle),
     Fill(Fill),
     Order(Order),
+    OrderBook(OrderBook),
     Signal(Signal),
 }
 
@@ -157,6 +168,7 @@ static TICK_SATURATION: AtomicBool = AtomicBool::new(false);
 static CANDLE_SATURATION: AtomicBool = AtomicBool::new(false);
 static FILL_SATURATION: AtomicBool = AtomicBool::new(false);
 static ORDER_SATURATION: AtomicBool = AtomicBool::new(false);
+static ORDER_BOOK_SATURATION: AtomicBool = AtomicBool::new(false);
 static SIGNAL_SATURATION: AtomicBool = AtomicBool::new(false);
 
 struct FlightRecorderWorker {
@@ -165,6 +177,7 @@ struct FlightRecorderWorker {
     candle_sink: DataSink<CandleEncoder>,
     fill_sink: DataSink<FillEncoder>,
     order_sink: DataSink<OrderEncoder>,
+    book_sink: DataSink<OrderBookEncoder>,
     signal_sink: DataSink<SignalEncoder>,
     flush_interval: Duration,
 }
@@ -181,6 +194,7 @@ impl FlightRecorderWorker {
         let candle_dir = ensure_subdir(&config.root, CandleEncoder::KIND).await?;
         let fill_dir = ensure_subdir(&config.root, FillEncoder::KIND).await?;
         let order_dir = ensure_subdir(&config.root, OrderEncoder::KIND).await?;
+        let book_dir = ensure_subdir(&config.root, OrderBookEncoder::KIND).await?;
         let signal_dir = ensure_subdir(&config.root, SignalEncoder::KIND).await?;
 
         Ok(Self {
@@ -208,6 +222,13 @@ impl FlightRecorderWorker {
             ),
             order_sink: DataSink::new(
                 order_dir,
+                config.max_buffered_rows,
+                config.max_rows_per_file,
+                config.flush_interval,
+                writer_props.clone(),
+            ),
+            book_sink: DataSink::new(
+                book_dir,
                 config.max_buffered_rows,
                 config.max_rows_per_file,
                 config.flush_interval,
@@ -241,6 +262,7 @@ impl FlightRecorderWorker {
                     self.candle_sink.maybe_flush_due_time().await?;
                     self.fill_sink.maybe_flush_due_time().await?;
                     self.order_sink.maybe_flush_due_time().await?;
+                    self.book_sink.maybe_flush_due_time().await?;
                     self.signal_sink.maybe_flush_due_time().await?;
                 }
             }
@@ -250,6 +272,7 @@ impl FlightRecorderWorker {
         self.candle_sink.shutdown().await?;
         self.fill_sink.shutdown().await?;
         self.order_sink.shutdown().await?;
+        self.book_sink.shutdown().await?;
         self.signal_sink.shutdown().await?;
         Ok(())
     }
@@ -260,6 +283,7 @@ impl FlightRecorderWorker {
             RecorderMessage::Candle(candle) => self.candle_sink.push(candle).await?,
             RecorderMessage::Fill(fill) => self.fill_sink.push(fill).await?,
             RecorderMessage::Order(order) => self.order_sink.push(order).await?,
+            RecorderMessage::OrderBook(book) => self.book_sink.push(book).await?,
             RecorderMessage::Signal(signal) => self.signal_sink.push(signal).await?,
         }
         Ok(())
@@ -287,6 +311,7 @@ struct TickEncoder;
 struct CandleEncoder;
 struct FillEncoder;
 struct OrderEncoder;
+struct OrderBookEncoder;
 struct SignalEncoder;
 
 impl SinkEncoder for TickEncoder {
@@ -546,6 +571,23 @@ impl ActiveWriter {
         self.writer.finish().await?;
         debug!(path = %self.path.display(), "closed flight recorder file");
         Ok(())
+    }
+}
+
+impl SinkEncoder for OrderBookEncoder {
+    type Record = OrderBook;
+    const KIND: &'static str = "order_books";
+
+    fn schema() -> Arc<arrow::datatypes::Schema> {
+        order_book_schema()
+    }
+
+    fn encode(records: &[Self::Record]) -> Result<arrow::record_batch::RecordBatch> {
+        order_books_to_batch(records)
+    }
+
+    fn partition_for(record: &Self::Record) -> NaiveDate {
+        record.timestamp.date_naive()
     }
 }
 

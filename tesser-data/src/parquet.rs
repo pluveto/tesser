@@ -5,7 +5,8 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{
-    Array, Decimal128Array, Int8Array, ListArray, StringArray, TimestampNanosecondArray,
+    Array, Decimal128Array, Int8Array, ListArray, StringArray, StructArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -426,10 +427,8 @@ impl CandleColumns {
 
 struct OrderBookColumns {
     symbol: usize,
-    bids_price: usize,
-    bids_size: usize,
-    asks_price: usize,
-    asks_size: usize,
+    bids: LevelColumn,
+    asks: LevelColumn,
     timestamp: usize,
 }
 
@@ -437,10 +436,8 @@ impl OrderBookColumns {
     fn from_schema(schema: &SchemaRef) -> Result<Self> {
         Ok(Self {
             symbol: column_index(schema, "symbol")?,
-            bids_price: column_index(schema, "bids_price")?,
-            bids_size: column_index(schema, "bids_size")?,
-            asks_price: column_index(schema, "asks_price")?,
-            asks_size: column_index(schema, "asks_size")?,
+            bids: LevelColumn::resolve(schema, "bids", "bids_price", "bids_size")?,
+            asks: LevelColumn::resolve(schema, "asks", "asks_price", "asks_size")?,
             timestamp: column_index(schema, "timestamp")?,
         })
     }
@@ -448,10 +445,8 @@ impl OrderBookColumns {
 
 struct DepthColumns {
     symbol: usize,
-    bids_price: usize,
-    bids_size: usize,
-    asks_price: usize,
-    asks_size: usize,
+    bids: LevelColumn,
+    asks: LevelColumn,
     timestamp: usize,
 }
 
@@ -459,12 +454,40 @@ impl DepthColumns {
     fn from_schema(schema: &SchemaRef) -> Result<Self> {
         Ok(Self {
             symbol: column_index(schema, "symbol")?,
-            bids_price: column_index(schema, "bids_price")?,
-            bids_size: column_index(schema, "bids_size")?,
-            asks_price: column_index(schema, "asks_price")?,
-            asks_size: column_index(schema, "asks_size")?,
+            bids: LevelColumn::resolve(schema, "bids", "bids_price", "bids_size")?,
+            asks: LevelColumn::resolve(schema, "asks", "asks_price", "asks_size")?,
             timestamp: column_index(schema, "timestamp")?,
         })
+    }
+}
+
+enum LevelColumn {
+    Struct { column: usize },
+    Split { price: usize, size: usize },
+}
+
+impl LevelColumn {
+    fn resolve(
+        schema: &SchemaRef,
+        struct_name: &str,
+        price_name: &str,
+        size_name: &str,
+    ) -> Result<Self> {
+        if let Some(idx) = optional_column_index(schema, struct_name) {
+            Ok(Self::Struct { column: idx })
+        } else {
+            Ok(Self::Split {
+                price: column_index(schema, price_name)?,
+                size: column_index(schema, size_name)?,
+            })
+        }
+    }
+
+    fn decode(&self, batch: &RecordBatch, row: usize) -> Result<Vec<OrderBookLevel>> {
+        match self {
+            Self::Struct { column } => struct_level_columns(batch, *column, row),
+            Self::Split { price, size } => level_columns(batch, *price, *size, row),
+        }
     }
 }
 
@@ -473,6 +496,10 @@ fn column_index(schema: &SchemaRef, name: &str) -> Result<usize> {
         .column_with_name(name)
         .map(|(idx, _)| idx)
         .ok_or_else(|| anyhow!("column '{name}' missing from parquet schema"))
+}
+
+fn optional_column_index(schema: &SchemaRef, name: &str) -> Option<usize> {
+    schema.column_with_name(name).map(|(idx, _)| idx)
 }
 
 fn decode_tick(batch: &RecordBatch, row: usize, columns: &TickColumns) -> Result<Tick> {
@@ -521,8 +548,8 @@ fn decode_order_book(
     columns: &OrderBookColumns,
 ) -> Result<OrderBook> {
     let symbol = string_value(batch, columns.symbol, row)?;
-    let bids = level_columns(batch, columns.bids_price, columns.bids_size, row)?;
-    let asks = level_columns(batch, columns.asks_price, columns.asks_size, row)?;
+    let bids = columns.bids.decode(batch, row)?;
+    let asks = columns.asks.decode(batch, row)?;
     let timestamp = timestamp_value(batch, columns.timestamp, row)?;
     Ok(OrderBook {
         symbol,
@@ -541,8 +568,8 @@ fn decode_depth_update(
 ) -> Result<DepthUpdate> {
     Ok(DepthUpdate {
         symbol: string_value(batch, columns.symbol, row)?,
-        bids: level_columns(batch, columns.bids_price, columns.bids_size, row)?,
-        asks: level_columns(batch, columns.asks_price, columns.asks_size, row)?,
+        bids: columns.bids.decode(batch, row)?,
+        asks: columns.asks.decode(batch, row)?,
         timestamp: timestamp_value(batch, columns.timestamp, row)?,
     })
 }
@@ -604,6 +631,47 @@ fn decimal_list(batch: &RecordBatch, column: usize, row: usize) -> Result<Vec<De
             decimals.value(idx),
             decimals.scale() as u32,
         ));
+    }
+    Ok(out)
+}
+
+fn struct_level_columns(
+    batch: &RecordBatch,
+    column: usize,
+    row: usize,
+) -> Result<Vec<OrderBookLevel>> {
+    let list = as_array::<ListArray>(batch, column)?;
+    if list.is_null(row) {
+        return Ok(Vec::new());
+    }
+    let values = list.value(row);
+    let structs = values
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| anyhow!("column {column} is not a struct list"))?;
+    let price = structs
+        .column_by_name("price")
+        .and_then(|arr| arr.as_any().downcast_ref::<Decimal128Array>())
+        .ok_or_else(|| anyhow!("missing price column in order book struct"))?;
+    let size = structs
+        .column_by_name("size")
+        .and_then(|arr| arr.as_any().downcast_ref::<Decimal128Array>())
+        .ok_or_else(|| anyhow!("missing size column in order book struct"))?;
+    if price.len() != size.len() || price.len() != structs.len() {
+        return Err(anyhow!("inconsistent order book struct column lengths"));
+    }
+    let mut out = Vec::with_capacity(structs.len());
+    for idx in 0..structs.len() {
+        if structs.is_null(idx) {
+            continue;
+        }
+        if price.is_null(idx) || size.is_null(idx) {
+            return Err(anyhow!("order book struct contains null price or size"));
+        }
+        out.push(OrderBookLevel {
+            price: Decimal::from_i128_with_scale(price.value(idx), price.scale() as u32),
+            size: Decimal::from_i128_with_scale(size.value(idx), size.scale() as u32),
+        });
     }
     Ok(out)
 }
@@ -692,9 +760,9 @@ mod tests {
     use rust_decimal::Decimal;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use tesser_core::{Interval, Side};
+    use tesser_core::{Interval, OrderBook, OrderBookLevel, Side};
 
-    use crate::encoding::{candles_to_batch, ticks_to_batch};
+    use crate::encoding::{candles_to_batch, order_books_to_batch, ticks_to_batch};
 
     const TEST_DECIMAL_PRECISION: u8 = 38;
     const TEST_DECIMAL_SCALE: u32 = 18;
@@ -715,6 +783,21 @@ mod tests {
     }
 
     fn order_book_batch(rows: &[BookRow]) -> Result<RecordBatch> {
+        let books = rows
+            .iter()
+            .map(|row| OrderBook {
+                symbol: row.symbol.to_string(),
+                bids: to_levels(&row.bids),
+                asks: to_levels(&row.asks),
+                timestamp: Utc::now(),
+                exchange_checksum: None,
+                local_checksum: None,
+            })
+            .collect::<Vec<_>>();
+        order_books_to_batch(&books)
+    }
+
+    fn legacy_order_book_batch(rows: &[BookRow]) -> Result<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
             list_field("bids_price"),
@@ -757,6 +840,16 @@ mod tests {
             ],
         )
         .context("failed to build order book batch")
+    }
+
+    fn to_levels(levels: &[(Decimal, Decimal)]) -> Vec<OrderBookLevel> {
+        levels
+            .iter()
+            .map(|(price, size)| OrderBookLevel {
+                price: *price,
+                size: *size,
+            })
+            .collect()
     }
 
     fn list_field(name: &str) -> Field {
@@ -872,7 +965,7 @@ mod tests {
             bids: vec![(Decimal::new(20_000, 0), Decimal::new(2, 0))],
             asks: vec![(Decimal::new(20_010, 0), Decimal::new(3, 0))],
         }];
-        let batch = order_book_batch(&rows)?;
+        let batch = legacy_order_book_batch(&rows)?;
         write_parquet_file(&path, &batch)?;
 
         let mut stream = ParquetMarketStream::with_order_books(vec!["BTCUSDT".into()], vec![path]);
