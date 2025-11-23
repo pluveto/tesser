@@ -4017,7 +4017,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tesser"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "tesser-backtester",
@@ -4040,7 +4040,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-backtester"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4062,7 +4062,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-binance"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4083,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-broker"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "governor",
@@ -4097,7 +4097,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-bybit"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4120,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4169,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-config"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "config",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -4192,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-cortex"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-data"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4227,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-events"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "tesser-core",
@@ -4236,7 +4236,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-execution"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-indicators"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "num-traits",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-journal"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-markets"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "tesser-broker",
@@ -4295,7 +4295,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-paper"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4314,7 +4314,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-portfolio"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -4329,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-rpc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4357,7 +4357,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-strategy"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4377,7 +4377,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-strategy-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4386,7 +4386,7 @@ dependencies = [
 
 [[package]]
 name = "tesser-test-utils"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",

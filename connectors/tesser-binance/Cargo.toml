@@ -22,5 +22,5 @@ tokio-tungstenite.workspace = true
 reqwest.workspace = true
 binance-sdk = { version = "31", features = ["derivatives_trading_usds_futures"] }
 uuid.workspace = true
-tesser-broker = { version = "0.8.0", path = "../../tesser-broker" }
-tesser-core = { version = "0.8.0", path = "../../tesser-core" }
+tesser-broker = { version = "0.9.0", path = "../../tesser-broker" }
+tesser-core = { version = "0.9.0", path = "../../tesser-core" }
