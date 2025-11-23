@@ -6,6 +6,7 @@ use crate::live::{
 };
 use crate::state;
 use crate::telemetry::init_tracing;
+use crate::tui;
 use crate::PublicChannel;
 use arrow::util::pretty::print_batches;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -94,6 +95,8 @@ pub enum Commands {
         #[command(subcommand)]
         action: AnalyzeCommand,
     },
+    /// Launch the real-time TUI dashboard
+    Monitor(MonitorArgs),
 }
 
 #[derive(Subcommand)]
@@ -190,6 +193,16 @@ pub struct AnalyzeExecutionArgs {
     export_csv: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct MonitorArgs {
+    /// Control plane address (overrides config.live.control_addr)
+    #[arg(long)]
+    control_addr: Option<String>,
+    /// UI refresh rate in milliseconds
+    #[arg(long, default_value_t = 250)]
+    tick_rate: u64,
+}
+
 impl StateInspectArgs {
     fn resolved_path(&self, config: &AppConfig) -> PathBuf {
         self.path
@@ -199,6 +212,18 @@ impl StateInspectArgs {
 
     fn resolved_engine(&self, config: &AppConfig) -> PersistenceEngine {
         config.live.persistence_config().engine
+    }
+}
+
+impl MonitorArgs {
+    async fn run(&self, config: &AppConfig) -> Result<()> {
+        let addr = self
+            .control_addr
+            .clone()
+            .unwrap_or_else(|| config.live.control_addr.clone());
+        let refresh = self.tick_rate.max(50);
+        let monitor_config = tui::MonitorConfig::new(addr, StdDuration::from_millis(refresh));
+        tui::run_monitor(monitor_config).await
     }
 }
 
@@ -799,6 +824,7 @@ pub async fn run() -> Result<()> {
         Commands::State { action } => handle_state(action, &config).await?,
         Commands::Analyze { action } => handle_analyze(action)?,
         Commands::Strategies => list_strategies(),
+        Commands::Monitor(args) => args.run(&config).await?,
     }
 
     Ok(())

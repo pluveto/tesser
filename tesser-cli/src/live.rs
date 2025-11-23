@@ -727,24 +727,51 @@ impl LiveRuntime {
         let backoff = Duration::from_millis(200);
         let mut orchestrator_timer = tokio::time::interval(Duration::from_secs(1));
 
-        while !self.shutdown.triggered() {
+        'run: while !self.shutdown.triggered() {
             let mut progressed = false;
 
-            if let Some(tick) = self.market.next_tick().await? {
-                progressed = true;
-                self.event_bus.publish(Event::Tick(TickEvent { tick }));
+            let tick = tokio::select! {
+                res = self.market.next_tick() => Some(res),
+                _ = self.shutdown.wait() => None,
+            };
+            match tick {
+                Some(res) => {
+                    if let Some(tick) = res? {
+                        progressed = true;
+                        self.event_bus.publish(Event::Tick(TickEvent { tick }));
+                    }
+                }
+                None => break 'run,
             }
 
-            if let Some(candle) = self.market.next_candle().await? {
-                progressed = true;
-                self.event_bus
-                    .publish(Event::Candle(CandleEvent { candle }));
+            let candle = tokio::select! {
+                res = self.market.next_candle() => Some(res),
+                _ = self.shutdown.wait() => None,
+            };
+            match candle {
+                Some(res) => {
+                    if let Some(candle) = res? {
+                        progressed = true;
+                        self.event_bus
+                            .publish(Event::Candle(CandleEvent { candle }));
+                    }
+                }
+                None => break 'run,
             }
 
-            if let Some(book) = self.market.next_order_book().await? {
-                progressed = true;
-                self.event_bus
-                    .publish(Event::OrderBook(OrderBookEvent { order_book: book }));
+            let book = tokio::select! {
+                res = self.market.next_order_book() => Some(res),
+                _ = self.shutdown.wait() => None,
+            };
+            match book {
+                Some(res) => {
+                    if let Some(book) = res? {
+                        progressed = true;
+                        self.event_bus
+                            .publish(Event::OrderBook(OrderBookEvent { order_book: book }));
+                    }
+                }
+                None => break 'run,
             }
 
             tokio::select! {
@@ -780,6 +807,7 @@ impl LiveRuntime {
                         error!("Orchestrator timer tick failed: {}", e);
                     }
                 }
+                _ = self.shutdown.wait() => break 'run,
                 else => {}
             }
 
