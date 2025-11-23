@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 use tesser_broker::{BrokerError, ExecutionClient};
-use tesser_core::{Instrument, Symbol};
+use tesser_core::{AssetId, ExchangeId, Instrument, InstrumentKind, Price, Quantity, Symbol};
 use thiserror::Error;
 
 /// Shared registry storing immutable instrument definitions.
@@ -40,7 +40,8 @@ impl MarketRegistry {
         })?;
         let file: MarketFile =
             toml::from_str(&contents).map_err(MarketRegistryError::InvalidFormat)?;
-        Self::from_instruments(file.into_instruments())
+        let instruments = file.into_instruments()?;
+        Self::from_instruments(instruments)
     }
 
     /// Fetch market metadata from the execution client.
@@ -98,6 +99,18 @@ pub enum MarketRegistryError {
     Empty,
     #[error("unknown symbol '{0}'")]
     UnknownSymbol(Symbol),
+    #[error("instrument '{symbol}' on {exchange} missing required field '{field}'")]
+    MissingField {
+        exchange: ExchangeId,
+        symbol: String,
+        field: &'static str,
+    },
+    #[error("instrument '{symbol}' on {exchange} has conflicting value for '{field}'")]
+    ConflictingField {
+        exchange: ExchangeId,
+        symbol: String,
+        field: &'static str,
+    },
     #[error("markets file is invalid: {0}")]
     InvalidFormat(toml::de::Error),
     #[error("failed to read markets file at {path}: {source}")]
@@ -115,11 +128,140 @@ pub enum MarketRegistryError {
 #[derive(Deserialize)]
 struct MarketFile {
     #[serde(default)]
-    markets: Vec<Instrument>,
+    markets: Vec<InstrumentInfo>,
 }
 
 impl MarketFile {
-    fn into_instruments(self) -> Vec<Instrument> {
-        self.markets
+    fn into_instruments(self) -> Result<Vec<Instrument>, MarketRegistryError> {
+        let mut merged: HashMap<(ExchangeId, String), InstrumentInfo> = HashMap::new();
+        for info in self.markets {
+            let key = info.key();
+            if let Some(existing) = merged.remove(&key) {
+                let combined = existing.merge(info)?;
+                merged.insert(key, combined);
+            } else {
+                merged.insert(key, info);
+            }
+        }
+        merged
+            .into_values()
+            .map(|info| info.into_instrument())
+            .collect()
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InstrumentInfo {
+    exchange: String,
+    symbol: String,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    quote: Option<String>,
+    #[serde(default)]
+    settlement_currency: Option<String>,
+    #[serde(default)]
+    kind: Option<InstrumentKind>,
+    #[serde(default)]
+    tick_size: Option<Price>,
+    #[serde(default)]
+    lot_size: Option<Quantity>,
+}
+
+impl InstrumentInfo {
+    fn key(&self) -> (ExchangeId, String) {
+        let exchange = ExchangeId::from(self.exchange.as_str());
+        (exchange, self.symbol.trim().to_ascii_uppercase())
+    }
+
+    fn merge(self, other: InstrumentInfo) -> Result<InstrumentInfo, MarketRegistryError> {
+        let (exchange, symbol) = self.key();
+        let (other_exchange, other_symbol) = other.key();
+        if exchange != other_exchange || symbol != other_symbol {
+            return Err(MarketRegistryError::ConflictingField {
+                exchange,
+                symbol,
+                field: "symbol",
+            });
+        }
+        Ok(InstrumentInfo {
+            exchange: self.exchange,
+            symbol: symbol.clone(),
+            base: merge_field(exchange, &symbol, "base", self.base, other.base)?,
+            quote: merge_field(exchange, &symbol, "quote", self.quote, other.quote)?,
+            settlement_currency: merge_field(
+                exchange,
+                &symbol,
+                "settlement_currency",
+                self.settlement_currency,
+                other.settlement_currency,
+            )?,
+            kind: merge_field(exchange, &symbol, "kind", self.kind, other.kind)?,
+            tick_size: merge_field(exchange, &symbol, "tick_size", self.tick_size, other.tick_size)?,
+            lot_size: merge_field(exchange, &symbol, "lot_size", self.lot_size, other.lot_size)?,
+        })
+    }
+
+    fn into_instrument(self) -> Result<Instrument, MarketRegistryError> {
+        let (exchange, symbol_code) = self.key();
+        let base = require_field(exchange, &symbol_code, "base", self.base)?;
+        let quote = require_field(exchange, &symbol_code, "quote", self.quote)?;
+        let settlement = require_field(
+            exchange,
+            &symbol_code,
+            "settlement_currency",
+            self.settlement_currency,
+        )?;
+        let kind = require_field(exchange, &symbol_code, "kind", self.kind)?;
+        let tick_size = require_field(exchange, &symbol_code, "tick_size", self.tick_size)?;
+        let lot_size = require_field(exchange, &symbol_code, "lot_size", self.lot_size)?;
+
+        Ok(Instrument {
+            symbol: Symbol::from_code(exchange, symbol_code.clone()),
+            base: AssetId::from_code(exchange, base),
+            quote: AssetId::from_code(exchange, quote),
+            kind,
+            settlement_currency: AssetId::from_code(exchange, settlement),
+            tick_size,
+            lot_size,
+        })
+    }
+}
+
+fn merge_field<T: Clone + PartialEq>(
+    exchange: ExchangeId,
+    symbol: &str,
+    field: &'static str,
+    primary: Option<T>,
+    secondary: Option<T>,
+) -> Result<Option<T>, MarketRegistryError> {
+    match (primary, secondary) {
+        (Some(existing), Some(replacement)) => {
+            if existing != replacement {
+                Err(MarketRegistryError::ConflictingField {
+                    exchange,
+                    symbol: symbol.to_string(),
+                    field,
+                })
+            } else {
+                Ok(Some(existing))
+            }
+        }
+        (Some(existing), None) => Ok(Some(existing)),
+        (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn require_field<T>(
+    exchange: ExchangeId,
+    symbol: &str,
+    field: &'static str,
+    value: Option<T>,
+) -> Result<T, MarketRegistryError> {
+    value.ok_or_else(|| MarketRegistryError::MissingField {
+        exchange,
+        symbol: symbol.to_string(),
+        field,
+    })
 }
