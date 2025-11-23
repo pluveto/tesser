@@ -37,6 +37,8 @@ pub struct MonitorApp {
     stream_connected: bool,
     cancel_in_progress: bool,
     should_quit: bool,
+    overlay: CommandOverlay,
+    overlay_error: Option<String>,
 }
 
 impl MonitorApp {
@@ -53,6 +55,8 @@ impl MonitorApp {
             stream_connected: false,
             cancel_in_progress: false,
             should_quit: false,
+            overlay: CommandOverlay::Hidden,
+            overlay_error: None,
         }
     }
 
@@ -181,6 +185,72 @@ impl MonitorApp {
 
     pub fn cancel_in_progress(&self) -> bool {
         self.cancel_in_progress
+    }
+
+    pub fn overlay(&self) -> &CommandOverlay {
+        &self.overlay
+    }
+
+    pub fn overlay_error(&self) -> Option<&str> {
+        self.overlay_error.as_deref()
+    }
+
+    pub fn overlay_visible(&self) -> bool {
+        !matches!(self.overlay, CommandOverlay::Hidden)
+    }
+
+    pub fn open_command_palette(&mut self) {
+        self.overlay = CommandOverlay::Palette;
+        self.overlay_error = None;
+    }
+
+    pub fn close_overlay(&mut self) {
+        self.overlay = CommandOverlay::Hidden;
+        self.overlay_error = None;
+    }
+
+    pub fn begin_cancel_confirmation(&mut self) {
+        self.overlay = CommandOverlay::Confirm {
+            buffer: String::new(),
+        };
+        self.overlay_error = None;
+    }
+
+    pub fn append_confirmation_char(&mut self, ch: char) {
+        if let CommandOverlay::Confirm { buffer } = &mut self.overlay {
+            buffer.push(ch);
+        }
+    }
+
+    pub fn backspace_confirmation(&mut self) {
+        if let CommandOverlay::Confirm { buffer } = &mut self.overlay {
+            buffer.pop();
+        }
+    }
+
+    pub fn confirmation_buffer(&self) -> Option<&str> {
+        match &self.overlay {
+            CommandOverlay::Confirm { buffer } => Some(buffer.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn confirmation_matches(&self) -> bool {
+        self.confirmation_buffer()
+            .map(|buf| buf.trim().eq_ignore_ascii_case("cancel all"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_overlay_error(&mut self, msg: impl Into<String>) {
+        self.overlay_error = Some(msg.into());
+    }
+
+    pub fn toggle_command_palette(&mut self) {
+        if matches!(self.overlay, CommandOverlay::Palette) {
+            self.close_overlay();
+        } else {
+            self.open_command_palette();
+        }
     }
 
     pub fn record_info(&mut self, msg: impl Into<String>) {
@@ -323,4 +393,11 @@ fn order_status(status: i32) -> &'static str {
         proto::OrderStatus::Rejected => "REJECTED",
         proto::OrderStatus::Unspecified => "UNKNOWN",
     }
+}
+
+#[derive(Clone)]
+pub enum CommandOverlay {
+    Hidden,
+    Palette,
+    Confirm { buffer: String },
 }

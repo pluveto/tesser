@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap},
@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use tesser_rpc::conversions::{from_decimal_proto, from_timestamp_proto};
 use tesser_rpc::proto;
 
-use super::app::{LogCategory, MonitorApp};
+use super::app::{CommandOverlay, LogCategory, MonitorApp};
 
 pub fn draw(f: &mut Frame<'_>, app: &MonitorApp) {
     let layout = Layout::default()
@@ -39,6 +39,7 @@ pub fn draw(f: &mut Frame<'_>, app: &MonitorApp) {
 
     render_log(f, footer[0], app);
     render_help(f, footer[1]);
+    render_overlay(f, f.size(), app);
 }
 
 fn render_header(f: &mut Frame<'_>, area: Rect, app: &MonitorApp) {
@@ -271,10 +272,81 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &MonitorApp) {
 }
 
 fn render_help(f: &mut Frame<'_>, area: Rect) {
-    let help = Paragraph::new("Shortcuts: [q] Quit  [Ctrl+C] Quit  [c] Cancel all orders")
-        .block(Block::default().borders(Borders::ALL).title("Help"))
-        .wrap(Wrap { trim: true });
+    let help =
+        Paragraph::new("Shortcuts: [q] Quit  [Ctrl+C] Quit  [m] Command palette (m → c → confirm)")
+            .block(Block::default().borders(Borders::ALL).title("Help"))
+            .wrap(Wrap { trim: true });
     f.render_widget(help, area);
+}
+
+fn render_overlay(f: &mut Frame<'_>, area: Rect, app: &MonitorApp) {
+    match app.overlay() {
+        CommandOverlay::Hidden => {}
+        CommandOverlay::Palette => {
+            let chunk = centered_rect(60, 30, area);
+            let block = Block::default()
+                .title("Command Palette")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black));
+            let lines = vec![
+                Line::from("Press 'c' to initiate Cancel All."),
+                Line::from("Press Esc (or 'm') to close this panel."),
+            ];
+            let paragraph = Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: true })
+                .block(block);
+            f.render_widget(paragraph, chunk);
+        }
+        CommandOverlay::Confirm { .. } => {
+            let chunk = centered_rect(70, 35, area);
+            let mut lines = vec![
+                Line::from("Type 'cancel all' and press Enter to confirm."),
+                Line::from("This action will cancel every open order and running algo."),
+                Line::from(""),
+            ];
+            let input = app.confirmation_buffer().unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Gray)),
+                Span::styled(input.to_string(), Style::default().fg(Color::White)),
+            ]));
+            if let Some(err) = app.overlay_error() {
+                lines.push(Line::from(Span::styled(
+                    err,
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            let block = Block::default()
+                .title("Confirm Cancel All")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black));
+            let paragraph = Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: true })
+                .block(block);
+            f.render_widget(paragraph, chunk);
+        }
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let vertical = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1]);
+    vertical[1]
 }
 
 fn label(text: &str) -> Span<'_> {

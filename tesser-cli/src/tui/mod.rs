@@ -2,6 +2,7 @@ mod app;
 mod events;
 mod ui;
 
+use app::CommandOverlay;
 pub use app::{LogCategory, LogEntry, MonitorApp, MonitorConfig};
 
 use anyhow::{anyhow, Context, Result};
@@ -132,6 +133,9 @@ async fn handle_key_event(
     app: &mut MonitorApp,
     cancel_client: &mut ControlServiceClient<Channel>,
 ) -> Result<()> {
+    if handle_overlay_key(key, app, cancel_client).await? {
+        return Ok(());
+    }
     match key.code {
         crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
             app.request_quit();
@@ -139,16 +143,73 @@ async fn handle_key_event(
         crossterm::event::KeyCode::Char('c') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.request_quit();
-            } else {
-                trigger_cancel_all(app, cancel_client).await?;
+            }
+        }
+        crossterm::event::KeyCode::Char('m') | crossterm::event::KeyCode::Char('M') => {
+            app.toggle_command_palette();
+            if matches!(app.overlay(), crate::tui::app::CommandOverlay::Palette) {
+                app.record_info("Command palette opened");
             }
         }
         crossterm::event::KeyCode::Char('C') => {
-            trigger_cancel_all(app, cancel_client).await?;
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.request_quit();
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+async fn handle_overlay_key(
+    key: KeyEvent,
+    app: &mut MonitorApp,
+    cancel_client: &mut ControlServiceClient<Channel>,
+) -> Result<bool> {
+    use crossterm::event::KeyCode;
+    match app.overlay() {
+        CommandOverlay::Hidden => Ok(false),
+        CommandOverlay::Palette => {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    app.begin_cancel_confirmation();
+                    app.record_info("Confirm cancel-all by typing 'cancel all'");
+                }
+                KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('M') => {
+                    app.close_overlay();
+                }
+                _ => {}
+            }
+            Ok(true)
+        }
+        CommandOverlay::Confirm { .. } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('M') => {
+                    app.close_overlay();
+                }
+                KeyCode::Backspace => {
+                    app.backspace_confirmation();
+                }
+                KeyCode::Enter => {
+                    if app.confirmation_matches() {
+                        app.close_overlay();
+                        trigger_cancel_all(app, cancel_client).await?;
+                    } else {
+                        app.set_overlay_error("Type 'cancel all' exactly to proceed.");
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        app.append_confirmation_char(ch);
+                    }
+                }
+                _ => {}
+            }
+            Ok(true)
+        }
+    }
 }
 
 async fn trigger_cancel_all(
