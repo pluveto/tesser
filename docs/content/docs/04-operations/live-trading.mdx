@@ -55,6 +55,16 @@ weight_limit_per_minute = 600  # default is 1200, lower it for testing
 
 Each connector now waits for the appropriate token bucket before issuing HTTP calls, shielding your API keys from accidental bans while still allowing you to dial in higher tiers as your VIP level increases.
 
+## Native Order Amendments
+
+High-frequency strategies no longer need to spam cancel + replace cycles just to keep a passive order near the touch. The Bybit, Binance Futures, and paper connectors now implement the exchanges’ native `amend` endpoints, and the execution engine’s `PeggedBest` algorithm chases by mutating the resting child order in place. This cuts the REST call count roughly in half and preserves queue position during volatile bursts.
+
+Tips:
+
+- Exchanges still meter amend calls separately, so size your `min_chase_distance` (new hint field) to match the venue’s tick size and weight rules.
+- Amendments inherit the existing order ID/state. When the process restarts, the orchestrator rebinds open children and resumes chasing without resubmitting fresh orders.
+- If an exchange rejects an amend (e.g., because the order already filled), the runtime automatically falls back to placing a new child order on the next tick.
+
 ## Flight Recorder
 
 Set `--record-data <path>` when you launch `tesser-cli live run` to stream every `Tick`, `Candle`, `Fill`, and order update into partitioned Parquet files. The recorder runs on its own Tokio task, buffers data in Arrow `RecordBatch`es, and rotates files per day under the provided directory (defaults to `data/flight_recorder`).

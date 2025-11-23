@@ -184,7 +184,7 @@ In tick mode the backtester replays historical depth snapshots through the high-
 
 Execution hints now support specialized algorithms (configured through your strategies):
 
-- `ExecutionHint::PeggedBest` – refreshes IOC slices at the top of book (used by the new `OrderBookScalper`).
+- `ExecutionHint::PeggedBest` – refreshes passive orders at the top of book using native amend/replace so queue position is preserved; tune `clip_size`, `refresh_secs`, and the optional `min_chase_distance` per strategy to control how aggressively it chases.
 - `ExecutionHint::Sniper` – waits for a target price before sweeping liquidity (used by the `VolatilitySkew` playbook).
 - Existing hints (`Twap`, `Vwap`, `IcebergSimulated`) continue to work unchanged, and their state is persisted via SQLite so in-flight schedules recover from process restarts.
 

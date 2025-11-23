@@ -14,3 +14,16 @@ Signal -> Execution -> Risk -> Orders -> Exchange -> Fills -> Portfolio
 ```
 
 Keep the signal payload focused on *intent* (e.g., “go long BTCUSDT, size 0.5”). Pricing tactics, throttling, and compliance rules live downstream so they can be audited centrally.
+
+## PeggedBest Execution Hint
+
+Attach `ExecutionHint::PeggedBest` to a signal when you want the execution layer to rest passively at the top of book and automatically “chase” the quote. The orchestrator now keeps a single child order working on the exchange and issues native amendments instead of cancel/re-place cycles, which preserves queue position and dramatically reduces API weight consumption.
+
+Tuning knobs:
+
+- `offset_bps` – how far inside/outside the top of book the pegged order should anchor.
+- `clip_size` – optional maximum displayed size per child (falls back to the full parent quantity).
+- `refresh_secs` – minimum time between refreshes; use this with volatile markets to avoid thrashing.
+- `min_chase_distance` – the newest knob; it sets the minimum price delta (in absolute quote terms) before a chase occurs, providing a guardrail against micro-ticks that would otherwise generate excessive amend calls.
+
+Because the runtime amends the resting child order in place, fills stream back against a single order ID and state is persisted through restarts. Set `min_chase_distance` according to your tick size and exchange rate limits to balance spread capture against API pressure.

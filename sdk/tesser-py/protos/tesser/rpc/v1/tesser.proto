@@ -99,7 +99,12 @@ message Fill {
 message TwapHint { google.protobuf.Duration duration = 1; }
 message VwapHint { google.protobuf.Duration duration = 1; Decimal participation_rate = 2; }
 message IcebergHint { Decimal display_size = 1; Decimal limit_offset_bps = 2; }
-message PeggedHint { Decimal offset_bps = 1; Decimal clip_size = 2; uint64 refresh_secs = 3; }
+message PeggedHint {
+  Decimal offset_bps = 1;
+  Decimal clip_size = 2;
+  uint64 refresh_secs = 3;
+  Decimal min_chase_distance = 4;
+}
 message SniperHint { Decimal trigger_price = 1; google.protobuf.Duration timeout = 2; }
 
 message ExecutionHint {
