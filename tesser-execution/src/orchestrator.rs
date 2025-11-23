@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::algorithm::{
     AlgoStatus, ChildOrderAction, ChildOrderRequest, ExecutionAlgorithm, IcebergAlgorithm,
-    PeggedBestAlgorithm, SniperAlgorithm, TwapAlgorithm, VwapAlgorithm,
+    PeggedBestAlgorithm, SniperAlgorithm, TrailingStopAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
 use crate::repository::{AlgoStateRepository, StoredAlgoState};
 use crate::{ExecutionEngine, RiskContext};
@@ -213,6 +213,7 @@ impl OrderOrchestrator {
             "ICEBERG" => Ok(Box::new(IcebergAlgorithm::from_state(state)?)),
             "PEGGED_BEST" => Ok(Box::new(PeggedBestAlgorithm::from_state(state)?)),
             "SNIPER" => Ok(Box::new(SniperAlgorithm::from_state(state)?)),
+            "TRAILING_STOP" => Ok(Box::new(TrailingStopAlgorithm::from_state(state)?)),
             other => bail!("unsupported algorithm type '{other}'"),
         }
     }
@@ -253,6 +254,9 @@ impl OrderOrchestrator {
             return Uuid::parse_str(id_part).ok();
         }
         if let Some(rest) = client_id.strip_prefix("sniper-") {
+            return Uuid::parse_str(rest).ok();
+        }
+        if let Some(rest) = client_id.strip_prefix("trailing-") {
             return Uuid::parse_str(rest).ok();
         }
         None
@@ -301,6 +305,18 @@ impl OrderOrchestrator {
             }) => {
                 self.handle_sniper_signal(signal.clone(), *trigger_price, *timeout, ctx)
                     .await
+            }
+            Some(ExecutionHint::TrailingStop {
+                activation_price,
+                callback_rate,
+            }) => {
+                self.handle_trailing_stop_signal(
+                    signal.clone(),
+                    *activation_price,
+                    *callback_rate,
+                    ctx,
+                )
+                .await
             }
             None => {
                 // Handle normal, non-algorithmic orders
@@ -534,6 +550,44 @@ impl OrderOrchestrator {
         let mut algo = SniperAlgorithm::new(signal, total_quantity, trigger_price, timeout)?;
         let algo_id = *algo.id();
         tracing::info!(id = %algo_id, qty = %total_quantity, "Starting new Sniper algorithm");
+        let initial_orders = algo.start()?;
+        {
+            let mut algorithms = self.algorithms.lock().unwrap();
+            algorithms.insert(algo_id, Box::new(algo));
+        }
+        self.persist_algo_state(&algo_id).await?;
+        for child in initial_orders {
+            self.send_child_order(child, Some(*ctx)).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_trailing_stop_signal(
+        &self,
+        signal: Signal,
+        activation_price: Price,
+        callback_rate: Decimal,
+        ctx: &RiskContext,
+    ) -> Result<()> {
+        self.update_risk_context(signal.symbol.clone(), *ctx);
+        let total_quantity =
+            self.execution_engine
+                .sizer()
+                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        if total_quantity <= Decimal::ZERO {
+            tracing::warn!("Trailing stop order size is zero, skipping");
+            return Ok(());
+        }
+        let mut algo =
+            TrailingStopAlgorithm::new(signal, total_quantity, activation_price, callback_rate)?;
+        let algo_id = *algo.id();
+        tracing::info!(
+            id = %algo_id,
+            qty = %total_quantity,
+            activation = %activation_price,
+            callback = %callback_rate,
+            "Starting new TrailingStop algorithm"
+        );
         let initial_orders = algo.start()?;
         {
             let mut algorithms = self.algorithms.lock().unwrap();

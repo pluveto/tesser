@@ -147,6 +147,10 @@ message PeggedHint {
   Decimal min_chase_distance = 4;
 }
 message SniperHint { Decimal trigger_price = 1; google.protobuf.Duration timeout = 2; }
+message TrailingStopHint {
+  Decimal activation_price = 1;
+  Decimal callback_rate = 2;
+}
 
 message ExecutionHint {
   oneof hint {
@@ -155,6 +159,7 @@ message ExecutionHint {
     IcebergHint iceberg = 3;
     PeggedHint pegged = 4;
     SniperHint sniper = 5;
+    TrailingStopHint trailing_stop = 6;
   }
 }
 

@@ -144,6 +144,11 @@ pub enum ExecutionHint {
         #[serde(default)]
         timeout: Option<Duration>,
     },
+    /// Trailing stop that arms above an activation price and trails by a callback rate.
+    TrailingStop {
+        activation_price: Price,
+        callback_rate: Decimal,
+    },
 }
 
 /// The side of an order or position.

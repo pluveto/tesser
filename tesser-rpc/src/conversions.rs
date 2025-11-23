@@ -382,5 +382,13 @@ fn execution_hint_metadata(hint: &ExecutionHint) -> serde_json::Value {
             "trigger_price": trigger_price.to_string(),
             "timeout_ms": timeout.map(|d| d.num_milliseconds()),
         }),
+        ExecutionHint::TrailingStop {
+            activation_price,
+            callback_rate,
+        } => json!({
+            "type": "trailing_stop",
+            "activation_price": activation_price.to_string(),
+            "callback_rate": callback_rate.to_string(),
+        }),
     }
 }

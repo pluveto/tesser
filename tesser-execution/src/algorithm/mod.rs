@@ -93,3 +93,5 @@ pub use twap::TwapAlgorithm;
 pub use vwap::VwapAlgorithm;
 pub mod sniper;
 pub use sniper::SniperAlgorithm;
+pub mod trailing_stop;
+pub use trailing_stop::TrailingStopAlgorithm;
