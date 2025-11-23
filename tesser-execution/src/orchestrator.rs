@@ -15,7 +15,7 @@ use crate::algorithm::{
 use crate::repository::{AlgoStateRepository, StoredAlgoState};
 use crate::{ExecutionEngine, RiskContext};
 use tesser_core::{
-    ExecutionHint, Fill, Order, OrderRequest, OrderStatus, Price, Quantity, Signal, Tick,
+    ExecutionHint, Fill, Order, OrderRequest, OrderStatus, Price, Quantity, Signal, Symbol, Tick,
 };
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
@@ -48,7 +48,7 @@ pub struct OrderOrchestrator {
     pending_orders: Arc<Mutex<HashMap<String, PendingOrder>>>,
 
     /// Cached risk context per symbol supplied by the portfolio.
-    risk_contexts: Arc<Mutex<HashMap<String, RiskContext>>>,
+    risk_contexts: Arc<Mutex<HashMap<Symbol, RiskContext>>>,
 
     /// Underlying execution engine for placing child orders.
     execution_engine: Arc<ExecutionEngine>,
@@ -219,14 +219,14 @@ impl OrderOrchestrator {
     }
 
     /// Update the latest risk context for a symbol.
-    pub fn update_risk_context(&self, symbol: impl Into<String>, ctx: RiskContext) {
+    pub fn update_risk_context(&self, symbol: Symbol, ctx: RiskContext) {
         let mut contexts = self.risk_contexts.lock().unwrap();
-        contexts.insert(symbol.into(), ctx);
+        contexts.insert(symbol, ctx);
     }
 
-    fn cached_risk_context(&self, symbol: &str) -> Option<RiskContext> {
+    fn cached_risk_context(&self, symbol: Symbol) -> Option<RiskContext> {
         let contexts = self.risk_contexts.lock().unwrap();
-        contexts.get(symbol).copied()
+        contexts.get(&symbol).copied()
     }
 
     fn is_active_order_status(status: OrderStatus) -> bool {
@@ -611,7 +611,7 @@ impl OrderOrchestrator {
             ChildOrderAction::Place(order_request) => {
                 let symbol = order_request.symbol.clone();
                 let resolved_ctx = ctx
-                    .or_else(|| self.cached_risk_context(&symbol))
+                    .or_else(|| self.cached_risk_context(symbol))
                     .ok_or_else(|| anyhow!("missing risk context for symbol {}", symbol))?;
                 // Keep cache warm with the latest context.
                 self.update_risk_context(symbol.clone(), resolved_ctx);
@@ -957,7 +957,7 @@ impl OrderOrchestrator {
         let mut updates = Vec::new();
         for (order_id, entry) in stale {
             let client = self.execution_engine.client();
-            let synthesized = match client.list_open_orders(&entry.request.symbol).await {
+            let synthesized = match client.list_open_orders(entry.request.symbol.code()).await {
                 Ok(remote_orders) => {
                     if let Some(existing) =
                         remote_orders.into_iter().find(|order| order.id == order_id)
@@ -970,7 +970,7 @@ impl OrderOrchestrator {
                                 | OrderStatus::PartiallyFilled
                         ) {
                             let _ = client
-                                .cancel_order(order_id.clone(), &entry.request.symbol)
+                                .cancel_order(order_id.clone(), entry.request.symbol.code())
                                 .await;
                             let mut canceled = existing.clone();
                             canceled.status = OrderStatus::Canceled;
@@ -995,7 +995,7 @@ impl OrderOrchestrator {
                         "failed to query stale order; canceling defensively"
                     );
                     let _ = client
-                        .cancel_order(order_id.clone(), &entry.request.symbol)
+                        .cancel_order(order_id.clone(), entry.request.symbol.code())
                         .await;
                     Some(build_timeout_order(
                         order_id.clone(),

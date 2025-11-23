@@ -231,7 +231,9 @@ impl<'de> Deserialize<'de> for AssetId {
 
 impl From<&str> for AssetId {
     fn from(value: &str) -> Self {
-        value.parse().unwrap_or_else(|_| Self::from_code(ExchangeId::UNSPECIFIED, value))
+        value
+            .parse()
+            .unwrap_or_else(|_| Self::from_code(ExchangeId::UNSPECIFIED, value))
     }
 }
 
@@ -261,7 +263,10 @@ pub struct Symbol {
 
 impl Symbol {
     pub const fn new(exchange: ExchangeId, market_id: u32) -> Self {
-        Self { exchange, market_id }
+        Self {
+            exchange,
+            market_id,
+        }
     }
 
     pub fn from_code(exchange: ExchangeId, code: impl AsRef<str>) -> Self {
