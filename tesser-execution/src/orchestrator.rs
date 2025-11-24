@@ -339,7 +339,7 @@ impl OrderOrchestrator {
         duration: Duration,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
+        self.update_risk_context(signal.symbol, *ctx);
         // Calculate total quantity using the execution engine's sizer
         let total_quantity =
             self.execution_engine
@@ -399,7 +399,7 @@ impl OrderOrchestrator {
         participation_rate: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
+        self.update_risk_context(signal.symbol, *ctx);
         let total_quantity =
             self.execution_engine
                 .sizer()
@@ -437,7 +437,7 @@ impl OrderOrchestrator {
         limit_offset_bps: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
+        self.update_risk_context(signal.symbol, *ctx);
         let total_quantity =
             self.execution_engine
                 .sizer()
@@ -492,7 +492,7 @@ impl OrderOrchestrator {
         min_chase_distance: Option<Price>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
+        self.update_risk_context(signal.symbol, *ctx);
         let total_quantity =
             self.execution_engine
                 .sizer()
@@ -538,7 +538,7 @@ impl OrderOrchestrator {
         timeout: Option<Duration>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
+        self.update_risk_context(signal.symbol, *ctx);
         let total_quantity =
             self.execution_engine
                 .sizer()
@@ -569,7 +569,7 @@ impl OrderOrchestrator {
         callback_rate: Decimal,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
+        self.update_risk_context(signal.symbol, *ctx);
         let total_quantity =
             self.execution_engine
                 .sizer()
@@ -609,12 +609,13 @@ impl OrderOrchestrator {
         let parent_algo_id = child_req.parent_algo_id;
         match child_req.action {
             ChildOrderAction::Place(order_request) => {
-                let symbol = order_request.symbol.clone();
+                let symbol = order_request.symbol;
+                tracing::debug!(%symbol, "Sending child order");
                 let resolved_ctx = ctx
                     .or_else(|| self.cached_risk_context(symbol))
                     .ok_or_else(|| anyhow!("missing risk context for symbol {}", symbol))?;
                 // Keep cache warm with the latest context.
-                self.update_risk_context(symbol.clone(), resolved_ctx);
+                self.update_risk_context(symbol, resolved_ctx);
 
                 let order = self
                     .execution_engine

@@ -537,11 +537,7 @@ pub struct BybitWsOrder {
     pub order_status: String,
 }
 
-async fn forward_trades(
-    exchange: ExchangeId,
-    payload: TradeMessage,
-    tick_tx: &mpsc::Sender<Tick>,
-) {
+async fn forward_trades(exchange: ExchangeId, payload: TradeMessage, tick_tx: &mpsc::Sender<Tick>) {
     for trade in payload.data {
         if let Some(tick) = build_tick(exchange, &trade) {
             if tick_tx.send(tick).await.is_err() {
@@ -705,7 +701,9 @@ impl BookManager {
         let stream = self
             .streams
             .entry(payload.topic.clone())
-            .or_insert_with(|| SymbolBook::new(self.exchange, payload.topic.clone(), symbol, depth));
+            .or_insert_with(|| {
+                SymbolBook::new(self.exchange, payload.topic.clone(), symbol, depth)
+            });
 
         match stream.ingest(payload.msg_type.as_str(), data, payload.ts) {
             BookUpdate::Pending => {}

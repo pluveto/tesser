@@ -82,7 +82,7 @@ fn order_status_to_proto(status: OrderStatus) -> proto::OrderStatus {
 impl From<Tick> for proto::Tick {
     fn from(t: Tick) -> Self {
         Self {
-            symbol: t.symbol.to_string(),
+            symbol: t.symbol.code().to_string(),
             price: Some(to_decimal_proto(t.price)),
             size: Some(to_decimal_proto(t.size)),
             side: side_to_proto(t.side) as i32,
@@ -95,7 +95,7 @@ impl From<Tick> for proto::Tick {
 impl From<Candle> for proto::Candle {
     fn from(c: Candle) -> Self {
         Self {
-            symbol: c.symbol.to_string(),
+            symbol: c.symbol.code().to_string(),
             interval: interval_to_proto(c.interval) as i32,
             open: Some(to_decimal_proto(c.open)),
             high: Some(to_decimal_proto(c.high)),
@@ -110,7 +110,7 @@ impl From<Candle> for proto::Candle {
 impl From<OrderBook> for proto::OrderBook {
     fn from(b: OrderBook) -> Self {
         Self {
-            symbol: b.symbol.to_string(),
+            symbol: b.symbol.code().to_string(),
             bids: b.bids.into_iter().map(Into::into).collect(),
             asks: b.asks.into_iter().map(Into::into).collect(),
             timestamp: Some(to_timestamp_proto(b.timestamp)),
@@ -133,7 +133,7 @@ impl From<Fill> for proto::Fill {
     fn from(f: Fill) -> Self {
         Self {
             order_id: f.order_id,
-            symbol: f.symbol.to_string(),
+            symbol: f.symbol.code().to_string(),
             side: side_to_proto(f.side) as i32,
             fill_price: Some(to_decimal_proto(f.fill_price)),
             fill_quantity: Some(to_decimal_proto(f.fill_quantity)),
@@ -151,7 +151,7 @@ impl From<&Order> for proto::OrderSnapshot {
     fn from(order: &Order) -> Self {
         Self {
             id: order.id.clone(),
-            symbol: order.request.symbol.to_string(),
+            symbol: order.request.symbol.code().to_string(),
             side: side_to_proto(order.request.side) as i32,
             order_type: order_type_to_proto(order.request.order_type) as i32,
             quantity: Some(to_decimal_proto(order.request.quantity)),
@@ -198,7 +198,7 @@ impl From<Signal> for proto::Signal {
     fn from(signal: Signal) -> Self {
         let metadata = signal_metadata(&signal).unwrap_or_default();
         Self {
-            symbol: signal.symbol.to_string(),
+            symbol: signal.symbol.code().to_string(),
             kind: signal_kind_to_proto(signal.kind) as i32,
             confidence: signal.confidence,
             stop_loss: signal.stop_loss.map(to_decimal_proto),
@@ -254,7 +254,7 @@ fn cash_to_proto(currency: AssetId, cash: &Cash) -> proto::CashBalance {
 impl From<Position> for proto::Position {
     fn from(p: Position) -> Self {
         Self {
-            symbol: p.symbol.to_string(),
+            symbol: p.symbol.code().to_string(),
             side: match p.side {
                 Some(Side::Buy) => proto::Side::Buy as i32,
                 Some(Side::Sell) => proto::Side::Sell as i32,

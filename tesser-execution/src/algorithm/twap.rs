@@ -114,7 +114,7 @@ impl TwapAlgorithm {
         ChildOrderRequest {
             parent_algo_id: self.state.id,
             action: ChildOrderAction::Place(OrderRequest {
-                symbol: self.state.parent_signal.symbol.clone(),
+                symbol: self.state.parent_signal.symbol,
                 side: self.state.parent_signal.kind.side(),
                 order_type: OrderType::Market,
                 quantity: slice_qty,
@@ -310,6 +310,11 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         Self: Sized,
     {
         let state: TwapState = serde_json::from_value(state_val)?;
+        tracing::debug!(
+            symbol = %state.parent_signal.symbol,
+            id = %state.id,
+            "Restored TWAP algorithm state"
+        );
         Ok(Self { state })
     }
 }

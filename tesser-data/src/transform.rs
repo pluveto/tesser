@@ -68,8 +68,8 @@ impl Resampler {
     /// Ingest one candle into the resampler. Completed buckets are pushed into the output buffer.
     pub fn push(&mut self, candle: Candle) {
         let bucket_start = align_timestamp(candle.timestamp, self.interval_nanos);
-        let symbol = candle.symbol.clone();
-        match self.active.entry(symbol.clone()) {
+        let symbol = candle.symbol;
+        match self.active.entry(symbol) {
             Entry::Vacant(slot) => {
                 slot.insert(Bucket::from_candle(
                     symbol,
@@ -86,7 +86,7 @@ impl Resampler {
                         let finished = mem::replace(
                             entry,
                             Bucket::from_candle(
-                                symbol.clone(),
+                                symbol,
                                 bucket_start,
                                 self.interval,
                                 &candle,
@@ -102,7 +102,7 @@ impl Resampler {
                         let finished = mem::replace(
                             entry,
                             Bucket::from_candle(
-                                symbol.clone(),
+                                symbol,
                                 bucket_start,
                                 self.interval,
                                 &candle,
@@ -123,10 +123,7 @@ impl Resampler {
         self.output.sort_by(|a, b| {
             let ts = a.timestamp.cmp(&b.timestamp);
             if ts == Ordering::Equal {
-                (
-                    a.symbol.exchange.as_raw(),
-                    a.symbol.market_id,
-                )
+                (a.symbol.exchange.as_raw(), a.symbol.market_id)
                     .cmp(&(b.symbol.exchange.as_raw(), b.symbol.market_id))
             } else {
                 ts

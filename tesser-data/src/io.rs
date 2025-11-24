@@ -208,7 +208,7 @@ fn write_csv(path: &Path, candles: &[Candle]) -> Result<()> {
     ])?;
     for candle in candles {
         writer.write_record([
-            &candle.symbol.to_string(),
+            candle.symbol.code(),
             &candle.timestamp.to_rfc3339(),
             &candle.open.to_string(),
             &candle.high.to_string(),

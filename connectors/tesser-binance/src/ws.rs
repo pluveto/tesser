@@ -262,7 +262,10 @@ fn convert_trade(exchange: ExchangeId, payload: &AggregateTradeStreamsResponse) 
     })
 }
 
-fn convert_kline(exchange: ExchangeId, payload: &KlineCandlestickStreamsResponse) -> Option<Candle> {
+fn convert_kline(
+    exchange: ExchangeId,
+    payload: &KlineCandlestickStreamsResponse,
+) -> Option<Candle> {
     let kline = payload.k.as_ref()?;
     let symbol = kline.s.clone()?;
     let interval = Interval::from_str(kline.i.as_deref().unwrap_or("1m")).ok()?;

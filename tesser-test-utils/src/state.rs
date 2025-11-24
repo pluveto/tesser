@@ -7,8 +7,8 @@ use rust_decimal::Decimal;
 use tokio::sync::{mpsc, Mutex};
 
 use tesser_core::{
-    AccountBalance, AssetId, Candle, Fill, Order, OrderId, OrderStatus, Position, Price,
-    Quantity, Side, Symbol, Tick,
+    AccountBalance, AssetId, Candle, ExchangeId, Fill, Order, OrderId, OrderStatus, Position,
+    Price, Quantity, Side, Symbol, Tick,
 };
 
 use crate::scenario::ScenarioManager;
@@ -34,6 +34,7 @@ pub(crate) struct Inner {
     pub market_data: MarketDataQueues,
     pub private_ws_sender: Option<mpsc::UnboundedSender<PrivateMessage>>,
     pub order_seq: u64,
+    pub exchange: ExchangeId,
 }
 
 #[derive(Clone)]
@@ -57,7 +58,7 @@ impl AccountState {
             positions: config
                 .positions
                 .into_iter()
-                .map(|position| (position.symbol.clone(), position))
+                .map(|position| (position.symbol, position))
                 .collect(),
             executions: VecDeque::new(),
             orders: HashMap::new(),
@@ -92,9 +93,9 @@ impl AccountState {
     fn update_positions(&mut self, fill: &Fill) {
         let entry = self
             .positions
-            .entry(fill.symbol.clone())
+            .entry(fill.symbol)
             .or_insert_with(|| Position {
-                symbol: fill.symbol.clone(),
+                symbol: fill.symbol,
                 side: None,
                 quantity: Decimal::ZERO,
                 entry_price: None,
@@ -158,17 +159,14 @@ impl AccountState {
     }
 
     fn update_balances(&mut self, fill: &Fill) {
-        let quote_asset = AssetId::from(DEFAULT_QUOTE_CURRENCY);
-        let quote = self
-            .balances
-            .entry(quote_asset)
-            .or_insert(AccountBalance {
-                exchange: quote_asset.exchange,
-                asset: quote_asset,
-                total: Decimal::ZERO,
-                available: Decimal::ZERO,
-                updated_at: Utc::now(),
-            });
+        let quote_asset = AssetId::from_code(fill.symbol.exchange, DEFAULT_QUOTE_CURRENCY);
+        let quote = self.balances.entry(quote_asset).or_insert(AccountBalance {
+            exchange: quote_asset.exchange,
+            asset: quote_asset,
+            total: Decimal::ZERO,
+            available: Decimal::ZERO,
+            updated_at: Utc::now(),
+        });
         let notional = fill.fill_price * fill.fill_quantity;
         match fill.side {
             Side::Buy => {
@@ -295,6 +293,7 @@ pub struct MockExchangeConfig {
     pub candles: Vec<Candle>,
     pub ticks: Vec<Tick>,
     pub scenarios: ScenarioManager,
+    pub exchange: ExchangeId,
 }
 
 impl MockExchangeConfig {
@@ -321,6 +320,11 @@ impl MockExchangeConfig {
         self.scenarios = scenarios;
         self
     }
+
+    pub fn with_exchange(mut self, exchange: ExchangeId) -> Self {
+        self.exchange = exchange;
+        self
+    }
 }
 
 impl Default for MockExchangeConfig {
@@ -330,6 +334,7 @@ impl Default for MockExchangeConfig {
             candles: Vec::new(),
             ticks: Vec::new(),
             scenarios: ScenarioManager::new(),
+            exchange: ExchangeId::UNSPECIFIED,
         }
     }
 }
@@ -353,6 +358,7 @@ impl MockExchangeState {
             market_data,
             private_ws_sender: None,
             order_seq: 1,
+            exchange: config.exchange,
         };
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -362,6 +368,10 @@ impl MockExchangeState {
 
     pub fn scenarios(&self) -> ScenarioManager {
         self.scenarios.clone()
+    }
+
+    pub async fn exchange(&self) -> ExchangeId {
+        self.inner.lock().await.exchange
     }
 
     #[allow(dead_code)]
@@ -525,7 +535,7 @@ impl MockExchangeState {
             order.updated_at = Utc::now();
             let fill = Fill {
                 order_id: order.id.clone(),
-                symbol: order.request.symbol.clone(),
+                symbol: order.request.symbol,
                 side: order.request.side,
                 fill_price: price,
                 fill_quantity: exec_quantity,
@@ -550,7 +560,8 @@ impl MockExchangeState {
     }
 
     pub async fn open_orders(&self, api_key: &str, symbol: Option<&str>) -> Result<Vec<Order>> {
-        let symbol = symbol.map(Symbol::from);
+        let exchange = self.inner.lock().await.exchange;
+        let symbol = symbol.map(|code| Symbol::from_code(exchange, code));
         self.with_account(api_key, |account| Ok(account.open_orders_snapshot(symbol)))
             .await
     }

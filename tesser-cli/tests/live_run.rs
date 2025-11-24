@@ -30,7 +30,10 @@ use tesser_cli::live::{
 };
 use tesser_cli::PublicChannel;
 use tesser_config::{AlertingConfig, ExchangeConfig, PersistenceEngine, RiskManagementConfig};
-use tesser_core::{AccountBalance, Candle, Interval, Position, Side, Signal, SignalKind, Tick};
+use tesser_core::{
+    AccountBalance, AssetId, Candle, ExchangeId, Interval, Position, Side, Signal, SignalKind,
+    Symbol, Tick,
+};
 use tesser_portfolio::{SqliteStateRepository, StateRepository};
 use tesser_rpc::proto::control_service_client::ControlServiceClient;
 use tesser_rpc::proto::{
@@ -49,6 +52,50 @@ fn next_control_addr() -> SocketAddr {
     let addr = listener.local_addr().expect("local addr");
     drop(listener);
     addr
+}
+
+fn bybit_exchange() -> ExchangeId {
+    ExchangeId::from("bybit_linear")
+}
+
+fn test_symbol() -> Symbol {
+    Symbol::from_code(bybit_exchange(), SYMBOL)
+}
+
+fn usdt_asset() -> AssetId {
+    AssetId::from_code(bybit_exchange(), "USDT")
+}
+
+fn account_balance(total: Decimal) -> AccountBalance {
+    let asset = usdt_asset();
+    AccountBalance {
+        exchange: asset.exchange,
+        asset,
+        total,
+        available: total,
+        updated_at: Utc::now(),
+    }
+}
+
+fn default_initial_balances() -> HashMap<AssetId, Decimal> {
+    HashMap::from([(usdt_asset(), Decimal::new(10_000, 0))])
+}
+
+fn spawn_live_runtime(
+    strategy: Box<dyn Strategy>,
+    symbols: Vec<Symbol>,
+    exchange_cfg: ExchangeConfig,
+    settings: LiveSessionSettings,
+    shutdown: ShutdownSignal,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let result = run_live_with_shutdown(strategy, symbols, exchange_cfg, settings, shutdown)
+            .await;
+        if let Err(err) = &result {
+            eprintln!("live runtime exited with error: {err:?}");
+        }
+        result
+    })
 }
 
 async fn connect_control_client(addr: SocketAddr) -> Result<ControlServiceClient<Channel>> {
@@ -70,15 +117,11 @@ async fn connect_control_client(addr: SocketAddr) -> Result<ControlServiceClient
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mock_exchange_starts() -> Result<()> {
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10000, 0),
-        available: Decimal::new(10000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
 
     let candles = vec![Candle {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         interval: Interval::OneMinute,
         open: Decimal::new(1000, 0),
         high: Decimal::new(1010, 0),
@@ -89,7 +132,7 @@ async fn mock_exchange_starts() -> Result<()> {
     }];
 
     let ticks = vec![Tick {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         price: Decimal::new(1005, 0),
         size: Decimal::ONE,
         side: Side::Buy,
@@ -98,6 +141,7 @@ async fn mock_exchange_starts() -> Result<()> {
     }];
 
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -110,16 +154,12 @@ async fn mock_exchange_starts() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_run_executes_round_trip() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let candles = (0..6)
         .map(|i| Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000 + i as i64, 0),
             high: Decimal::new(1_010 + i as i64, 0),
@@ -131,7 +171,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .collect::<Vec<_>>();
     let ticks = (0..6)
         .map(|i| Tick {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             price: Decimal::new(1_005 + i as i64, 0),
             size: Decimal::ONE,
             side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
@@ -141,6 +181,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .collect::<Vec<_>>();
 
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -185,8 +226,8 @@ async fn live_run_executes_round_trip() -> Result<()> {
         history: 8,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting: AlertingConfig::default(),
         exec_backend: ExecutionBackend::Live,
@@ -206,15 +247,15 @@ async fn live_run_executes_round_trip() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
+    let (strategy, monitor) = ScriptedStrategy::new(test_symbol());
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         Box::new(strategy),
-        vec![SYMBOL.to_string()],
+        vec![test_symbol()],
         exchange_cfg,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     match timeout(Duration::from_secs(10), monitor.wait_for_fills(2)).await {
         Ok(result) => result?,
@@ -250,7 +291,10 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .account_balances("test-key")
         .await
         .expect("balances");
-    let usdt = balances.iter().find(|b| b.currency == "USDT").unwrap();
+    let usdt = balances
+        .iter()
+        .find(|b| b.asset == usdt_asset())
+        .unwrap();
     assert_eq!(usdt.available, Decimal::new(10_001, 0));
 
     exchange.shutdown().await;
@@ -259,14 +303,10 @@ async fn live_run_executes_round_trip() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn control_plane_reports_status() -> Result<()> {
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let candles = vec![Candle {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         interval: Interval::OneMinute,
         open: Decimal::new(1_000, 0),
         high: Decimal::new(1_010, 0),
@@ -276,7 +316,7 @@ async fn control_plane_reports_status() -> Result<()> {
         timestamp: Utc::now(),
     }];
     let ticks = vec![Tick {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         price: Decimal::new(1_005, 0),
         size: Decimal::ONE,
         side: Side::Buy,
@@ -284,6 +324,7 @@ async fn control_plane_reports_status() -> Result<()> {
         received_at: Utc::now(),
     }];
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -302,8 +343,8 @@ async fn control_plane_reports_status() -> Result<()> {
         history: 8,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting: AlertingConfig::default(),
         exec_backend: ExecutionBackend::Live,
@@ -323,15 +364,15 @@ async fn control_plane_reports_status() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(SYMBOL));
+    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(test_symbol()));
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         strategy,
-        vec![SYMBOL.to_string()],
+        vec![test_symbol()],
         exchange_cfg,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     let mut client = connect_control_client(control_addr).await?;
     let status = client.get_status(GetStatusRequest {}).await?.into_inner();
@@ -343,7 +384,7 @@ async fn control_plane_reports_status() -> Result<()> {
         .await?
         .into_inner();
     let snapshot = portfolio.portfolio.expect("snapshot");
-    assert_eq!(snapshot.reporting_currency, "USDT");
+    assert_eq!(snapshot.reporting_currency, usdt_asset().to_string());
     assert!(!snapshot.liquidate_only);
 
     let open_orders = client
@@ -363,16 +404,12 @@ async fn control_plane_reports_status() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let candles = (0..3)
         .map(|i| Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000 + i as i64, 0),
             high: Decimal::new(1_010 + i as i64, 0),
@@ -384,7 +421,7 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         .collect::<Vec<_>>();
     let ticks = (0..3)
         .map(|i| Tick {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             price: Decimal::new(1_005 + i as i64, 0),
             size: Decimal::ONE,
             side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
@@ -416,8 +453,8 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         history: 4,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting,
         exec_backend: ExecutionBackend::Live,
@@ -437,24 +474,24 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(SYMBOL));
+    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(test_symbol()));
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         strategy,
-        vec![SYMBOL.to_string()],
+        vec![test_symbol()],
         exchange_cfg,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     sleep(Duration::from_millis(300)).await;
     exchange
         .state()
         .with_account_mut("test-key", |account| {
             account.positions.insert(
-                SYMBOL.into(),
+                test_symbol(),
                 Position {
-                    symbol: SYMBOL.into(),
+                    symbol: test_symbol(),
                     side: Some(Side::Buy),
                     quantity: Decimal::new(5, 0),
                     entry_price: Some(Decimal::new(1_000, 0)),
@@ -462,7 +499,7 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
                     updated_at: Utc::now(),
                 },
             );
-            if let Some(balance) = account.balances.get_mut("USDT") {
+            if let Some(balance) = account.balances.get_mut(&usdt_asset()) {
                 balance.available += Decimal::new(500, 0);
                 balance.total = balance.available;
                 balance.updated_at = Utc::now();
@@ -491,16 +528,12 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn alerts_on_rejected_order() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let candles = (0..2)
         .map(|i| Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000 + i as i64, 0),
             high: Decimal::new(1_010 + i as i64, 0),
@@ -512,7 +545,7 @@ async fn alerts_on_rejected_order() -> Result<()> {
         .collect::<Vec<_>>();
     let ticks = (0..2)
         .map(|i| Tick {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             price: Decimal::new(1_005 + i as i64, 0),
             size: Decimal::ONE,
             side: Side::Buy,
@@ -538,6 +571,7 @@ async fn alerts_on_rejected_order() -> Result<()> {
         })
         .await;
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks)
@@ -563,8 +597,8 @@ async fn alerts_on_rejected_order() -> Result<()> {
         history: 4,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting,
         exec_backend: ExecutionBackend::Live,
@@ -584,15 +618,15 @@ async fn alerts_on_rejected_order() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
+    let (strategy, monitor) = ScriptedStrategy::new(test_symbol());
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         Box::new(strategy),
-        vec![SYMBOL.to_string()],
+        vec![test_symbol()],
         exchange_cfg,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     // Wait for a rejection alert
     let alert = timeout(Duration::from_secs(10), async {
@@ -683,21 +717,19 @@ async fn wait_for_liquidate_only(path: &Path, timeout: Duration) -> Result<()> {
 }
 
 struct ScriptedStrategy {
-    symbol: String,
+    symbol: Symbol,
     stage: usize,
     pending: Vec<Signal>,
     state: Arc<StrategyState>,
 }
 
 struct PassiveStrategy {
-    symbol: String,
+    symbol: Symbol,
 }
 
 impl PassiveStrategy {
-    fn new(symbol: &str) -> Self {
-        Self {
-            symbol: symbol.to_string(),
-        }
+    fn new(symbol: Symbol) -> Self {
+        Self { symbol }
     }
 }
 
@@ -707,8 +739,8 @@ impl Strategy for PassiveStrategy {
         "passive-test"
     }
 
-    fn symbol(&self) -> &str {
-        &self.symbol
+    fn symbol(&self) -> Symbol {
+        self.symbol
     }
 
     fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
@@ -737,14 +769,14 @@ impl Strategy for PassiveStrategy {
 }
 
 impl ScriptedStrategy {
-    fn new(symbol: &str) -> (Self, StrategyMonitor) {
+    fn new(symbol: Symbol) -> (Self, StrategyMonitor) {
         let state = Arc::new(StrategyState {
             fills: AtomicUsize::new(0),
             notify: Notify::new(),
         });
         (
             Self {
-                symbol: symbol.to_string(),
+                symbol,
                 stage: 0,
                 pending: Vec::new(),
                 state: state.clone(),
@@ -760,8 +792,8 @@ impl Strategy for ScriptedStrategy {
         "scripted-test"
     }
 
-    fn symbol(&self) -> &str {
-        &self.symbol
+    fn symbol(&self) -> Symbol {
+        self.symbol
     }
 
     fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
@@ -774,12 +806,12 @@ impl Strategy for ScriptedStrategy {
 
     async fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
         if self.stage == 0 {
-            self.pending
-                .push(Signal::new(self.symbol.clone(), SignalKind::EnterLong, 1.0));
+                self.pending
+                    .push(Signal::new(self.symbol, SignalKind::EnterLong, 1.0));
             self.stage = 1;
         } else if self.stage == 1 {
-            self.pending
-                .push(Signal::new(self.symbol.clone(), SignalKind::ExitLong, 1.0));
+                self.pending
+                    .push(Signal::new(self.symbol, SignalKind::ExitLong, 1.0));
             self.stage = 2;
         }
         Ok(())

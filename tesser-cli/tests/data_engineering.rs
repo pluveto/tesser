@@ -41,7 +41,17 @@ fn converts_parquet_to_csv() -> Result<()> {
     run_resample(&input, &output, "1m", &[])?;
 
     let dataset = io::read_dataset(&output)?;
-    assert_eq!(dataset.candles, candles);
+    assert_eq!(dataset.candles.len(), candles.len());
+    for (converted, expected) in dataset.candles.iter().zip(&candles) {
+        assert_eq!(converted.symbol.code(), expected.symbol.code());
+        assert_eq!(converted.interval, expected.interval);
+        assert_eq!(converted.open, expected.open);
+        assert_eq!(converted.high, expected.high);
+        assert_eq!(converted.low, expected.low);
+        assert_eq!(converted.close, expected.close);
+        assert_eq!(converted.volume, expected.volume);
+        assert_eq!(converted.timestamp, expected.timestamp);
+    }
     Ok(())
 }
 

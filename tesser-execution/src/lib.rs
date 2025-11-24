@@ -453,25 +453,25 @@ impl ExecutionEngine {
         let client_order_id = signal.id.to_string();
         let request = match signal.kind {
             SignalKind::EnterLong => self.build_request(
-                signal.symbol.clone(),
+                signal.symbol,
                 Side::Buy,
                 qty,
                 Some(client_order_id.clone()),
             ),
             SignalKind::ExitLong | SignalKind::Flatten => self.build_request(
-                signal.symbol.clone(),
+                signal.symbol,
                 Side::Sell,
                 qty,
                 Some(client_order_id.clone()),
             ),
             SignalKind::EnterShort => self.build_request(
-                signal.symbol.clone(),
+                signal.symbol,
                 Side::Sell,
                 qty,
                 Some(client_order_id.clone()),
             ),
             SignalKind::ExitShort => self.build_request(
-                signal.symbol.clone(),
+                signal.symbol,
                 Side::Buy,
                 qty,
                 Some(client_order_id.clone()),
@@ -488,7 +488,7 @@ impl ExecutionEngine {
 
         if let Some(sl_price) = signal.stop_loss {
             let sl_request = OrderRequest {
-                symbol: signal.symbol.clone(),
+                symbol: signal.symbol,
                 side: stop_side,
                 order_type: OrderType::StopMarket,
                 quantity: qty,
@@ -507,7 +507,7 @@ impl ExecutionEngine {
 
         if let Some(tp_price) = signal.take_profit {
             let tp_request = OrderRequest {
-                symbol: signal.symbol.clone(),
+                symbol: signal.symbol,
                 side: stop_side,
                 order_type: OrderType::StopMarket,
                 quantity: qty,

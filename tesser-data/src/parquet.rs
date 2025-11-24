@@ -138,7 +138,7 @@ impl MarketStream for ParquetMarketStream {
 
         if let Some(cursor) = self.depth_updates.as_mut() {
             while let Some(update) = cursor.next().await.map_err(map_err)? {
-                let state = self.book_state.entry(update.symbol.clone()).or_default();
+                let state = self.book_state.entry(update.symbol).or_default();
                 apply_depth_delta(state, &update);
                 if let Some(book) = snapshot_from_state(&update.symbol, state, update.timestamp) {
                     return Ok(Some(book));

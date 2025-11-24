@@ -46,8 +46,8 @@ use tesser_bybit::ws::{BybitWsExecution, BybitWsOrder, PrivateMessage};
 use tesser_bybit::{register_factory as register_bybit_factory, BybitClient, BybitCredentials};
 use tesser_config::{AlertingConfig, ExchangeConfig, PersistenceEngine, RiskManagementConfig};
 use tesser_core::{
-    AccountBalance, Candle, ExchangeId, Fill, Interval, Order, OrderBook, OrderStatus, Position,
-    Price, Quantity, Side, Signal, Symbol, Tick,
+    AccountBalance, AssetId, Candle, ExchangeId, Fill, Interval, Order, OrderBook, OrderStatus,
+    Position, Price, Quantity, Side, Signal, Symbol, Tick,
 };
 use tesser_data::recorder::{ParquetRecorder, RecorderConfig, RecorderHandle};
 use tesser_events::{
@@ -186,8 +186,8 @@ pub struct LiveSessionSettings {
     pub history: usize,
     pub metrics_addr: SocketAddr,
     pub persistence: PersistenceSettings,
-    pub initial_balances: HashMap<Symbol, Decimal>,
-    pub reporting_currency: Symbol,
+    pub initial_balances: HashMap<AssetId, Decimal>,
+    pub reporting_currency: AssetId,
     pub markets_file: Option<PathBuf>,
     pub alerting: AlertingConfig,
     pub exec_backend: ExecutionBackend,
@@ -243,7 +243,7 @@ fn build_persistence_handles(settings: &LiveSessionSettings) -> Result<Persisten
 
 pub async fn run_live(
     strategy: Box<dyn Strategy>,
-    symbols: Vec<String>,
+    symbols: Vec<Symbol>,
     exchange: ExchangeConfig,
     settings: LiveSessionSettings,
 ) -> Result<()> {
@@ -253,7 +253,7 @@ pub async fn run_live(
 /// Variant of [`run_live`] that accepts a manually controlled shutdown signal.
 pub async fn run_live_with_shutdown(
     strategy: Box<dyn Strategy>,
-    symbols: Vec<String>,
+    symbols: Vec<Symbol>,
     exchange: ExchangeConfig,
     settings: LiveSessionSettings,
     shutdown: ShutdownSignal,
@@ -275,11 +275,15 @@ pub async fn run_live_with_shutdown(
     let connector_payload = build_exchange_payload(&exchange, &settings);
     let connector_factory = get_connector_factory(&settings.driver)
         .ok_or_else(|| anyhow!("driver {} is not registered", settings.driver))?;
+    let symbol_codes: Vec<String> = symbols
+        .iter()
+        .map(|symbol| symbol.code().to_string())
+        .collect();
     let stream_config = ConnectorStreamConfig {
         ws_url: Some(exchange.ws_url.clone()),
         metadata: json!({
             "category": settings.category.as_path(),
-            "symbols": symbols.clone(),
+            "symbols": symbol_codes.clone(),
             "orderbook_depth": settings.orderbook_depth,
         }),
         connection_status: Some(public_connection.clone()),
@@ -289,7 +293,7 @@ pub async fn run_live_with_shutdown(
         .await
         .map_err(|err| anyhow!("failed to create market stream: {err}"))?;
     connector_stream
-        .subscribe(&symbols, settings.interval)
+        .subscribe(&symbol_codes, settings.interval)
         .await
         .map_err(|err| anyhow!("failed to subscribe via connector: {err}"))?;
     let market_stream: Box<dyn LiveMarketStream> =
@@ -328,11 +332,11 @@ pub async fn run_live_with_shutdown(
             .await
             .context("failed to fetch remote account balances")?;
         let mut open_orders = Vec::new();
-        for symbol in &symbols {
+        for symbol_code in &symbol_codes {
             let mut symbol_orders = execution_client
-                .list_open_orders(symbol)
+                .list_open_orders(symbol_code)
                 .await
-                .with_context(|| format!("failed to fetch open orders for {symbol}"))?;
+                .with_context(|| format!("failed to fetch open orders for {symbol_code}"))?;
             open_orders.append(&mut symbol_orders);
         }
         bootstrap = Some(LiveBootstrap {
@@ -389,7 +393,7 @@ async fn build_execution_client(
             }
             Ok(Arc::new(PaperExecutionClient::new(
                 "paper".to_string(),
-                vec!["BTCUSDT".to_string()],
+                vec![Symbol::from("BTCUSDT")],
                 settings.slippage_bps,
                 FeeScheduleConfig::with_defaults(
                     settings.fee_bps.max(Decimal::ZERO),
@@ -440,7 +444,7 @@ impl LiveRuntime {
     async fn new(
         market: Box<dyn LiveMarketStream>,
         mut strategy: Box<dyn Strategy>,
-        symbols: Vec<String>,
+        symbols: Vec<Symbol>,
         orchestrator: OrderOrchestrator,
         state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
         settings: LiveSessionSettings,
@@ -479,7 +483,7 @@ impl LiveRuntime {
 
         let portfolio_cfg = PortfolioConfig {
             initial_balances: settings.initial_balances.clone(),
-            reporting_currency: settings.reporting_currency.clone(),
+            reporting_currency: settings.reporting_currency,
             max_drawdown: Some(settings.risk.max_drawdown),
         };
         let portfolio = if let Some((positions, balances)) = live_bootstrap {
@@ -510,7 +514,7 @@ impl LiveRuntime {
             if let Some(price) = persisted.last_prices.get(symbol).copied() {
                 snapshot.last_trade = Some(price);
             }
-            market_snapshots.insert(symbol.clone(), snapshot);
+            market_snapshots.insert(*symbol, snapshot);
         }
 
         let metrics = LiveMetrics::new();
@@ -652,7 +656,7 @@ impl LiveRuntime {
                 state_repo: state_repo.clone(),
                 alerts: alerts.clone(),
                 metrics: metrics.clone(),
-                reporting_currency: settings.reporting_currency.clone(),
+                reporting_currency: settings.reporting_currency,
                 threshold: settings.reconciliation_threshold,
             }))
         });
@@ -697,8 +701,8 @@ impl LiveRuntime {
         );
 
         for symbol in &symbols {
-            let ctx = shared_risk_context(symbol, &portfolio, &market_cache, &persisted).await;
-            orchestrator.update_risk_context(symbol.clone(), ctx);
+            let ctx = shared_risk_context(*symbol, &portfolio, &market_cache, &persisted).await;
+            orchestrator.update_risk_context(*symbol, ctx);
         }
 
         Ok(Self {
@@ -868,7 +872,7 @@ struct ReconciliationContext {
     state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
     alerts: Arc<AlertManager>,
     metrics: Arc<LiveMetrics>,
-    reporting_currency: Symbol,
+    reporting_currency: AssetId,
     threshold: Decimal,
 }
 
@@ -879,7 +883,7 @@ struct ReconciliationContextConfig {
     state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
     alerts: Arc<AlertManager>,
     metrics: Arc<LiveMetrics>,
-    reporting_currency: Symbol,
+    reporting_currency: AssetId,
     threshold: Decimal,
 }
 
@@ -947,7 +951,7 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
 
     let remote_map = positions_to_map(remote_positions);
     let local_map = positions_to_map(local_positions);
-    let mut tracked_symbols: HashSet<String> = HashSet::new();
+    let mut tracked_symbols: HashSet<Symbol> = HashSet::new();
     tracked_symbols.extend(remote_map.keys().cloned());
     tracked_symbols.extend(local_map.keys().cloned());
 
@@ -957,10 +961,11 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
         let remote_qty = remote_map.get(&symbol).copied().unwrap_or(Decimal::ZERO);
         let diff = (local_qty - remote_qty).abs();
         let diff_value = diff.to_f64().unwrap_or(0.0);
-        ctx.metrics.update_position_diff(&symbol, diff_value);
+        let symbol_name = symbol.code().to_string();
+        ctx.metrics.update_position_diff(&symbol_name, diff_value);
         if diff > Decimal::ZERO {
             warn!(
-                symbol = %symbol,
+                symbol = %symbol_name,
                 local = %local_qty,
                 remote = %remote_qty,
                 diff = %diff,
@@ -969,7 +974,7 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
             let pct = normalize_diff(diff, remote_qty);
             if pct >= ctx.threshold {
                 error!(
-                    symbol = %symbol,
+                    symbol = %symbol_name,
                     local = %local_qty,
                     remote = %remote_qty,
                     diff = %diff,
@@ -977,24 +982,25 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
                     "position mismatch exceeds threshold"
                 );
                 severe_findings.push(format!(
-                    "{symbol} local={local_qty} remote={remote_qty} diff={diff}"
+                    "{symbol_name} local={local_qty} remote={remote_qty} diff={diff}"
                 ));
             }
         }
     }
 
-    let reporting = ctx.reporting_currency.as_str();
+    let reporting = ctx.reporting_currency;
+    let reporting_label = reporting.to_string();
     let remote_cash = remote_balances
         .iter()
-        .find(|balance| balance.currency == reporting)
+        .find(|balance| balance.asset == reporting)
         .map(|balance| balance.available)
         .unwrap_or_else(|| Decimal::ZERO);
     let cash_diff = (remote_cash - local_cash).abs();
     ctx.metrics
-        .update_balance_diff(reporting, cash_diff.to_f64().unwrap_or(0.0));
+        .update_balance_diff(&reporting_label, cash_diff.to_f64().unwrap_or(0.0));
     if cash_diff > Decimal::ZERO {
         warn!(
-            currency = %reporting,
+            currency = %reporting_label,
             local = %local_cash,
             remote = %remote_cash,
             diff = %cash_diff,
@@ -1003,7 +1009,7 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
         let pct = normalize_diff(cash_diff, remote_cash);
         if pct >= ctx.threshold {
             error!(
-                currency = %reporting,
+                currency = %reporting_label,
                 local = %local_cash,
                 remote = %remote_cash,
                 diff = %cash_diff,
@@ -1011,7 +1017,7 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
                 "balance mismatch exceeds threshold"
             );
             severe_findings.push(format!(
-                "{reporting} balance local={local_cash} remote={remote_cash} diff={cash_diff}"
+                "{reporting_label} balance local={local_cash} remote={remote_cash} diff={cash_diff}"
             ));
         }
     }
@@ -1047,10 +1053,10 @@ async fn enforce_liquidate_only(ctx: &ReconciliationContext) {
     }
 }
 
-fn positions_to_map(positions: Vec<Position>) -> HashMap<String, Decimal> {
+fn positions_to_map(positions: Vec<Position>) -> HashMap<Symbol, Decimal> {
     let mut map = HashMap::new();
     for position in positions {
-        map.insert(position.symbol.clone(), position_signed_qty(&position));
+        map.insert(position.symbol, position_signed_qty(&position));
     }
     map
 }
@@ -1179,7 +1185,7 @@ fn spawn_event_subscribers(
     portfolio: Arc<Mutex<Portfolio>>,
     metrics: Arc<LiveMetrics>,
     alerts: Arc<AlertManager>,
-    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    market: Arc<Mutex<HashMap<Symbol, MarketSnapshot>>>,
     state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
     persisted: Arc<Mutex<LiveState>>,
     exec_backend: ExecutionBackend,
@@ -1355,7 +1361,7 @@ fn spawn_event_subscribers(
                     )
                     .await
                     {
-                        warn!(error = %err, "fill handler failed");
+                        warn!(error = ?err, "fill handler failed");
                     }
                 }
                 Ok(_) => {}
@@ -1418,7 +1424,7 @@ async fn process_tick_event(
     strategy_ctx: Arc<Mutex<StrategyContext>>,
     metrics: Arc<LiveMetrics>,
     alerts: Arc<AlertManager>,
-    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    market: Arc<Mutex<HashMap<Symbol, MarketSnapshot>>>,
     portfolio: Arc<Mutex<Portfolio>>,
     state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
     persisted: Arc<Mutex<LiveState>>,
@@ -1442,7 +1448,7 @@ async fn process_tick_event(
     {
         let mut guard = portfolio.lock().await;
         let was_liquidate_only = guard.liquidate_only();
-        match guard.update_market_data(&tick.symbol, tick.price) {
+        match guard.update_market_data(tick.symbol, tick.price) {
             Ok(_) => {
                 if !was_liquidate_only && guard.liquidate_only() {
                     drawdown_triggered = true;
@@ -1460,7 +1466,7 @@ async fn process_tick_event(
     }
     {
         let mut state = persisted.lock().await;
-        state.last_prices.insert(tick.symbol.clone(), tick.price);
+        state.last_prices.insert(tick.symbol, tick.price);
         if drawdown_triggered {
             if let Some(snapshot) = snapshot_on_trigger.take() {
                 state.portfolio = Some(snapshot);
@@ -1501,7 +1507,7 @@ async fn process_candle_event(
     strategy_ctx: Arc<Mutex<StrategyContext>>,
     metrics: Arc<LiveMetrics>,
     alerts: Arc<AlertManager>,
-    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    market: Arc<Mutex<HashMap<Symbol, MarketSnapshot>>>,
     portfolio: Arc<Mutex<Portfolio>>,
     orchestrator: Arc<OrderOrchestrator>,
     exec_backend: ExecutionBackend,
@@ -1515,7 +1521,8 @@ async fn process_candle_event(
     metrics.update_last_data_timestamp(Utc::now().timestamp() as f64);
     last_data_timestamp.store(candle.timestamp.timestamp(), Ordering::SeqCst);
     alerts.heartbeat().await;
-    metrics.update_price(&candle.symbol, candle.close.to_f64().unwrap_or(0.0));
+    let candle_label = candle.symbol.code().to_string();
+    metrics.update_price(&candle_label, candle.close.to_f64().unwrap_or(0.0));
     {
         let mut guard = market.lock().await;
         if let Some(snapshot) = guard.get_mut(&candle.symbol) {
@@ -1534,7 +1541,7 @@ async fn process_candle_event(
     {
         let mut guard = portfolio.lock().await;
         let was_liquidate_only = guard.liquidate_only();
-        match guard.update_market_data(&candle.symbol, candle.close) {
+        match guard.update_market_data(candle.symbol, candle.close) {
             Ok(_) => {
                 if !was_liquidate_only && guard.liquidate_only() {
                     candle_drawdown_triggered = true;
@@ -1575,7 +1582,7 @@ async fn process_candle_event(
         snapshot.last_candle_ts = Some(candle.timestamp);
         snapshot
             .last_prices
-            .insert(candle.symbol.clone(), candle.close);
+            .insert(candle.symbol, candle.close);
     }
     persist_state(
         state_repo.clone(),
@@ -1583,8 +1590,8 @@ async fn process_candle_event(
         Some(strategy.clone()),
     )
     .await?;
-    let ctx = shared_risk_context(&candle.symbol, &portfolio, &market, &persisted).await;
-    orchestrator.update_risk_context(candle.symbol.clone(), ctx);
+    let ctx = shared_risk_context(candle.symbol, &portfolio, &market, &persisted).await;
+    orchestrator.update_risk_context(candle.symbol, ctx);
     emit_signals(strategy.clone(), bus.clone(), metrics.clone()).await;
     debug!(symbol = %candle.symbol, close = %candle.close, "completed candle processing");
     Ok(())
@@ -1597,7 +1604,7 @@ async fn process_order_book_event(
     strategy_ctx: Arc<Mutex<StrategyContext>>,
     metrics: Arc<LiveMetrics>,
     alerts: Arc<AlertManager>,
-    _market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    _market: Arc<Mutex<HashMap<Symbol, MarketSnapshot>>>,
     bus: Arc<EventBus>,
     last_data_timestamp: Arc<AtomicI64>,
     driver: Arc<String>,
@@ -1613,11 +1620,12 @@ async fn process_order_book_event(
         book.local_checksum = Some(computed);
         computed
     };
+    let symbol_label = book.symbol.code().to_string();
     if let Some(expected) = book.exchange_checksum {
         if expected != local_checksum {
-            metrics.inc_checksum_mismatch(driver_name, &book.symbol);
+            metrics.inc_checksum_mismatch(driver_name, &symbol_label);
             alerts
-                .order_book_checksum_mismatch(driver_name, &book.symbol, expected, local_checksum)
+                .order_book_checksum_mismatch(driver_name, &symbol_label, expected, local_checksum)
                 .await;
         }
     }
@@ -1642,13 +1650,13 @@ async fn process_signal_event(
     signal: Signal,
     orchestrator: Arc<OrderOrchestrator>,
     portfolio: Arc<Mutex<Portfolio>>,
-    market: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    market: Arc<Mutex<HashMap<Symbol, MarketSnapshot>>>,
     persisted: Arc<Mutex<LiveState>>,
     alerts: Arc<AlertManager>,
     metrics: Arc<LiveMetrics>,
 ) -> Result<()> {
-    let ctx = shared_risk_context(&signal.symbol, &portfolio, &market, &persisted).await;
-    orchestrator.update_risk_context(signal.symbol.clone(), ctx);
+    let ctx = shared_risk_context(signal.symbol, &portfolio, &market, &persisted).await;
+    orchestrator.update_risk_context(signal.symbol, ctx);
     match orchestrator.on_signal(&signal, &ctx).await {
         Ok(()) => {
             alerts.reset_order_failures().await;
@@ -1699,7 +1707,7 @@ async fn process_fill_event(
         let was_liquidate_only = guard.liquidate_only();
         guard
             .apply_fill(&fill)
-            .context("Failed to apply fill to portfolio")?;
+            .with_context(|| format!("Failed to apply fill to portfolio for {}", fill.symbol))?;
         if !was_liquidate_only && guard.liquidate_only() {
             drawdown_triggered = true;
         }
@@ -1860,9 +1868,9 @@ async fn persist_state(
 }
 
 async fn shared_risk_context(
-    symbol: &str,
+    symbol: Symbol,
     portfolio: &Arc<Mutex<Portfolio>>,
-    market: &Arc<Mutex<HashMap<String, MarketSnapshot>>>,
+    market: &Arc<Mutex<HashMap<Symbol, MarketSnapshot>>>,
     persisted: &Arc<Mutex<LiveState>>,
 ) -> RiskContext {
     let (signed_qty, equity, liquidate_only) = {
@@ -1875,7 +1883,7 @@ async fn shared_risk_context(
     };
     let observed_price = {
         let guard = market.lock().await;
-        guard.get(symbol).and_then(|snapshot| snapshot.price())
+        guard.get(&symbol).and_then(|snapshot| snapshot.price())
     };
     let last_price = if let Some(price) = observed_price {
         price
@@ -1883,7 +1891,7 @@ async fn shared_risk_context(
         let guard = persisted.lock().await;
         guard
             .last_prices
-            .get(symbol)
+            .get(&symbol)
             .copied()
             .unwrap_or(Decimal::ZERO)
     };
@@ -1963,13 +1971,15 @@ async fn load_market_registry(
     settings: &LiveSessionSettings,
 ) -> Result<Arc<MarketRegistry>> {
     let mut catalog = InstrumentCatalog::new();
+    let mut loaded_local = false;
     if let Some(path) = &settings.markets_file {
         catalog
             .add_file(path)
             .with_context(|| format!("failed to load markets from {}", path.display()))?;
+        loaded_local = true;
     }
 
-    if !settings.exec_backend.is_paper() {
+    if !loaded_local && !settings.exec_backend.is_paper() {
         let instruments = client
             .list_instruments(settings.category.as_path())
             .await
@@ -2000,7 +2010,7 @@ fn spawn_bybit_private_stream(
     ws_url: String,
     private_tx: mpsc::Sender<BrokerEvent>,
     exec_client: Arc<dyn ExecutionClient>,
-    symbols: Vec<String>,
+    symbols: Vec<Symbol>,
     last_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
     private_connection_flag: Option<Arc<AtomicBool>>,
     metrics: Arc<LiveMetrics>,
@@ -2011,6 +2021,10 @@ fn spawn_bybit_private_stream(
         .downcast_ref::<BybitClient>()
         .map(|client| client.exchange())
         .unwrap_or(ExchangeId::UNSPECIFIED);
+    let symbol_codes: Vec<String> = symbols
+        .iter()
+        .map(|symbol| symbol.code().to_string())
+        .collect();
     tokio::spawn(async move {
         loop {
             match tesser_bybit::ws::connect_private(
@@ -2026,7 +2040,7 @@ fn spawn_bybit_private_stream(
                     }
                     metrics.update_connection_status("private", true);
                     info!("Connected to Bybit private WebSocket stream");
-                    for symbol in &symbols {
+                    for symbol in &symbol_codes {
                         match exec_client.list_open_orders(symbol).await {
                             Ok(orders) => {
                                 for order in orders {

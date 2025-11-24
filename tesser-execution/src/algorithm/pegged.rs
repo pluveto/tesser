@@ -142,7 +142,7 @@ impl PeggedBestAlgorithm {
         ChildOrderRequest {
             parent_algo_id: self.state.id,
             action: ChildOrderAction::Place(OrderRequest {
-                symbol: self.state.parent_signal.symbol.clone(),
+                symbol: self.state.parent_signal.symbol,
                 side: self.state.parent_signal.kind.side(),
                 order_type: OrderType::Limit,
                 quantity: qty,
@@ -255,7 +255,7 @@ impl ExecutionAlgorithm for PeggedBestAlgorithm {
             self.state.last_order_time = Some(now);
             let request = OrderUpdateRequest {
                 order_id: active.order_id.clone(),
-                symbol: self.state.parent_signal.symbol.clone(),
+                symbol: self.state.parent_signal.symbol,
                 side: self.state.parent_signal.kind.side(),
                 new_price: Some(price),
                 new_quantity: Some(active.total_quantity),

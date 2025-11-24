@@ -114,10 +114,8 @@ impl ControlGrpcService {
         let client = self.orchestrator.execution_engine().client();
         let mut cancelled_orders = 0u32;
         for order in open_orders {
-            match client
-                .cancel_order(order.id.clone(), &order.request.symbol)
-                .await
-            {
+            let symbol = order.request.symbol.code().to_string();
+            match client.cancel_order(order.id.clone(), &symbol).await {
                 Ok(_) => cancelled_orders += 1,
                 Err(err) => warn!(order_id = %order.id, error = %err, "failed to cancel order"),
             }

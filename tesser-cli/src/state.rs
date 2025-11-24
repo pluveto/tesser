@@ -85,7 +85,7 @@ fn print_summary(path: &Path, state: &LiveState) {
         println!("  none");
     } else {
         let mut entries: Vec<_> = state.last_prices.iter().collect();
-        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        entries.sort_by_key(|(symbol, _)| (symbol.exchange.as_raw(), symbol.market_id));
         for (symbol, price) in entries.into_iter().take(MAX_PRICE_ROWS) {
             println!("  {symbol}: {price}");
         }
@@ -109,7 +109,7 @@ fn print_portfolio(portfolio: &PortfolioState) {
     let realized = equity - portfolio.initial_equity - unrealized;
     let reporting_cash = portfolio
         .balances
-        .get(&portfolio.reporting_currency)
+        .get(portfolio.reporting_currency)
         .map(|cash| cash.quantity)
         .unwrap_or_default();
     println!("Portfolio snapshot:");
@@ -134,7 +134,7 @@ fn print_portfolio(portfolio: &PortfolioState) {
     {
         println!("  Balances:");
         let mut balances: Vec<_> = portfolio.balances.iter().collect();
-        balances.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        balances.sort_by_key(|(asset, _)| (asset.exchange.as_raw(), asset.asset_id));
         for (currency, cash) in balances {
             println!(
                 "    {:<8} qty={:.6} rate={:.6}",
@@ -149,7 +149,7 @@ fn print_portfolio(portfolio: &PortfolioState) {
     }
     println!("  Positions:");
     let mut positions: Vec<_> = portfolio.positions.iter().collect();
-    positions.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    positions.sort_by_key(|(symbol, _)| (symbol.exchange.as_raw(), symbol.market_id));
     for (symbol, position) in positions {
         println!(
             "    {:<12} side={} qty={:.4} entry={:.4?} unrealized={:.2} updated={}",

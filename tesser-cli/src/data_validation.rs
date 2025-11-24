@@ -166,7 +166,7 @@ pub fn validate_dataset(
                         let ts = current_ts + Duration::milliseconds(expected_ms * step as i64);
                         let fill_price = repaired[idx].close;
                         let fill = Candle {
-                            symbol: repaired[idx].symbol.clone(),
+                            symbol: repaired[idx].symbol,
                             interval,
                             open: fill_price,
                             high: fill_price,
@@ -213,7 +213,7 @@ fn ensure_single_symbol(candles: &[Candle]) -> Result<Symbol> {
     let first = iter
         .next()
         .ok_or_else(|| anyhow!("no candles to inspect for symbol"))?;
-    let symbol = first.symbol.clone();
+    let symbol = first.symbol;
     if iter.any(|c| c.symbol != symbol) {
         bail!("validation currently supports a single symbol per run");
     }
@@ -230,7 +230,7 @@ mod tests {
         let close = Decimal::from_f64(close).expect("close convertible");
         let volume = Decimal::from_f64(volume).expect("volume convertible");
         Candle {
-            symbol: "BTCUSDT".to_string(),
+            symbol: Symbol::from("BTCUSDT"),
             interval: Interval::OneMinute,
             open: close,
             high: close,

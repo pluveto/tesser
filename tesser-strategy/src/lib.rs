@@ -468,7 +468,7 @@ impl SmaCross {
             self.slow_last,
         ) {
             if fast_prev <= slow_prev && fast_curr > slow_curr {
-                let mut signal = Signal::new(self.cfg.symbol.clone(), SignalKind::EnterLong, 0.75);
+                let mut signal = Signal::new(self.cfg.symbol, SignalKind::EnterLong, 0.75);
                 let stop_loss_factor = Decimal::new(98, 2); // 0.98
                 signal.stop_loss = Some(candle.low * stop_loss_factor);
                 if let Some(duration_secs) = self.cfg.vwap_duration_secs.filter(|v| *v > 0) {
@@ -485,7 +485,7 @@ impl SmaCross {
                 self.signals.push(signal);
             } else if fast_prev >= slow_prev && fast_curr < slow_curr {
                 self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
+                    self.cfg.symbol,
                     SignalKind::ExitLong,
                     0.75,
                 ));
@@ -611,13 +611,13 @@ impl RsiReversion {
         if let Some(rsi_value) = value {
             if rsi_value <= self.oversold_level {
                 self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
+                    self.cfg.symbol,
                     SignalKind::EnterLong,
                     0.8,
                 ));
             } else if rsi_value >= self.overbought_level {
                 self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
+                    self.cfg.symbol,
                     SignalKind::ExitLong,
                     0.8,
                 ));
@@ -749,19 +749,19 @@ impl BollingerBreakout {
         let price = candle.close;
         if price > bands.upper {
             self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
+                self.cfg.symbol,
                 SignalKind::EnterLong,
                 0.7,
             ));
         } else if price < bands.lower {
             self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
+                self.cfg.symbol,
                 SignalKind::EnterShort,
                 0.7,
             ));
         } else if (price - bands.middle).abs() <= self.neutral_band {
             self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
+                self.cfg.symbol,
                 SignalKind::Flatten,
                 0.6,
             ));
@@ -935,13 +935,13 @@ impl Strategy for MlClassifier {
         if let Some(score) = self.score(ctx) {
             if score >= self.cfg.threshold_long {
                 self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
+                    self.cfg.symbol,
                     SignalKind::EnterLong,
                     0.85,
                 ));
             } else if score <= self.cfg.threshold_short {
                 self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
+                    self.cfg.symbol,
                     SignalKind::EnterShort,
                     0.85,
                 ));
@@ -1100,12 +1100,12 @@ impl Strategy for LstmCortex {
                         if *probability >= 0.6 {
                             match idx {
                                 0 => self.signals.push(Signal::new(
-                                    self.cfg.symbol.clone(),
+                                    self.cfg.symbol,
                                     SignalKind::EnterLong,
                                     f64::from(*probability),
                                 )),
                                 1 => self.signals.push(Signal::new(
-                                    self.cfg.symbol.clone(),
+                                    self.cfg.symbol,
                                     SignalKind::EnterShort,
                                     f64::from(*probability),
                                 )),
@@ -1193,10 +1193,8 @@ impl PairsTradingArbitrage {
     }
 
     fn spreads(&self, ctx: &StrategyContext) -> Option<Vec<Decimal>> {
-        let closes_a =
-            collect_symbol_closes(ctx.candles(), self.cfg.symbols[0], self.cfg.lookback);
-        let closes_b =
-            collect_symbol_closes(ctx.candles(), self.cfg.symbols[1], self.cfg.lookback);
+        let closes_a = collect_symbol_closes(ctx.candles(), self.cfg.symbols[0], self.cfg.lookback);
+        let closes_b = collect_symbol_closes(ctx.candles(), self.cfg.symbols[1], self.cfg.lookback);
         if closes_a.len() < self.cfg.lookback || closes_b.len() < self.cfg.lookback {
             return None;
         }
@@ -1251,31 +1249,31 @@ impl Strategy for PairsTradingArbitrage {
                     if z >= self.entry_z_level {
                         // Asset A rich: short A, long B.
                         self.signals.push(Signal::new(
-                            self.cfg.symbols[0].clone(),
+                            self.cfg.symbols[0],
                             SignalKind::EnterShort,
                             0.8,
                         ));
                         self.signals.push(Signal::new(
-                            self.cfg.symbols[1].clone(),
+                            self.cfg.symbols[1],
                             SignalKind::EnterLong,
                             0.8,
                         ));
                     } else if z <= -self.entry_z_level {
                         // Asset B rich: long A, short B.
                         self.signals.push(Signal::new(
-                            self.cfg.symbols[0].clone(),
+                            self.cfg.symbols[0],
                             SignalKind::EnterLong,
                             0.8,
                         ));
                         self.signals.push(Signal::new(
-                            self.cfg.symbols[1].clone(),
+                            self.cfg.symbols[1],
                             SignalKind::EnterShort,
                             0.8,
                         ));
                     } else if z.abs() <= self.exit_z_level {
                         for symbol in &self.cfg.symbols {
                             self.signals.push(Signal::new(
-                                symbol.clone(),
+                                *symbol,
                                 SignalKind::Flatten,
                                 0.6,
                             ));
@@ -1380,19 +1378,19 @@ impl Strategy for OrderBookImbalance {
             if let Some(imbalance_f64) = imbalance.to_f64() {
                 if imbalance_f64 >= self.cfg.long_threshold {
                     self.signals.push(Signal::new(
-                        self.cfg.symbol.clone(),
+                        self.cfg.symbol,
                         SignalKind::EnterLong,
                         0.9,
                     ));
                 } else if imbalance_f64 <= self.cfg.short_threshold {
                     self.signals.push(Signal::new(
-                        self.cfg.symbol.clone(),
+                        self.cfg.symbol,
                         SignalKind::EnterShort,
                         0.9,
                     ));
                 } else if imbalance_f64.abs() <= self.cfg.neutral_zone {
                     self.signals.push(Signal::new(
-                        self.cfg.symbol.clone(),
+                        self.cfg.symbol,
                         SignalKind::Flatten,
                         0.6,
                     ));
@@ -1546,7 +1544,7 @@ impl Strategy for OrderBookScalper {
             if let Some(im) = balance.to_f64() {
                 let kind = self.imbalance_supports_entry(im, macd);
                 if !matches!(kind, SignalKind::Flatten) || im.abs() <= self.cfg.neutral_zone {
-                    let mut signal = Signal::new(self.cfg.symbol.clone(), kind, 0.9);
+                    let mut signal = Signal::new(self.cfg.symbol, kind, 0.9);
                     signal.execution_hint = Some(ExecutionHint::PeggedBest {
                         offset_bps: self.cfg.peg_offset_bps,
                         clip_size: Some(self.cfg.clip_size.max(Decimal::ONE)),
@@ -1633,7 +1631,7 @@ impl CrossExchangeArb {
     fn emit_pair_trade(&mut self, long_a: bool) {
         let duration = Duration::seconds(30);
         let mut signal_a = Signal::new(
-            self.cfg.symbol_a.clone(),
+            self.cfg.symbol_a,
             if long_a {
                 SignalKind::EnterLong
             } else {
@@ -1643,7 +1641,7 @@ impl CrossExchangeArb {
         );
         signal_a.execution_hint = Some(ExecutionHint::Twap { duration });
         let mut signal_b = Signal::new(
-            self.cfg.symbol_b.clone(),
+            self.cfg.symbol_b,
             if long_a {
                 SignalKind::EnterShort
             } else {
@@ -1668,7 +1666,7 @@ impl Strategy for CrossExchangeArb {
     }
 
     fn subscriptions(&self) -> Vec<Symbol> {
-        vec![self.cfg.symbol_a.clone(), self.cfg.symbol_b.clone()]
+        vec![self.cfg.symbol_a, self.cfg.symbol_b]
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -1716,12 +1714,12 @@ impl Strategy for CrossExchangeArb {
                 self.emit_pair_trade(true);
             } else if spread.abs() <= self.cfg.exit_bps / Decimal::from(10_000) {
                 self.signals.push(Signal::new(
-                    self.cfg.symbol_a.clone(),
+                    self.cfg.symbol_a,
                     SignalKind::Flatten,
                     0.6,
                 ));
                 self.signals.push(Signal::new(
-                    self.cfg.symbol_b.clone(),
+                    self.cfg.symbol_b,
                     SignalKind::Flatten,
                     0.6,
                 ));
@@ -1848,7 +1846,7 @@ impl Strategy for VolatilitySkew {
                 let timeout = Some(Duration::seconds(self.cfg.sniper_timeout_secs as i64));
                 if implied >= premium {
                     let mut signal =
-                        Signal::new(self.cfg.underlying.clone(), SignalKind::EnterShort, 0.8);
+                        Signal::new(self.cfg.underlying, SignalKind::EnterShort, 0.8);
                     signal.execution_hint = Some(ExecutionHint::Sniper {
                         trigger_price: candle.close,
                         timeout,
@@ -1856,7 +1854,7 @@ impl Strategy for VolatilitySkew {
                     self.signals.push(signal);
                 } else if implied <= discount {
                     let mut signal =
-                        Signal::new(self.cfg.underlying.clone(), SignalKind::EnterLong, 0.8);
+                        Signal::new(self.cfg.underlying, SignalKind::EnterLong, 0.8);
                     signal.execution_hint = Some(ExecutionHint::Sniper {
                         trigger_price: candle.close,
                         timeout,

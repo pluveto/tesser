@@ -455,7 +455,10 @@ impl ExecutionClient for BybitClient {
         let resp: ApiResponse<CreateOrderResult> = self
             .signed_request(Method::POST, "/v5/order/amend", payload, None)
             .await?;
-        if let Ok(open_orders) = self.list_open_orders(Self::symbol_code(request.symbol)).await {
+        if let Ok(open_orders) = self
+            .list_open_orders(Self::symbol_code(request.symbol))
+            .await
+        {
             if let Some(order) = open_orders
                 .into_iter()
                 .find(|order| order.id == resp.result.order_id)

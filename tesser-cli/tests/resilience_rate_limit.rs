@@ -8,21 +8,37 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use tesser_broker::{ExecutionClient, Quota};
 use tesser_bybit::{BybitClient, BybitConfig, BybitCredentials};
-use tesser_core::{AccountBalance, Candle, Interval, OrderRequest, Side, Tick};
+use tesser_core::{
+    AccountBalance, AssetId, Candle, ExchangeId, Interval, OrderRequest, Side, Symbol, Tick,
+};
 use tesser_test_utils::{AccountConfig, MockExchange, MockExchangeConfig};
 
 const SYMBOL: &str = "BTCUSDT";
 
+fn bybit_exchange() -> ExchangeId {
+    ExchangeId::from("bybit_linear")
+}
+
+fn test_symbol() -> Symbol {
+    Symbol::from_code(bybit_exchange(), SYMBOL)
+}
+
+fn usdt_asset() -> AssetId {
+    AssetId::from_code(bybit_exchange(), "USDT")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bybit_client_honors_private_rate_limit() -> Result<()> {
+    let usdt = usdt_asset();
     let account = AccountConfig::new("limit-key", "limit-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
+        exchange: usdt.exchange,
+        asset: usdt,
         total: Decimal::new(10_000, 0),
         available: Decimal::new(10_000, 0),
         updated_at: Utc::now(),
     });
     let candles = vec![Candle {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         interval: Interval::OneMinute,
         open: Decimal::new(20_000, 0),
         high: Decimal::new(20_010, 0),
@@ -32,7 +48,7 @@ async fn bybit_client_honors_private_rate_limit() -> Result<()> {
         timestamp: Utc::now(),
     }];
     let ticks = vec![Tick {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         price: Decimal::new(20_005, 0),
         size: Decimal::ONE,
         side: Side::Buy,
@@ -40,6 +56,7 @@ async fn bybit_client_honors_private_rate_limit() -> Result<()> {
         received_at: Utc::now(),
     }];
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -57,10 +74,11 @@ async fn bybit_client_honors_private_rate_limit() -> Result<()> {
             api_key: "limit-key".into(),
             api_secret: "limit-secret".into(),
         }),
+        ExchangeId::from("bybit_linear"),
     );
 
     let request = OrderRequest {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         side: Side::Buy,
         order_type: tesser_core::OrderType::Market,
         quantity: Decimal::new(1, 0),

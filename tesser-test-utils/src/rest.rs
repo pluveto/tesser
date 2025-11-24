@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use tracing::warn;
 use uuid::Uuid;
 
-use tesser_core::{Fill, Order, OrderRequest, OrderStatus, OrderType, Side, TimeInForce};
+use tesser_core::{Fill, Order, OrderRequest, OrderStatus, OrderType, Side, Symbol, TimeInForce};
 
 use crate::scenario::{OrderFillStep, ScenarioAction, ScenarioTrigger};
 use crate::state::{MockExchangeState, PrivateMessage};
@@ -239,7 +239,7 @@ async fn handle_positions(parts: http::request::Parts, state: MockExchangeState)
                 .into_iter()
                 .map(|position| {
                     json!({
-                        "symbol": position.symbol.to_string(),
+                        "symbol": position.symbol.code().to_string(),
                         "side": side_label(position.side),
                         "size": decimal_to_string(position.quantity),
                         "avgPrice": position.entry_price.map(decimal_to_string).unwrap_or_else(|| "0".into()),
@@ -309,7 +309,7 @@ async fn handle_execution_list(
                 .into_iter()
                 .map(|fill| {
                     json!({
-                        "symbol": fill.symbol.to_string(),
+                        "symbol": fill.symbol.code().to_string(),
                         "orderId": fill.order_id,
                         "side": map_side(fill.side),
                         "execPrice": decimal_to_string(fill.fill_price),
@@ -348,7 +348,7 @@ async fn handle_open_orders(
                     json!({
                         "orderId": order.id,
                         "orderLinkId": order.request.client_order_id.clone().unwrap_or_default(),
-                        "symbol": order.request.symbol,
+                        "symbol": order.request.symbol.code().to_string(),
                         "price": order.request.price.map(decimal_to_string).unwrap_or_else(|| "0".into()),
                         "qty": decimal_to_string(order.request.quantity),
                         "side": map_side(order.request.side),
@@ -395,8 +395,9 @@ async fn create_order(
         None => None,
     };
 
+    let exchange = state.exchange().await;
     let request = OrderRequest {
-        symbol: payload.symbol.clone().into(),
+        symbol: Symbol::from_code(exchange, payload.symbol.clone()),
         side,
         order_type,
         quantity,
@@ -641,7 +642,7 @@ fn order_message(order: &Order) -> PrivateMessage {
         "type": "snapshot",
         "data": [{
             "orderId": order.id,
-            "symbol": order.request.symbol,
+            "symbol": order.request.symbol.code().to_string(),
             "side": map_side(order.request.side),
             "orderStatus": map_order_status(order.status),
             "orderType": map_order_type(order.request.order_type),
@@ -663,7 +664,7 @@ fn execution_message(fill: &Fill) -> PrivateMessage {
         "data": [{
             "execId": Uuid::new_v4().to_string(),
             "orderId": fill.order_id,
-            "symbol": fill.symbol,
+            "symbol": fill.symbol.code().to_string(),
             "side": map_side(fill.side),
             "execPrice": decimal_to_string(fill.fill_price),
             "execQty": decimal_to_string(fill.fill_quantity),

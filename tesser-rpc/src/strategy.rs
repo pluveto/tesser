@@ -210,7 +210,7 @@ impl RpcStrategy {
 
     fn apply_remote_metadata(&mut self, mut symbols: Vec<String>) {
         if symbols.is_empty() {
-            symbols.push(self.symbol.to_string());
+            symbols.push(self.symbol.code().to_string());
         }
         let parsed: Vec<Symbol> = symbols.into_iter().map(Symbol::from).collect();
         if let Some(primary) = parsed.first().copied() {

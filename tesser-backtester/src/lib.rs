@@ -164,7 +164,7 @@ impl Backtester {
     ) -> Self {
         let portfolio_config = PortfolioConfig {
             initial_balances: config.initial_balances.clone(),
-            reporting_currency: config.reporting_currency.clone(),
+            reporting_currency: config.reporting_currency,
             max_drawdown: None, // Disable liquidate-only for backtests for now
         };
         Self {
@@ -249,7 +249,7 @@ impl Backtester {
             .on_tick(&self.strategy_ctx, &tick)
             .await
             .context("strategy failed on tick")?;
-        if let Err(err) = self.portfolio.update_market_data(&tick.symbol, tick.price) {
+        if let Err(err) = self.portfolio.update_market_data(tick.symbol, tick.price) {
             warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
         }
         Ok(())
@@ -298,7 +298,7 @@ impl Backtester {
         let signals = self.strategy.drain_signals();
         for signal in signals {
             let ctx = RiskContext {
-                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                signed_position_qty: self.portfolio.signed_position_qty(signal.symbol),
                 portfolio_equity: self.portfolio.equity(),
                 last_price: candle.close,
                 liquidate_only: false,
@@ -312,7 +312,7 @@ impl Backtester {
 
         if let Err(err) = self
             .portfolio
-            .update_market_data(&candle.symbol, candle.close)
+            .update_market_data(candle.symbol, candle.close)
         {
             warn!(
                 symbol = %candle.symbol,
@@ -383,7 +383,7 @@ impl Backtester {
         };
         Fill {
             order_id: order.id.clone(),
-            symbol: order.request.symbol.clone(),
+            symbol: order.request.symbol,
             side: order.request.side,
             fill_price: price,
             fill_quantity: order.request.quantity,
@@ -431,7 +431,7 @@ impl Backtester {
                         .process_trade(tick.side, tick.price, tick.size, tick.exchange_timestamp)
                         .await;
                     last_trade_price = Some(tick.price);
-                    if let Err(err) = self.portfolio.update_market_data(&tick.symbol, tick.price) {
+                    if let Err(err) = self.portfolio.update_market_data(tick.symbol, tick.price) {
                         warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
                     }
                     self.strategy_ctx.push_tick(tick.clone());
@@ -462,7 +462,7 @@ impl Backtester {
                 .or(fallback_price)
                 .unwrap_or(Decimal::ZERO);
             let ctx = RiskContext {
-                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                signed_position_qty: self.portfolio.signed_position_qty(signal.symbol),
                 portfolio_equity: self.portfolio.equity(),
                 last_price: reference_price,
                 liquidate_only: false,

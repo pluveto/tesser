@@ -79,14 +79,11 @@ impl Portfolio {
                 },
             });
         }
-        balances
-            .0
-            .entry(config.reporting_currency)
-            .or_insert(Cash {
-                currency: config.reporting_currency,
-                quantity: Decimal::ZERO,
-                conversion_rate: Decimal::ONE,
-            });
+        balances.0.entry(config.reporting_currency).or_insert(Cash {
+            currency: config.reporting_currency,
+            quantity: Decimal::ZERO,
+            conversion_rate: Decimal::ONE,
+        });
         let initial_equity = balances.total_value();
         Self {
             positions: HashMap::new(),
@@ -147,18 +144,18 @@ impl Portfolio {
     pub fn apply_fill(&mut self, fill: &Fill) -> PortfolioResult<()> {
         let instrument = self
             .market_registry
-            .get(&fill.symbol)
-            .ok_or_else(|| PortfolioError::UnknownSymbol(fill.symbol.clone()))?;
-        self.ensure_currency(&instrument.settlement_currency);
-        self.ensure_currency(&instrument.base);
-        self.ensure_currency(&instrument.quote);
+            .get(fill.symbol)
+            .ok_or_else(|| PortfolioError::UnknownSymbol(fill.symbol))?;
+        self.ensure_currency(instrument.settlement_currency);
+        self.ensure_currency(instrument.base);
+        self.ensure_currency(instrument.quote);
         let mut realized_delta = Decimal::ZERO;
         {
             let entry = self
                 .positions
-                .entry(fill.symbol.clone())
+                .entry(fill.symbol)
                 .or_insert(Position {
-                    symbol: fill.symbol.clone(),
+                    symbol: fill.symbol,
                     side: Some(fill.side),
                     quantity: Decimal::ZERO,
                     entry_price: Some(fill.fill_price),
@@ -242,7 +239,7 @@ impl Portfolio {
     #[must_use]
     pub fn cash(&self) -> Price {
         self.balances
-            .get(&self.reporting_currency)
+            .get(self.reporting_currency)
             .map(|cash| cash.quantity)
             .unwrap_or_default()
     }
@@ -332,8 +329,10 @@ impl Portfolio {
             market_registry: registry,
         };
         let reporting = portfolio.reporting_currency;
-        portfolio.ensure_currency(&reporting);
-        portfolio.balances.update_conversion_rate(reporting, Decimal::ONE);
+        portfolio.ensure_currency(reporting);
+        portfolio
+            .balances
+            .update_conversion_rate(reporting, Decimal::ONE);
         portfolio.update_drawdown_state();
         portfolio
     }
@@ -348,7 +347,7 @@ impl Portfolio {
         let instrument = self
             .market_registry
             .get(symbol)
-            .ok_or_else(|| PortfolioError::UnknownSymbol(symbol))?;
+            .ok_or(PortfolioError::UnknownSymbol(symbol))?;
         let mut updated = false;
         if let Some(position) = self.positions.get_mut(&symbol) {
             update_unrealized(position, &instrument, price);
@@ -395,16 +394,16 @@ impl Portfolio {
         let notional = fill.fill_price * fill.fill_quantity;
         match fill.side {
             Side::Buy => {
-                self.ensure_currency(&instrument.base);
-                self.ensure_currency(&instrument.quote);
-                self.balances.adjust(&instrument.base, fill.fill_quantity);
-                self.balances.adjust(&instrument.quote, -notional);
+                self.ensure_currency(instrument.base);
+                self.ensure_currency(instrument.quote);
+                self.balances.adjust(instrument.base, fill.fill_quantity);
+                self.balances.adjust(instrument.quote, -notional);
             }
             Side::Sell => {
-                self.ensure_currency(&instrument.base);
-                self.ensure_currency(&instrument.quote);
-                self.balances.adjust(&instrument.base, -fill.fill_quantity);
-                self.balances.adjust(&instrument.quote, notional);
+                self.ensure_currency(instrument.base);
+                self.ensure_currency(instrument.quote);
+                self.balances.adjust(instrument.base, -fill.fill_quantity);
+                self.balances.adjust(instrument.quote, notional);
             }
         }
     }
@@ -435,42 +434,42 @@ impl Portfolio {
 
     fn update_conversion_rates(&mut self, instrument: &Instrument, price: Price) {
         if instrument.quote == self.reporting_currency {
-            self.ensure_currency(&instrument.base);
-            self.ensure_currency(&instrument.quote);
+            self.ensure_currency(instrument.base);
+            self.ensure_currency(instrument.quote);
             self.balances
-                .update_conversion_rate(&instrument.base, price);
+                .update_conversion_rate(instrument.base, price);
             self.balances
-                .update_conversion_rate(&instrument.quote, Decimal::ONE);
+                .update_conversion_rate(instrument.quote, Decimal::ONE);
             return;
         }
         if instrument.base == self.reporting_currency && !price.is_zero() {
-            self.ensure_currency(&instrument.quote);
-            self.ensure_currency(&instrument.base);
+            self.ensure_currency(instrument.quote);
+            self.ensure_currency(instrument.base);
             self.balances
-                .update_conversion_rate(&instrument.base, Decimal::ONE);
+                .update_conversion_rate(instrument.base, Decimal::ONE);
             self.balances
-                .update_conversion_rate(&instrument.quote, Decimal::ONE / price);
+                .update_conversion_rate(instrument.quote, Decimal::ONE / price);
             return;
         }
         let quote_rate = self
             .balances
-            .get(&instrument.quote)
+            .get(instrument.quote)
             .map(|cash| cash.conversion_rate)
             .unwrap_or(Decimal::ZERO);
         if quote_rate > Decimal::ZERO {
-            self.ensure_currency(&instrument.base);
+            self.ensure_currency(instrument.base);
             self.balances
-                .update_conversion_rate(&instrument.base, price * quote_rate);
+                .update_conversion_rate(instrument.base, price * quote_rate);
         }
         let base_rate = self
             .balances
-            .get(&instrument.base)
+            .get(instrument.base)
             .map(|cash| cash.conversion_rate)
             .unwrap_or(Decimal::ZERO);
         if base_rate > Decimal::ZERO && !price.is_zero() {
-            self.ensure_currency(&instrument.quote);
+            self.ensure_currency(instrument.quote);
             self.balances
-                .update_conversion_rate(&instrument.quote, base_rate / price);
+                .update_conversion_rate(instrument.quote, base_rate / price);
         }
     }
 }

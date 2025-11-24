@@ -36,7 +36,9 @@ use tesser_backtester::{
 };
 use tesser_broker::ExecutionClient;
 use tesser_config::{load_config, AppConfig, PersistenceEngine, RiskManagementConfig};
-use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
+use tesser_core::{
+    AssetId, Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick,
+};
 use tesser_data::analytics::ExecutionAnalysisRequest;
 use tesser_data::download::{
     BinanceDownloader, BybitDownloader, KlineRequest, NormalizedTrade, TradeRequest, TradeSource,
@@ -1055,13 +1057,11 @@ impl LiveRunArgs {
         }
     }
 
-    fn resolved_initial_balances(&self, config: &AppConfig) -> HashMap<Symbol, Decimal> {
+    fn resolved_initial_balances(&self, config: &AppConfig) -> HashMap<AssetId, Decimal> {
         let mut balances = clone_initial_balances(&config.backtest);
         if let Some(value) = self.initial_equity {
-            balances.insert(
-                config.backtest.reporting_currency.clone(),
-                value.max(Decimal::ZERO),
-            );
+            let reporting = AssetId::from(config.backtest.reporting_currency.as_str());
+            balances.insert(reporting, value.max(Decimal::ZERO));
         }
         balances
     }
@@ -1280,10 +1280,10 @@ impl BacktestRunArgs {
         let order_quantity = self.quantity;
         let execution = ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
 
-        let mut cfg = BacktestConfig::new(symbols[0].clone());
+        let mut cfg = BacktestConfig::new(symbols[0]);
         cfg.order_quantity = order_quantity;
         cfg.initial_balances = clone_initial_balances(&config.backtest);
-        cfg.reporting_currency = config.backtest.reporting_currency.clone();
+        cfg.reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
         cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
         cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
         cfg.execution.latency_candles = self.latency_candles.max(1);
@@ -1324,13 +1324,13 @@ impl BacktestRunArgs {
             let mut generated = Vec::new();
             for (idx, symbol) in symbols.iter().enumerate() {
                 let offset = idx as i64 * 10;
-                generated.extend(synth_candles(symbol, self.candles, offset));
+                generated.extend(synth_candles(*symbol, self.candles, offset));
             }
             generated.sort_by_key(|c| c.timestamp);
             if generated.is_empty() {
                 bail!("no synthetic candles generated; provide --data files instead");
             }
-            return Ok(memory_market_stream(&symbols[0], generated));
+            return Ok(memory_market_stream(symbols[0], generated));
         }
 
         match detect_data_format(&self.data_paths)? {
@@ -1340,7 +1340,7 @@ impl BacktestRunArgs {
                     bail!("no candles loaded from --data paths");
                 }
                 candles.sort_by_key(|c| c.timestamp);
-                Ok(memory_market_stream(&symbols[0], candles))
+                Ok(memory_market_stream(symbols[0], candles))
             }
             DataFormat::Parquet => Ok(parquet_market_stream(symbols, self.data_paths.clone())),
         }
@@ -1436,7 +1436,7 @@ impl BacktestBatchArgs {
                         bail!("no candles loaded from --data paths");
                     }
                     candles.sort_by_key(|c| c.timestamp);
-                    memory_market_stream(&symbols[0], candles)
+                    memory_market_stream(symbols[0], candles)
                 }
                 DataFormat::Parquet => parquet_market_stream(&symbols, self.data_paths.clone()),
             };
@@ -1448,10 +1448,10 @@ impl BacktestBatchArgs {
             ));
             let execution =
                 ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
-            let mut cfg = BacktestConfig::new(symbols[0].clone());
+            let mut cfg = BacktestConfig::new(symbols[0]);
             cfg.order_quantity = order_quantity;
             cfg.initial_balances = clone_initial_balances(&config.backtest);
-            cfg.reporting_currency = config.backtest.reporting_currency.clone();
+            cfg.reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
             cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
             cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
             cfg.execution.latency_candles = self.latency_candles.max(1);
@@ -1513,7 +1513,7 @@ impl LiveRunArgs {
         }
         let quantity = self.quantity;
         let initial_balances = self.resolved_initial_balances(config);
-        let reporting_currency = config.backtest.reporting_currency.clone();
+        let reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
         let markets_file = self
             .markets_file
             .clone()
@@ -1673,7 +1673,7 @@ fn print_report(report: &PerformanceReport) {
     println!("\n{}", report);
 }
 
-fn synth_candles(symbol: &str, len: usize, offset_minutes: i64) -> Vec<Candle> {
+fn synth_candles(symbol: Symbol, len: usize, offset_minutes: i64) -> Vec<Candle> {
     let mut candles = Vec::with_capacity(len);
     for i in 0..len {
         let base = 50_000.0 + ((i as f64) + offset_minutes as f64).sin() * 500.0;
@@ -1685,7 +1685,7 @@ fn synth_candles(symbol: &str, len: usize, offset_minutes: i64) -> Vec<Candle> {
         let high = Decimal::from_f64(open.max(close) + 20.0).unwrap_or(open_dec);
         let low = Decimal::from_f64(open.min(close) - 20.0).unwrap_or(close_dec);
         candles.push(Candle {
-            symbol: Symbol::from(symbol),
+            symbol,
             interval: Interval::OneMinute,
             open: open_dec,
             high,
@@ -1734,7 +1734,7 @@ fn load_candles_from_paths(paths: &[PathBuf]) -> Result<Vec<Candle>> {
         for record in reader.deserialize::<CandleCsvRow>() {
             let row = record.with_context(|| format!("invalid row in {}", path.display()))?;
             let timestamp = parse_datetime(&row.timestamp)?;
-            let symbol = row
+            let symbol_code = row
                 .symbol
                 .clone()
                 .or_else(|| infer_symbol_from_path(path))
@@ -1744,6 +1744,7 @@ fn load_candles_from_paths(paths: &[PathBuf]) -> Result<Vec<Candle>> {
                         path.display()
                     )
                 })?;
+            let symbol = Symbol::from(symbol_code.as_str());
             let interval = infer_interval_from_path(path).unwrap_or(Interval::OneMinute);
             let open = Decimal::from_f64(row.open).ok_or_else(|| {
                 anyhow!("invalid open value '{}' in {}", row.open, path.display())
@@ -1808,12 +1809,8 @@ fn detect_data_format(paths: &[PathBuf]) -> Result<DataFormat> {
     detected.ok_or_else(|| anyhow!("no data paths provided"))
 }
 
-fn memory_market_stream(symbol: &str, candles: Vec<Candle>) -> BacktestStream {
-    Box::new(PaperMarketStream::from_data(
-        symbol.to_string(),
-        Vec::new(),
-        candles,
-    ))
+fn memory_market_stream(symbol: Symbol, candles: Vec<Candle>) -> BacktestStream {
+    Box::new(PaperMarketStream::from_data(symbol, Vec::new(), candles))
 }
 
 fn parquet_market_stream(symbols: &[Symbol], paths: Vec<PathBuf>) -> BacktestStream {
@@ -1866,13 +1863,14 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                     asks,
                 } => {
                     let ts = parse_datetime(&timestamp)?;
-                    let symbol = symbol
+                    let symbol_code = symbol
                         .or_else(|| symbol_hint.clone())
                         .ok_or_else(|| anyhow!("missing symbol in snapshot {}", path.display()))?;
+                    let symbol = Symbol::from(symbol_code.as_str());
                     let bids = convert_levels(&bids)?;
                     let asks = convert_levels(&asks)?;
                     let book = OrderBook {
-                        symbol: symbol.clone(),
+                        symbol,
                         bids,
                         asks,
                         timestamp: ts,
@@ -1891,13 +1889,14 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                     asks,
                 } => {
                     let ts = parse_datetime(&timestamp)?;
-                    let symbol = symbol.or_else(|| symbol_hint.clone()).ok_or_else(|| {
+                    let symbol_code = symbol.or_else(|| symbol_hint.clone()).ok_or_else(|| {
                         anyhow!("missing symbol in depth update {}", path.display())
                     })?;
+                    let symbol = Symbol::from(symbol_code.as_str());
                     let bids = convert_levels(&bids)?;
                     let asks = convert_levels(&asks)?;
                     let update = DepthUpdate {
-                        symbol: symbol.clone(),
+                        symbol,
                         bids,
                         asks,
                         timestamp: ts,
@@ -1915,9 +1914,10 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                     size,
                 } => {
                     let ts = parse_datetime(&timestamp)?;
-                    let symbol = symbol
+                    let symbol_code = symbol
                         .or_else(|| symbol_hint.clone())
                         .ok_or_else(|| anyhow!("missing symbol in trade {}", path.display()))?;
+                    let symbol = Symbol::from(symbol_code.as_str());
                     let side = match side.to_lowercase().as_str() {
                         "buy" | "bid" | "b" => Side::Buy,
                         "sell" | "ask" | "s" => Side::Sell,
@@ -1930,7 +1930,7 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                         anyhow!("invalid trade size '{}' in {}", size, path.display())
                     })?;
                     let tick = Tick {
-                        symbol: symbol.clone(),
+                        symbol,
                         price,
                         size,
                         side,
@@ -2030,8 +2030,8 @@ fn interval_label(interval: Interval) -> &'static str {
 }
 
 #[derive(Serialize)]
-struct CandleRow<'a> {
-    symbol: &'a str,
+struct CandleRow {
+    symbol: String,
     timestamp: String,
     open: f64,
     high: f64,
@@ -2049,7 +2049,7 @@ fn write_candles_csv(path: &Path, candles: &[Candle]) -> Result<()> {
         Writer::from_path(path).with_context(|| format!("failed to create {}", path.display()))?;
     for candle in candles {
         let row = CandleRow {
-            symbol: &candle.symbol,
+            symbol: candle.symbol.code().to_string(),
             timestamp: candle.timestamp.to_rfc3339(),
             open: candle.open.to_f64().unwrap_or(0.0),
             high: candle.high.to_f64().unwrap_or(0.0),
@@ -2057,7 +2057,7 @@ fn write_candles_csv(path: &Path, candles: &[Candle]) -> Result<()> {
             close: candle.close.to_f64().unwrap_or(0.0),
             volume: candle.volume.to_f64().unwrap_or(0.0),
         };
-        writer.serialize(row)?;
+        writer.serialize(&row)?;
     }
     writer.flush()?;
     Ok(())
@@ -2086,11 +2086,11 @@ fn write_batch_report(path: &Path, rows: &[BatchRow]) -> Result<()> {
     Ok(())
 }
 
-fn clone_initial_balances(config: &tesser_config::BacktestConfig) -> HashMap<Symbol, Decimal> {
+fn clone_initial_balances(config: &tesser_config::BacktestConfig) -> HashMap<AssetId, Decimal> {
     config
         .initial_balances
         .iter()
-        .map(|(currency, amount)| (currency.clone(), *amount))
+        .map(|(currency, amount)| (AssetId::from(currency.as_str()), *amount))
         .collect()
 }
 

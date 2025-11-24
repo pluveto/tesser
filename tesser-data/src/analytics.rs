@@ -258,7 +258,7 @@ impl ArrivalLookup {
     fn new(rows: Vec<TickPoint>) -> Self {
         let mut ticks: HashMap<Symbol, Vec<TickPoint>> = HashMap::new();
         for row in rows {
-            ticks.entry(row.symbol.clone()).or_default().push(row);
+            ticks.entry(row.symbol).or_default().push(row);
         }
         for series in ticks.values_mut() {
             series.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -653,7 +653,9 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use rust_decimal::prelude::FromPrimitive;
     use tempfile::tempdir;
-    use tesser_core::{Fill, Order, OrderRequest, OrderStatus, OrderType, Symbol, Tick, TimeInForce};
+    use tesser_core::{
+        Fill, Order, OrderRequest, OrderStatus, OrderType, Symbol, Tick, TimeInForce,
+    };
 
     use crate::encoding::{fills_to_batch, orders_to_batch, ticks_to_batch};
 

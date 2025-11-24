@@ -115,7 +115,7 @@ impl Default for PaperConnectorConfig {
 
 impl PaperConnectorConfig {
     fn cache_key(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| self.symbol.to_string())
+        serde_json::to_string(self).unwrap_or_else(|_| self.symbol.code().to_string())
     }
 
     fn balance_asset(&self) -> AssetId {
@@ -144,7 +144,7 @@ impl PaperRuntimeState {
         let cash_asset = config.balance_asset();
         let client = Arc::new(PaperExecutionClient::with_cash_asset(
             stream_name,
-            vec![config.symbol.to_string()],
+            vec![config.symbol],
             config.slippage_bps,
             fee_model,
             cash_asset,
@@ -219,7 +219,7 @@ impl ConnectorFactory for PaperFactory {
         let runtime = self.runtime_for(cfg.clone());
         runtime.ensure_initialized().await;
         let stream = LivePaperStream::new(
-            cfg.symbol.clone(),
+            cfg.symbol,
             cfg.market.clone(),
             runtime.client.clone(),
             stream_config.connection_status,
@@ -281,7 +281,7 @@ impl Default for PaperExecutionClient {
         let fee_model = FeeScheduleConfig::default().build_model();
         Self::new(
             "paper".into(),
-            vec!["BTCUSDT".into()],
+            vec![Symbol::from("BTCUSDT")],
             Decimal::ZERO,
             fee_model,
         )
@@ -292,7 +292,7 @@ impl PaperExecutionClient {
     /// Create a new paper execution client configurable with instrument metadata.
     pub fn new(
         name: String,
-        markets: Vec<String>,
+        markets: Vec<Symbol>,
         slippage_bps: Decimal,
         fee_model: Arc<dyn FeeModel>,
     ) -> Self {
@@ -307,11 +307,13 @@ impl PaperExecutionClient {
 
     pub fn with_cash_asset(
         name: String,
-        markets: Vec<String>,
+        markets: Vec<Symbol>,
         slippage_bps: Decimal,
         fee_model: Arc<dyn FeeModel>,
         cash_asset: AssetId,
     ) -> Self {
+        let broker_markets: Vec<String> =
+            markets.iter().map(|symbol| symbol.code().to_string()).collect();
         let initial_balance = AccountBalance {
             exchange: cash_asset.exchange,
             asset: cash_asset,
@@ -322,7 +324,7 @@ impl PaperExecutionClient {
         Self {
             info: BrokerInfo {
                 name,
-                markets,
+                markets: broker_markets,
                 supports_testnet: true,
             },
             orders: Arc::new(AsyncMutex::new(Vec::new())),
@@ -339,7 +341,7 @@ impl PaperExecutionClient {
     /// Update the latest market price for a symbol.
     pub fn update_price(&self, symbol: &Symbol, price: Price) {
         let mut prices = self.last_prices.lock().unwrap();
-        prices.insert(symbol.clone(), price);
+        prices.insert(*symbol, price);
     }
 
     /// Reset the available balance to a configured amount.
@@ -404,7 +406,7 @@ impl PaperExecutionClient {
 
         Fill {
             order_id: order.id.clone(),
-            symbol: order.request.symbol.clone(),
+            symbol: order.request.symbol,
             side: order.request.side,
             fill_price,
             fill_quantity: order.request.quantity,
@@ -508,7 +510,7 @@ impl PaperExecutionClient {
 
         if let Some(price) = order.request.take_profit {
             let request = OrderRequest {
-                symbol: order.request.symbol.clone(),
+                symbol: order.request.symbol,
                 side: exit_side,
                 order_type: OrderType::StopMarket,
                 quantity: qty,
@@ -526,7 +528,7 @@ impl PaperExecutionClient {
 
         if let Some(price) = order.request.stop_loss {
             let request = OrderRequest {
-                symbol: order.request.symbol.clone(),
+                symbol: order.request.symbol,
                 side: exit_side,
                 order_type: OrderType::StopMarket,
                 quantity: qty,
@@ -560,8 +562,8 @@ impl PaperExecutionClient {
         drop(balances);
 
         let mut positions = self.positions.lock().await;
-        let position = positions.entry(fill.symbol.clone()).or_insert(Position {
-            symbol: fill.symbol.clone(),
+        let position = positions.entry(fill.symbol).or_insert(Position {
+            symbol: fill.symbol,
             side: Some(fill.side),
             quantity: Decimal::ZERO,
             entry_price: Some(fill.fill_price),
@@ -842,14 +844,14 @@ pub struct MatchingEngine {
 
 impl MatchingEngine {
     /// Build a new matching engine with the provided book metadata.
-    pub fn new(name: impl Into<String>, markets: Vec<String>, initial_cash: Price) -> Self {
+    pub fn new(name: impl Into<String>, markets: Vec<Symbol>, initial_cash: Price) -> Self {
         Self::with_config(name, markets, initial_cash, MatchingEngineConfig::default())
     }
 
     /// Build a matching engine configured with explicit latency/queue parameters.
     pub fn with_config(
         name: impl Into<String>,
-        markets: Vec<String>,
+        markets: Vec<Symbol>,
         initial_cash: Price,
         config: MatchingEngineConfig,
     ) -> Self {
@@ -860,10 +862,12 @@ impl MatchingEngine {
             config.latency
         };
         let cash_asset = AssetId::from("USDT");
+        let broker_markets: Vec<String> =
+            markets.iter().map(|symbol| symbol.code().to_string()).collect();
         Self {
             info: BrokerInfo {
                 name: name.into(),
-                markets,
+                markets: broker_markets,
                 supports_testnet: true,
             },
             market_depth: Arc::new(Mutex::new(LocalOrderBook::new())),
@@ -1163,7 +1167,7 @@ impl MatchingEngine {
 
         if let Some(price) = order.request.take_profit {
             let request = OrderRequest {
-                symbol: order.request.symbol.clone(),
+                symbol: order.request.symbol,
                 side: exit_side,
                 order_type: OrderType::StopMarket,
                 quantity: qty,
@@ -1181,7 +1185,7 @@ impl MatchingEngine {
 
         if let Some(price) = order.request.stop_loss {
             let request = OrderRequest {
-                symbol: order.request.symbol.clone(),
+                symbol: order.request.symbol,
                 side: exit_side,
                 order_type: OrderType::StopMarket,
                 quantity: qty,
@@ -1407,8 +1411,8 @@ impl MatchingEngine {
         drop(balances);
 
         let mut positions = self.positions.lock().await;
-        let position = positions.entry(fill.symbol.clone()).or_insert(Position {
-            symbol: fill.symbol.clone(),
+        let position = positions.entry(fill.symbol).or_insert(Position {
+            symbol: fill.symbol,
             side: Some(fill.side),
             quantity: Decimal::ZERO,
             entry_price: Some(fill.fill_price),
@@ -1675,7 +1679,7 @@ impl CandleBuilder {
         let start = self.start.unwrap_or(timestamp);
         if timestamp - start >= interval {
             let candle = Candle {
-                symbol: self.symbol.clone(),
+                symbol: self.symbol,
                 interval: Interval::OneMinute, // placeholder, updated by caller if needed
                 open: self.open.unwrap_or(price),
                 high: self.high,
@@ -1728,7 +1732,7 @@ impl LivePaperStream {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let candle_interval = Arc::new(AsyncMutex::new(ChronoDuration::minutes(1)));
         spawn_market_generator(
-            symbol.clone(),
+            symbol,
             market,
             exec_client,
             tick_tx,
@@ -1758,7 +1762,7 @@ impl Drop for LivePaperStream {
 #[async_trait]
 impl ConnectorStream for LivePaperStream {
     async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
-        let expected = self.symbol.to_string();
+        let expected = self.symbol.code().to_string();
         if !symbols.is_empty() && !symbols.iter().any(|s| s == &expected) {
             return Err(BrokerError::InvalidRequest(format!(
                 "paper stream only supports symbol {}",
@@ -1807,7 +1811,7 @@ fn spawn_market_generator(
                 interval_ms,
             } => {
                 run_random_walk(
-                    symbol.clone(),
+                    symbol,
                     start_price,
                     volatility,
                     interval_ms,
@@ -1821,7 +1825,7 @@ fn spawn_market_generator(
             }
             PaperMarketConfig::Replay { path, speed } => {
                 run_replay(
-                    symbol.clone(),
+                    symbol,
                     path,
                     speed,
                     exec_client,
@@ -1857,7 +1861,7 @@ async fn run_random_walk(
     let mut rng = StdRng::from_entropy();
     let mut price = start_price.to_f64().unwrap_or(25_000.0).max(1.0);
     let mut ticker = interval(TokioDuration::from_millis(interval_ms.max(10)));
-    let mut candle_builder = CandleBuilder::new(symbol.clone());
+    let mut candle_builder = CandleBuilder::new(symbol);
     loop {
         select! {
             _ = ticker.tick() => {},
@@ -1872,7 +1876,7 @@ async fn run_random_walk(
         let now = Utc::now();
         let size = Decimal::ONE;
         let tick = Tick {
-            symbol: symbol.clone(),
+            symbol: symbol,
             price: price_decimal,
             size,
             side: if delta >= 1.0 { Side::Buy } else { Side::Sell },
@@ -1916,7 +1920,7 @@ async fn run_replay(
             path.display()
         )));
     }
-    let mut candle_builder = CandleBuilder::new(symbol.clone());
+    let mut candle_builder = CandleBuilder::new(symbol);
     let mut idx = 0usize;
     loop {
         let sample = &samples[idx];
@@ -1933,7 +1937,7 @@ async fn run_replay(
         }
         exec_client.update_price(&symbol, sample.price);
         let tick = Tick {
-            symbol: symbol.clone(),
+            symbol: symbol,
             price: sample.price,
             size: sample.size,
             side: sample.side,
@@ -2072,7 +2076,7 @@ impl PaperMarketStream {
             candles: candles.into(),
             info: BrokerInfo {
                 name: "paper-market".into(),
-                markets: vec![symbol.to_string()],
+                markets: vec![symbol.code().to_string()],
                 supports_testnet: true,
             },
         }
@@ -2115,7 +2119,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn matching_engine_amend_updates_resting_state() {
-        let engine = MatchingEngine::new("paper", vec!["BTCUSDT".into()], Decimal::from(10_000));
+        let engine = MatchingEngine::new(
+            "paper",
+            vec![Symbol::from("BTCUSDT")],
+            Decimal::from(10_000),
+        );
         let request = OrderRequest {
             symbol: "BTCUSDT".into(),
             side: Side::Buy,
@@ -2154,7 +2162,7 @@ mod tests {
     async fn queue_model_waits_for_depth_before_fill() {
         let engine = MatchingEngine::with_config(
             "paper",
-            vec!["BTCUSDT".into()],
+            vec![Symbol::from("BTCUSDT")],
             Decimal::from(10_000),
             MatchingEngineConfig {
                 latency: ChronoDuration::zero(),
@@ -2231,7 +2239,7 @@ mod tests {
     async fn latency_delays_limit_order_activation() {
         let engine = MatchingEngine::with_config(
             "paper",
-            vec!["BTCUSDT".into()],
+            vec![Symbol::from("BTCUSDT")],
             Decimal::from(10_000),
             MatchingEngineConfig {
                 latency: ChronoDuration::milliseconds(50),
@@ -2303,7 +2311,7 @@ mod tests {
     async fn optimistic_queue_fills_even_with_depth_ahead() {
         let engine = MatchingEngine::with_config(
             "paper",
-            vec!["BTCUSDT".into()],
+            vec![Symbol::from("BTCUSDT")],
             Decimal::from(10_000),
             MatchingEngineConfig {
                 latency: ChronoDuration::zero(),
@@ -2359,7 +2367,7 @@ mod tests {
             FeeScheduleConfig::with_defaults(Decimal::ZERO, Decimal::from_f64(0.5).unwrap());
         let engine = MatchingEngine::with_config(
             "paper",
-            vec!["BTCUSDT".into()],
+            vec![Symbol::from("BTCUSDT")],
             Decimal::from(10_000),
             MatchingEngineConfig {
                 latency: ChronoDuration::zero(),

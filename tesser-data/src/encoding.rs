@@ -192,7 +192,7 @@ pub fn ticks_to_batch(rows: &[Tick]) -> Result<RecordBatch> {
     let mut received_ts = timestamp_builder(capacity);
 
     for tick in rows {
-        symbols.append_value(&tick.symbol);
+        symbols.append_value(tick.symbol);
         let price = decimal_to_i128(tick.price)?;
         prices.append_value(price);
         let size = decimal_to_i128(tick.size)?;
@@ -227,7 +227,7 @@ pub fn candles_to_batch(rows: &[Candle]) -> Result<RecordBatch> {
     let mut timestamps = timestamp_builder(capacity);
 
     for candle in rows {
-        symbols.append_value(&candle.symbol);
+        symbols.append_value(candle.symbol);
         intervals.append_value(interval_label(candle.interval));
         let open = decimal_to_i128(candle.open)?;
         opens.append_value(open);
@@ -269,7 +269,7 @@ pub fn fills_to_batch(rows: &[Fill]) -> Result<RecordBatch> {
 
     for fill in rows {
         order_ids.append_value(&fill.order_id);
-        symbols.append_value(&fill.symbol);
+        symbols.append_value(fill.symbol);
         sides.append_value(fill.side.as_i8());
         let price = decimal_to_i128(fill.fill_price)?;
         prices.append_value(price);
@@ -316,7 +316,7 @@ pub fn orders_to_batch(rows: &[Order]) -> Result<RecordBatch> {
     for order in rows {
         let req = &order.request;
         ids.append_value(&order.id);
-        symbols.append_value(&req.symbol);
+        symbols.append_value(req.symbol);
         sides.append_value(req.side.as_i8());
         types.append_value(order_type_label(req.order_type));
         statuses.append_value(status_code(order.status));
@@ -377,7 +377,7 @@ pub fn signals_to_batch(rows: &[Signal]) -> Result<RecordBatch> {
 
     for signal in rows {
         ids.append_value(signal.id.to_string());
-        symbols.append_value(&signal.symbol);
+        symbols.append_value(signal.symbol);
         kinds.append_value(signal_kind_label(signal.kind));
         confidences.append_value(signal.confidence);
         append_decimal_option(&mut stop_losses, signal.stop_loss)?;
@@ -414,7 +414,7 @@ pub fn order_books_to_batch(rows: &[OrderBook]) -> Result<RecordBatch> {
 
     for book in rows {
         timestamps.append_value(timestamp_to_nanos(&book.timestamp));
-        symbols.append_value(&book.symbol);
+        symbols.append_value(book.symbol);
         append_order_book_levels(&mut bids, &book.bids)?;
         append_order_book_levels(&mut asks, &book.asks)?;
     }

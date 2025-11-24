@@ -24,8 +24,8 @@ use tesser_cli::live::{
 use tesser_cli::PublicChannel;
 use tesser_config::{AlertingConfig, ExchangeConfig, PersistenceEngine, RiskManagementConfig};
 use tesser_core::{
-    AccountBalance, Candle, ExecutionHint, Interval, OrderBook, OrderBookLevel, Side, Signal,
-    SignalKind, Tick,
+    AccountBalance, AssetId, Candle, ExecutionHint, ExchangeId, Interval, OrderBook,
+    OrderBookLevel, Side, Signal, SignalKind, Symbol, Tick,
 };
 use tesser_data::recorder::{ParquetRecorder, RecorderConfig};
 use tesser_rpc::proto::control_service_client::ControlServiceClient;
@@ -40,6 +40,29 @@ fn next_control_addr() -> SocketAddr {
     let addr = listener.local_addr().expect("local addr");
     drop(listener);
     addr
+}
+
+fn bybit_exchange() -> ExchangeId {
+    ExchangeId::from("bybit_linear")
+}
+
+fn test_symbol() -> Symbol {
+    Symbol::from_code(bybit_exchange(), SYMBOL)
+}
+
+fn usdt_asset() -> AssetId {
+    AssetId::from_code(bybit_exchange(), "USDT")
+}
+
+fn account_balance(total: Decimal) -> AccountBalance {
+    let asset = usdt_asset();
+    AccountBalance {
+        exchange: asset.exchange,
+        asset,
+        total,
+        available: total,
+        updated_at: Utc::now(),
+    }
 }
 
 fn find_parquet_file(dir: &Path) -> Option<PathBuf> {
@@ -117,7 +140,7 @@ async fn connect_control_client(addr: SocketAddr) -> Result<ControlServiceClient
 }
 
 struct SignalStrategy {
-    symbol: String,
+    symbol: Symbol,
     emitted: bool,
     pending: Vec<Signal>,
     gate_passed: bool,
@@ -126,9 +149,9 @@ struct SignalStrategy {
 }
 
 impl SignalStrategy {
-    fn new(symbol: &str, ready: Arc<Notify>, emit_signal: bool) -> Self {
+    fn new(symbol: Symbol, ready: Arc<Notify>, emit_signal: bool) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol,
             emitted: false,
             pending: Vec::new(),
             gate_passed: false,
@@ -144,8 +167,8 @@ impl Strategy for SignalStrategy {
         "signal-test"
     }
 
-    fn symbol(&self) -> &str {
-        &self.symbol
+    fn symbol(&self) -> Symbol {
+        self.symbol
     }
 
     fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
@@ -159,7 +182,7 @@ impl Strategy for SignalStrategy {
         }
         if self.emit_signal && !self.emitted {
             self.emitted = true;
-            let mut signal = Signal::new(&self.symbol, SignalKind::EnterLong, 0.73);
+            let mut signal = Signal::new(self.symbol, SignalKind::EnterLong, 0.73);
             signal.stop_loss = Some(Decimal::new(99_000, 0));
             signal.take_profit = Some(Decimal::new(101_500, 0));
             signal.note = Some("integration-monitor".into());
@@ -286,7 +309,7 @@ async fn flight_recorder_writes_order_books() -> Result<()> {
     let recorder = ParquetRecorder::spawn(config).await?;
     let handle = recorder.handle();
     handle.record_order_book(OrderBook {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         bids: vec![OrderBookLevel {
             price: Decimal::new(20_000, 0),
             size: Decimal::new(1, 0),
@@ -429,14 +452,10 @@ struct LiveTestHarness {
 
 impl LiveTestHarness {
     async fn start(record_data: bool, emit_signal: bool) -> Result<Self> {
-        let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-            currency: "USDT".into(),
-            total: Decimal::new(10_000, 0),
-            available: Decimal::new(10_000, 0),
-            updated_at: Utc::now(),
-        });
+        let account = AccountConfig::new("test-key", "test-secret")
+            .with_balance(account_balance(Decimal::new(10_000, 0)));
         let candles = vec![Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000, 0),
             high: Decimal::new(1_010, 0),
@@ -447,7 +466,7 @@ impl LiveTestHarness {
         }];
         let ticks = (0..5)
             .map(|i| Tick {
-                symbol: SYMBOL.into(),
+                symbol: test_symbol(),
                 price: Decimal::new(1_005 + i, 0),
                 size: Decimal::ONE,
                 side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
@@ -457,6 +476,7 @@ impl LiveTestHarness {
             .collect::<Vec<_>>();
 
         let config = MockExchangeConfig::new()
+            .with_exchange(bybit_exchange())
             .with_account(account)
             .with_candles(candles)
             .with_ticks(ticks);
@@ -468,7 +488,7 @@ impl LiveTestHarness {
         let record_root = temp.path().join("flight_recorder");
         let ready = Arc::new(Notify::new());
         let strategy: Box<dyn Strategy> =
-            Box::new(SignalStrategy::new(SYMBOL, ready.clone(), emit_signal));
+            Box::new(SignalStrategy::new(test_symbol(), ready.clone(), emit_signal));
 
         let exchange_cfg = ExchangeConfig {
             rest_url: exchange.rest_url(),
@@ -488,8 +508,8 @@ impl LiveTestHarness {
             history: 4,
             metrics_addr: "127.0.0.1:0".parse().unwrap(),
             persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-            initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-            reporting_currency: "USDT".into(),
+            initial_balances: HashMap::from([(usdt_asset(), Decimal::new(10_000, 0))]),
+            reporting_currency: usdt_asset(),
             markets_file: Some(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml"),
             ),
@@ -507,7 +527,7 @@ impl LiveTestHarness {
         let shutdown = ShutdownSignal::new();
         let run_handle = tokio::spawn(run_live_with_shutdown(
             strategy,
-            vec![SYMBOL.to_string()],
+            vec![Symbol::from(SYMBOL)],
             exchange_cfg,
             settings,
             shutdown.clone(),

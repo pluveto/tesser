@@ -85,7 +85,7 @@ impl TrailingStopAlgorithm {
         ChildOrderRequest {
             parent_algo_id: self.state.id,
             action: ChildOrderAction::Place(OrderRequest {
-                symbol: self.state.parent_signal.symbol.clone(),
+                symbol: self.state.parent_signal.symbol,
                 side: self.state.parent_signal.kind.side(),
                 order_type: OrderType::Market,
                 quantity: qty,
