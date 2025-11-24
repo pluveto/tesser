@@ -34,12 +34,13 @@ use tesser_core::{
     Order, OrderBook, OrderId, OrderRequest, OrderStatus, OrderType, OrderUpdateRequest, Position,
     Price, Quantity, Side, Symbol, Tick, TimeInForce,
 };
+use tokio::task::JoinHandle;
 use tokio::{
     select,
     sync::{mpsc, oneshot, Mutex as AsyncMutex},
     time::{interval, sleep, Duration as TokioDuration},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub use fees::{FeeContext, FeeModel, FeeScheduleConfig, LiquidityRole, MarketFeeConfig};
@@ -85,6 +86,8 @@ impl PaperMarketConfig {
 pub struct PaperConnectorConfig {
     #[serde(default = "default_symbol")]
     pub symbol: Symbol,
+    #[serde(default)]
+    pub symbols: Vec<Symbol>,
     #[serde(default = "default_balance_currency")]
     pub balance_currency: String,
     #[serde(default = "default_initial_balance")]
@@ -103,6 +106,7 @@ impl Default for PaperConnectorConfig {
     fn default() -> Self {
         Self {
             symbol: default_symbol(),
+            symbols: Vec::new(),
             balance_currency: default_balance_currency(),
             initial_balance: default_initial_balance(),
             slippage_bps: Decimal::ZERO,
@@ -115,14 +119,34 @@ impl Default for PaperConnectorConfig {
 
 impl PaperConnectorConfig {
     fn cache_key(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| self.symbol.code().to_string())
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            self.symbols()
+                .first()
+                .copied()
+                .unwrap_or_else(default_symbol)
+                .code()
+                .to_string()
+        })
     }
 
     fn balance_asset(&self) -> AssetId {
         if let Ok(parsed) = self.balance_currency.parse::<AssetId>() {
             parsed
         } else {
-            AssetId::from_code(self.symbol.exchange, &self.balance_currency)
+            let primary = self
+                .symbols()
+                .first()
+                .copied()
+                .unwrap_or_else(default_symbol);
+            AssetId::from_code(primary.exchange, &self.balance_currency)
+        }
+    }
+
+    fn symbols(&self) -> Vec<Symbol> {
+        if self.symbols.is_empty() {
+            vec![self.symbol]
+        } else {
+            self.symbols.clone()
         }
     }
 }
@@ -130,12 +154,15 @@ impl PaperConnectorConfig {
 struct PaperRuntimeState {
     client: Arc<PaperExecutionClient>,
     config: PaperConnectorConfig,
+    symbols: Vec<Symbol>,
     initialized: AsyncMutex<bool>,
 }
 
 impl PaperRuntimeState {
     fn new(config: PaperConnectorConfig) -> Self {
-        let stream_name = format!("paper-{}", config.symbol.code().to_lowercase());
+        let symbols = config.symbols();
+        let primary = symbols.first().copied().unwrap_or_else(default_symbol);
+        let stream_name = format!("paper-{}", primary.code().to_lowercase());
         let fee_schedule = config
             .fee_schedule
             .clone()
@@ -144,7 +171,7 @@ impl PaperRuntimeState {
         let cash_asset = config.balance_asset();
         let client = Arc::new(PaperExecutionClient::with_cash_asset(
             stream_name,
-            vec![config.symbol],
+            symbols.clone(),
             config.slippage_bps,
             fee_model,
             cash_asset,
@@ -152,6 +179,7 @@ impl PaperRuntimeState {
         Self {
             client,
             config,
+            symbols,
             initialized: AsyncMutex::new(false),
         }
     }
@@ -165,8 +193,10 @@ impl PaperRuntimeState {
         self.client
             .initialize_balance(asset, self.config.initial_balance)
             .await;
-        self.client
-            .update_price(&self.config.symbol, self.config.market.initial_price());
+        for symbol in &self.symbols {
+            self.client
+                .update_price(symbol, self.config.market.initial_price());
+        }
         *guard = true;
     }
 }
@@ -218,13 +248,27 @@ impl ConnectorFactory for PaperFactory {
         let cfg = self.parse_config(config)?;
         let runtime = self.runtime_for(cfg.clone());
         runtime.ensure_initialized().await;
-        let stream = LivePaperStream::new(
-            cfg.symbol,
-            cfg.market.clone(),
-            runtime.client.clone(),
-            stream_config.connection_status,
-        )?;
-        Ok(Box::new(stream))
+        let symbols = cfg.symbols();
+        if symbols.len() == 1 {
+            let stream = LivePaperStream::new(
+                symbols[0],
+                cfg.market.clone(),
+                runtime.client.clone(),
+                stream_config.connection_status,
+            )?;
+            Ok(Box::new(stream))
+        } else {
+            let mut streams = Vec::new();
+            for symbol in symbols {
+                streams.push(LivePaperStream::new(
+                    symbol,
+                    cfg.market.clone(),
+                    runtime.client.clone(),
+                    stream_config.connection_status.clone(),
+                )?);
+            }
+            Ok(Box::new(FanInPaperStream::new(streams)))
+        }
     }
 }
 
@@ -1768,8 +1812,13 @@ impl Drop for LivePaperStream {
 #[async_trait]
 impl ConnectorStream for LivePaperStream {
     async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
-        let expected = self.symbol.code().to_string();
-        if !symbols.is_empty() && !symbols.iter().any(|s| s == &expected) {
+        let with_exchange = self.symbol.to_string();
+        let without_exchange = self.symbol.code();
+        if !symbols.is_empty()
+            && !symbols
+                .iter()
+                .any(|s| s == &with_exchange || s == without_exchange)
+        {
             return Err(BrokerError::InvalidRequest(format!(
                 "paper stream only supports symbol {}",
                 self.symbol
@@ -1792,6 +1841,130 @@ impl ConnectorStream for LivePaperStream {
 
     async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
         Ok(None)
+    }
+}
+
+struct FanInPaperStream {
+    pending: Vec<LivePaperStream>,
+    tick_rx: Option<mpsc::Receiver<Tick>>,
+    candle_rx: Option<mpsc::Receiver<Candle>>,
+    book_rx: Option<mpsc::Receiver<OrderBook>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl FanInPaperStream {
+    fn new(streams: Vec<LivePaperStream>) -> Self {
+        Self {
+            pending: streams,
+            tick_rx: None,
+            candle_rx: None,
+            book_rx: None,
+            tasks: Vec::new(),
+        }
+    }
+
+    fn ensure_started(&mut self) {
+        if self.tick_rx.is_some() {
+            return;
+        }
+        let (tick_tx, tick_rx) = mpsc::channel(2048);
+        let (candle_tx, candle_rx) = mpsc::channel(512);
+        let (book_tx, book_rx) = mpsc::channel(256);
+        let mut handles = Vec::new();
+        for mut stream in self.pending.drain(..) {
+            let tick_tx = tick_tx.clone();
+            let candle_tx = candle_tx.clone();
+            let book_tx = book_tx.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    match stream.next_tick().await {
+                        Ok(Some(event)) => {
+                            if tick_tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, "paper stream tick failed");
+                            break;
+                        }
+                    }
+
+                    match stream.next_candle().await {
+                        Ok(Some(event)) => {
+                            if candle_tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, "paper stream candle failed");
+                            break;
+                        }
+                    }
+
+                    match stream.next_order_book().await {
+                        Ok(Some(event)) => {
+                            if book_tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, "paper stream book failed");
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+        self.tick_rx = Some(tick_rx);
+        self.candle_rx = Some(candle_rx);
+        self.book_rx = Some(book_rx);
+        self.tasks = handles;
+    }
+}
+
+#[async_trait]
+impl ConnectorStream for FanInPaperStream {
+    async fn subscribe(&mut self, symbols: &[String], interval: Interval) -> BrokerResult<()> {
+        for stream in &mut self.pending {
+            stream.subscribe(symbols, interval).await?;
+        }
+        self.ensure_started();
+        Ok(())
+    }
+
+    async fn next_tick(&mut self) -> BrokerResult<Option<Tick>> {
+        if let Some(rx) = &mut self.tick_rx {
+            Ok(rx.recv().await)
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn next_candle(&mut self) -> BrokerResult<Option<Candle>> {
+        if let Some(rx) = &mut self.candle_rx {
+            Ok(rx.recv().await)
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn next_order_book(&mut self) -> BrokerResult<Option<OrderBook>> {
+        if let Some(rx) = &mut self.book_rx {
+            Ok(rx.recv().await)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Drop for FanInPaperStream {
+    fn drop(&mut self) {
+        for handle in self.tasks.drain(..) {
+            handle.abort();
+        }
     }
 }
 
@@ -2121,7 +2294,42 @@ impl MarketStream for PaperMarketStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::HashSet;
     use tesser_core::OrderBookLevel;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn paper_factory_supports_multi_symbol_streams() -> BrokerResult<()> {
+        let factory = PaperFactory::default();
+        let config = json!({
+            "symbols": ["bybit_linear:BTCUSDT", "bybit_linear:ETHUSDT"],
+            "market": {
+                "mode": "random_walk",
+                "start_price": "25000",
+                "volatility": 0.001,
+                "interval_ms": 10
+            }
+        });
+        let mut stream = factory
+            .create_market_stream(&config, ConnectorStreamConfig::default())
+            .await?;
+        stream
+            .subscribe(
+                &["bybit_linear:BTCUSDT".into(), "bybit_linear:ETHUSDT".into()],
+                Interval::OneMinute,
+            )
+            .await?;
+        let mut seen = HashSet::new();
+        while seen.len() < 2 {
+            let tick = tokio::time::timeout(TokioDuration::from_millis(500), stream.next_tick())
+                .await
+                .map_err(|_| BrokerError::Other("timed out waiting for paper tick".into()))??;
+            if let Some(event) = tick {
+                seen.insert(event.symbol);
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn matching_engine_amend_updates_resting_state() {
@@ -2174,6 +2382,7 @@ mod tests {
                 latency: ChronoDuration::zero(),
                 queue_model: QueueModel::Conservative,
                 fee_model: FeeScheduleConfig::default().build_model(),
+                cash_asset: None,
             },
         );
         let book_time = Utc::now();
@@ -2251,6 +2460,7 @@ mod tests {
                 latency: ChronoDuration::milliseconds(50),
                 queue_model: QueueModel::Optimistic,
                 fee_model: FeeScheduleConfig::default().build_model(),
+                cash_asset: None,
             },
         );
         let book_time = Utc::now();
@@ -2323,6 +2533,7 @@ mod tests {
                 latency: ChronoDuration::zero(),
                 queue_model: QueueModel::Optimistic,
                 fee_model: FeeScheduleConfig::default().build_model(),
+                cash_asset: None,
             },
         );
         let book_time = Utc::now();
@@ -2379,6 +2590,7 @@ mod tests {
                 latency: ChronoDuration::zero(),
                 queue_model: QueueModel::Optimistic,
                 fee_model: fee_cfg.build_model(),
+                cash_asset: None,
             },
         );
         let book_time = Utc::now();
