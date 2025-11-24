@@ -183,3 +183,5 @@ pub use connector::{
     get_connector_factory, register_connector_factory, registered_connectors, ConnectorFactory,
     ConnectorStream, ConnectorStreamConfig,
 };
+pub mod router;
+pub use router::RouterExecutionClient;

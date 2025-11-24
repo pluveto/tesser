@@ -17,3 +17,9 @@ tesser-core = { version = "0.9.0", path = "../tesser-core" }
 once_cell.workspace = true
 governor.workspace = true
 nonzero_ext.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+chrono.workspace = true
+rust_decimal.workspace = true

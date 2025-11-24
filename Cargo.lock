@@ -4087,13 +4087,17 @@ name = "tesser-broker"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "governor",
  "nonzero_ext",
  "once_cell",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tesser-core",
  "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
