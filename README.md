@@ -388,10 +388,12 @@ The upgraded `tesser-strategy` crate bundles a diverse suite for pressure-testin
 | `RsiReversion` | Mean reversion | RSI thresholds with configurable lookbacks |
 | `BollingerBreakout` | Volatility/Band breakout | Uses standard deviation bands for entries |
 | `MlClassifier` | Machine learning | Loads an external model artifact for real-time inference |
-| `PairsTradingArbitrage` | Statistical arbitrage | Operates on two correlated symbols |
+| `PairsTradingArbitrage` | Statistical arbitrage | Operates on two correlated symbols (configure as `exchange:SYMBOL`, e.g., `binance_perp:BTCUSDT`) |
 | `OrderBookImbalance` | Microstructure | Consumes order-book snapshots to trade short-term imbalances |
 
 Each strategy exposes a typed configuration schema and registers the symbols (one or many) it operates on. Sample configs live in `research/strategies/` and the ML artifact in `research/models/`, so you can run them directly with the CLI.
+
+> **Note:** Multi-symbol strategies (e.g., `PairsTradingArbitrage`) require fully-qualified identifiers in the form `exchange:instrument` so the router can distinguish venues.
 
 ## Contributing
 

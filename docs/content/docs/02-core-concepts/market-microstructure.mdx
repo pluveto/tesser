@@ -72,7 +72,7 @@ Strategies generally fall into mathematical categories.
 ### Statistical Arbitrage (Stat Arb)
 *   **Premise**: "Asset A and Asset B usually move together. Currently, they are divergent."
 *   **Action**: Long the underperformer, Short the overperformer.
-*   **Tesser Example**: The `PairsTrading` strategy implements this using cointegration concepts.
+*   **Tesser Example**: The `PairsTrading` strategy implements this using cointegration concepts. Configure the two legs with fully-qualified identifiers (`exchange:SYMBOL`, e.g., `binance_perp:BTCUSDT`) so the engine knows which venue each leg belongs to.
 
 ## 5. Risk Metrics (The Math of Survival)
 
