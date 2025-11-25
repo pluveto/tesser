@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient};
 use tesser_core::{
-    AccountBalance, ExchangeId, Instrument, Order, OrderRequest, OrderUpdateRequest, Position,
-    Symbol,
+    AccountBalance, ExchangeId, Fill, Instrument, Order, OrderRequest, OrderUpdateRequest,
+    Position, Symbol,
 };
 
 const CLIENT_NAMESPACE: &str = "TESSER";
@@ -74,7 +74,7 @@ impl RouterExecutionClient {
             .ok_or_else(|| BrokerError::InvalidRequest(format!("unknown order id {order_id}")))
     }
 
-    fn normalize_order(&self, exchange: ExchangeId, mut order: Order) -> Order {
+    fn normalize_external_order(&self, exchange: ExchangeId, mut order: Order) -> Order {
         let mut guard = self.state.lock().unwrap();
         let external_id = order.id.clone();
         let external_client_id = order.request.client_order_id.clone();
@@ -103,6 +103,26 @@ impl RouterExecutionClient {
         order.id = internal_id;
         order.request.client_order_id = original_client_id;
         order
+    }
+
+    /// Normalize an order originating from an exchange-specific stream.
+    pub fn normalize_order_event(&self, exchange: ExchangeId, order: Order) -> Order {
+        self.normalize_external_order(exchange, order)
+    }
+
+    /// Normalize a fill originating from an exchange-specific stream.
+    pub fn normalize_fill_event(&self, exchange: ExchangeId, mut fill: Fill) -> Fill {
+        let guard = self.state.lock().unwrap();
+        if let Some(internal) = guard
+            .lookup_external_order(exchange, &fill.order_id)
+            .cloned()
+        {
+            if let Some(entry) = guard.get(&internal) {
+                fill.order_id = internal;
+                fill.symbol = entry.symbol;
+            }
+        }
+        fill
     }
 }
 
@@ -190,7 +210,7 @@ impl ExecutionClient for RouterExecutionClient {
         let mut orders = client.list_open_orders(symbol).await?;
         let mut normalized = Vec::with_capacity(orders.len());
         for order in orders.drain(..) {
-            normalized.push(self.normalize_order(exchange, order));
+            normalized.push(self.normalize_external_order(exchange, order));
         }
         Ok(normalized)
     }
@@ -318,6 +338,8 @@ mod tests {
         next_id: Mutex<u64>,
         placed: Mutex<Vec<OrderRequest>>,
         canceled: Mutex<Vec<(String, Symbol)>>,
+        listed: Mutex<Vec<Symbol>>,
+        open_orders: Mutex<Vec<Order>>,
     }
 
     impl TestClient {
@@ -327,7 +349,13 @@ mod tests {
                 next_id: Mutex::new(0),
                 placed: Mutex::new(Vec::new()),
                 canceled: Mutex::new(Vec::new()),
+                listed: Mutex::new(Vec::new()),
+                open_orders: Mutex::new(Vec::new()),
             }
+        }
+
+        fn push_open_order(&self, order: Order) {
+            self.open_orders.lock().unwrap().push(order);
         }
     }
 
@@ -390,8 +418,9 @@ mod tests {
             })
         }
 
-        async fn list_open_orders(&self, _symbol: Symbol) -> BrokerResult<Vec<Order>> {
-            Ok(Vec::new())
+        async fn list_open_orders(&self, symbol: Symbol) -> BrokerResult<Vec<Order>> {
+            self.listed.lock().unwrap().push(symbol);
+            Ok(self.open_orders.lock().unwrap().clone())
         }
 
         async fn account_balances(&self) -> BrokerResult<Vec<AccountBalance>> {
@@ -473,5 +502,87 @@ mod tests {
             "binance client should receive order"
         );
         assert_ne!(order_a.id, order_b.id, "internal ids must be unique");
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_scoped_to_matching_exchange() {
+        let bybit = ExchangeId::from("bybit_linear");
+        let binance = ExchangeId::from("binance_perp");
+        let client_a = Arc::new(TestClient::new(bybit));
+        let client_b = Arc::new(TestClient::new(binance));
+        let order_a = Order {
+            id: "ext-a".into(),
+            request: sample_request(Symbol::from_code(bybit, "BTCUSDT")),
+            status: OrderStatus::Accepted,
+            filled_quantity: Decimal::ZERO,
+            avg_fill_price: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let order_b = Order {
+            id: "ext-b".into(),
+            request: sample_request(Symbol::from_code(binance, "ETHUSDT")),
+            status: OrderStatus::Accepted,
+            filled_quantity: Decimal::ZERO,
+            avg_fill_price: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        client_a.push_open_order(order_a.clone());
+        client_b.push_open_order(order_b.clone());
+
+        let mut routes: HashMap<ExchangeId, Arc<dyn ExecutionClient>> = HashMap::new();
+        routes.insert(bybit, client_a.clone());
+        routes.insert(binance, client_b.clone());
+        let router = RouterExecutionClient::new(routes);
+
+        let fetched_a = router
+            .list_open_orders(order_a.request.symbol)
+            .await
+            .expect("bybit open orders");
+        assert_eq!(fetched_a.len(), 1);
+        assert_eq!(fetched_a[0].request.symbol.exchange, bybit);
+        assert_eq!(client_a.listed.lock().unwrap().len(), 1);
+        assert_eq!(client_b.listed.lock().unwrap().len(), 0);
+
+        let fetched_b = router
+            .list_open_orders(order_b.request.symbol)
+            .await
+            .expect("binance open orders");
+        assert_eq!(fetched_b.len(), 1);
+        assert_eq!(fetched_b[0].request.symbol.exchange, binance);
+        assert_eq!(client_b.listed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn normalizes_fill_order_ids() {
+        let exchange = ExchangeId::from("bybit_linear");
+        let client = Arc::new(TestClient::new(exchange));
+        let mut routes: HashMap<ExchangeId, Arc<dyn ExecutionClient>> = HashMap::new();
+        routes.insert(exchange, client.clone());
+        let router = RouterExecutionClient::new(routes);
+        let symbol = Symbol::from_code(exchange, "BTCUSDT");
+        let order = router
+            .place_order(sample_request(symbol))
+            .await
+            .expect("order");
+        let external_id = format!(
+            "{}-{}",
+            exchange.as_raw(),
+            *client.next_id.lock().unwrap()
+        );
+        let fill = Fill {
+            order_id: external_id,
+            symbol,
+            side: Side::Buy,
+            fill_price: Decimal::ONE,
+            fill_quantity: Decimal::ONE,
+            fee: None,
+            fee_asset: None,
+            timestamp: Utc::now(),
+        };
+        let normalized = router.normalize_fill_event(exchange, fill);
+        assert_eq!(normalized.order_id, order.id);
+        assert_eq!(normalized.symbol, order.request.symbol);
     }
 }

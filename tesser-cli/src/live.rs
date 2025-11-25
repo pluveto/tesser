@@ -336,6 +336,7 @@ struct ExchangeRoute {
 
 struct ExchangeBuildResult {
     execution_client: Arc<dyn ExecutionClient>,
+    router: Option<Arc<RouterExecutionClient>>,
     market_stream: Box<dyn LiveMarketStream>,
     routes: Vec<ExchangeRoute>,
 }
@@ -457,6 +458,7 @@ pub async fn run_live_with_shutdown(
 
     let ExchangeBuildResult {
         execution_client,
+        router,
         market_stream,
         routes,
     } = build_exchange_routes(
@@ -541,6 +543,7 @@ pub async fn run_live_with_shutdown(
         strategy,
         symbols,
         routes,
+        router.clone(),
         orchestrator,
         persistence.state,
         settings,
@@ -613,10 +616,14 @@ async fn build_exchange_routes(
         });
     }
 
-    let execution_client = if router_inputs.len() == 1 {
-        router_inputs.into_values().next().unwrap()
+    let (execution_client, router_handle): (
+        Arc<dyn ExecutionClient>,
+        Option<Arc<RouterExecutionClient>>,
+    ) = if router_inputs.len() == 1 {
+        (router_inputs.into_values().next().unwrap(), None)
     } else {
-        Arc::new(RouterExecutionClient::new(router_inputs))
+        let router = Arc::new(RouterExecutionClient::new(router_inputs));
+        (router.clone(), Some(router))
     };
 
     let market_stream: Box<dyn LiveMarketStream> = if stream_sources.len() == 1 {
@@ -627,6 +634,7 @@ async fn build_exchange_routes(
 
     Ok(ExchangeBuildResult {
         execution_client,
+        router: router_handle,
         market_stream,
         routes,
     })
@@ -702,6 +710,7 @@ impl LiveRuntime {
         mut strategy: Box<dyn Strategy>,
         symbols: Vec<Symbol>,
         exchanges: Vec<ExchangeRoute>,
+        router: Option<Arc<RouterExecutionClient>>,
         orchestrator: OrderOrchestrator,
         state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
         settings: LiveSessionSettings,
@@ -800,6 +809,7 @@ impl LiveRuntime {
         }
 
         if !settings.exec_backend.is_paper() {
+            let router_handle = router.clone();
             for route in &exchanges {
                 match route.driver.as_str() {
                     "bybit" | "" => {
@@ -825,6 +835,7 @@ impl LiveRuntime {
                                 last_private_sync.clone(),
                                 private_connection.clone(),
                                 metrics.clone(),
+                                router_handle.clone(),
                                 shutdown.clone(),
                             );
                         }
@@ -842,6 +853,7 @@ impl LiveRuntime {
                                 private_event_tx.clone(),
                                 private_connection.clone(),
                                 metrics.clone(),
+                                router_handle.clone(),
                                 shutdown.clone(),
                             );
                         }
@@ -2467,6 +2479,7 @@ fn spawn_bybit_private_stream(
     last_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
     private_connection_flag: Option<Arc<AtomicBool>>,
     metrics: Arc<LiveMetrics>,
+    router: Option<Arc<RouterExecutionClient>>,
     shutdown: ShutdownSignal,
 ) {
     let exchange_id = exec_client
@@ -2497,7 +2510,10 @@ fn spawn_bybit_private_stream(
                     for symbol in &venue_symbols {
                         match exec_client.list_open_orders(*symbol).await {
                             Ok(orders) => {
-                                for order in orders {
+                                for mut order in orders {
+                                    if let Some(router) = &router {
+                                        order = router.normalize_order_event(exchange_id, order);
+                                    }
                                     if let Err(err) =
                                         private_tx.send(BrokerEvent::OrderUpdate(order)).await
                                     {
@@ -2520,7 +2536,10 @@ fn spawn_bybit_private_stream(
                         };
                         match bybit.list_executions_since(since).await {
                             Ok(fills) => {
-                                for fill in fills {
+                                for mut fill in fills {
+                                    if let Some(router) = &router {
+                                        fill = router.normalize_fill_event(exchange_id, fill);
+                                    }
                                     if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await
                                     {
                                         error!("failed to send reconciled fill: {err}");
@@ -2550,9 +2569,15 @@ fn spawn_bybit_private_stream(
                                                 value.clone()
                                             ) {
                                                 for update in msg.data {
-                                                    if let Ok(order) =
+                                                    if let Ok(mut order) =
                                                         update.to_tesser_order(exchange_id, None)
                                                     {
+                                                        if let Some(router) = &router {
+                                                            order = router.normalize_order_event(
+                                                                exchange_id,
+                                                                order,
+                                                            );
+                                                        }
                                                         if let Err(err) = private_tx
                                                             .send(BrokerEvent::OrderUpdate(order))
                                                             .await
@@ -2572,9 +2597,15 @@ fn spawn_bybit_private_stream(
                                                 value.clone()
                                             ) {
                                                 for exec in msg.data {
-                                                    if let Ok(fill) =
+                                                    if let Ok(mut fill) =
                                                         exec.to_tesser_fill(exchange_id)
                                                     {
+                                                        if let Some(router) = &router {
+                                                            fill = router.normalize_fill_event(
+                                                                exchange_id,
+                                                                fill,
+                                                            );
+                                                        }
                                                         if let Err(err) = private_tx
                                                             .send(BrokerEvent::Fill(fill))
                                                             .await
@@ -2618,9 +2649,12 @@ fn spawn_binance_private_stream(
     private_tx: mpsc::Sender<BrokerEvent>,
     private_connection_flag: Option<Arc<AtomicBool>>,
     metrics: Arc<LiveMetrics>,
+    router: Option<Arc<RouterExecutionClient>>,
     shutdown: ShutdownSignal,
 ) {
+    let router_handle = router.clone();
     tokio::spawn(async move {
+        let router = router_handle;
         loop {
             let Some(binance) = exec_client
                 .as_ref()
@@ -2648,12 +2682,19 @@ fn spawn_binance_private_stream(
                     let (reconnect_tx, mut reconnect_rx) = mpsc::channel(1);
                     let tx_orders = private_tx.clone();
                     let exchange_id = exchange;
+                    let router_for_event = router.clone();
                     user_stream.on_event(move |event| {
                         if let Some(update) = extract_order_update(&event) {
-                            if let Some(order) = order_from_update(exchange_id, update) {
+                            if let Some(mut order) = order_from_update(exchange_id, update) {
+                                if let Some(router) = &router_for_event {
+                                    order = router.normalize_order_event(exchange_id, order);
+                                }
                                 let _ = tx_orders.blocking_send(BrokerEvent::OrderUpdate(order));
                             }
-                            if let Some(fill) = fill_from_update(exchange_id, update) {
+                            if let Some(mut fill) = fill_from_update(exchange_id, update) {
+                                if let Some(router) = &router_for_event {
+                                    fill = router.normalize_fill_event(exchange_id, fill);
+                                }
                                 let _ = tx_orders.blocking_send(BrokerEvent::Fill(fill));
                             }
                         }

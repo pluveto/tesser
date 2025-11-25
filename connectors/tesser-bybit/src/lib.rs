@@ -499,10 +499,7 @@ impl ExecutionClient for BybitClient {
     async fn list_open_orders(&self, symbol: Symbol) -> BrokerResult<Vec<Order>> {
         let query = vec![
             ("category".to_string(), self.config.category.clone()),
-            (
-                "symbol".to_string(),
-                Self::symbol_code(symbol).to_string(),
-            ),
+            ("symbol".to_string(), Self::symbol_code(symbol).to_string()),
             ("openOnly".to_string(), "0".into()),
         ];
         let resp: ApiResponse<OpenOrdersResult> = self
