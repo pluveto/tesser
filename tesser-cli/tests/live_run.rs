@@ -9,7 +9,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hyper::{
     body::to_bytes,
     service::{make_service_fn, service_fn},
@@ -39,7 +39,7 @@ use tesser_rpc::proto::control_service_client::ControlServiceClient;
 use tesser_rpc::proto::{
     CancelAllRequest, GetOpenOrdersRequest, GetPortfolioRequest, GetStatusRequest,
 };
-use tesser_strategy::{Strategy, StrategyContext, StrategyResult};
+use tesser_strategy::{PairsTradingArbitrage, Strategy, StrategyContext, StrategyResult};
 use tesser_test_utils::{
     AccountConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario, ScenarioAction,
     ScenarioManager, ScenarioTrigger,
@@ -76,6 +76,59 @@ fn binance_symbol() -> Symbol {
 
 fn binance_asset() -> AssetId {
     AssetId::from_code(binance_exchange(), "USDT")
+}
+
+fn build_price_series(
+    symbol: Symbol,
+    base_time: DateTime<Utc>,
+    closes: &[i64],
+) -> (Vec<Candle>, Vec<Tick>) {
+    let mut candles = Vec::with_capacity(closes.len());
+    let mut ticks = Vec::with_capacity(closes.len());
+    for (index, close) in closes.iter().enumerate() {
+        let timestamp = base_time + ChronoDuration::minutes(index as i64);
+        let price = Decimal::new(*close, 0);
+        candles.push(Candle {
+            symbol,
+            interval: Interval::OneMinute,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Decimal::ONE,
+            timestamp,
+        });
+        ticks.push(Tick {
+            symbol,
+            price,
+            size: Decimal::ONE,
+            side: Side::Buy,
+            exchange_timestamp: timestamp,
+            received_at: timestamp,
+        });
+    }
+    (candles, ticks)
+}
+
+async fn wait_for_fill_count(
+    exchange: &MockExchange,
+    expected: usize,
+    timeout_dur: Duration,
+) -> Result<()> {
+    let state = exchange.state();
+    let since = Utc::now() - ChronoDuration::minutes(1);
+    timeout(timeout_dur, async move {
+        loop {
+            let fills = state.executions_between("test-key", since, None).await?;
+            if fills.len() >= expected {
+                return Ok::<(), anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for {expected} fills"))??;
+    Ok(())
 }
 
 fn account_balance(total: Decimal) -> AccountBalance {
@@ -531,6 +584,152 @@ async fn live_run_executes_round_trip_multi_exchange() -> Result<()> {
         .find(|b| b.asset == binance_asset())
         .unwrap();
     assert_eq!(busdt.available, Decimal::new(10_001, 0));
+    exchange_a.shutdown().await;
+    exchange_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let account_a = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
+    let account_b = AccountConfig::new("test-key", "test-secret")
+        .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
+    let base_time = Utc::now();
+    let series_a = [100, 100, 100, 300, 110, 95, 101, 98];
+    let series_b = [100, 100, 100, 100, 100, 100, 100, 100];
+    let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
+    let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
+    let config_a = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
+        .with_account(account_a)
+        .with_candles(candles_a)
+        .with_ticks(ticks_a);
+    let config_b = MockExchangeConfig::new()
+        .with_exchange(binance_exchange())
+        .with_account(account_b)
+        .with_candles(candles_b)
+        .with_ticks(ticks_b);
+    let mut exchange_a = MockExchange::start(config_a).await?;
+    let mut exchange_b = MockExchange::start(config_b).await?;
+    for (exchange, entry_price, exit_price) in [
+        (
+            &exchange_a,
+            Decimal::new(10_000, 0),
+            Decimal::new(10_050, 0),
+        ),
+        (&exchange_b, Decimal::new(9_950, 0), Decimal::new(10_000, 0)),
+    ] {
+        let scenarios = exchange.state().scenarios();
+        scenarios
+            .push(Scenario {
+                name: "pairs-entry".into(),
+                trigger: ScenarioTrigger::OrderCreate,
+                action: ScenarioAction::FillPlan {
+                    steps: vec![OrderFillStep {
+                        after: Duration::from_millis(25),
+                        quantity: Decimal::ONE,
+                        price: Some(entry_price),
+                    }],
+                },
+            })
+            .await;
+        scenarios
+            .push(Scenario {
+                name: "pairs-exit".into(),
+                trigger: ScenarioTrigger::OrderCreate,
+                action: ScenarioAction::FillPlan {
+                    steps: vec![OrderFillStep {
+                        after: Duration::from_millis(25),
+                        quantity: Decimal::ONE,
+                        price: Some(exit_price),
+                    }],
+                },
+            })
+            .await;
+    }
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 16,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
+        initial_balances: dual_initial_balances(),
+        reporting_currency: usdt_asset(),
+        markets_file: Some(markets_file),
+        alerting: AlertingConfig::default(),
+        exec_backend: ExecutionBackend::Live,
+        risk: RiskManagementConfig::default(),
+        reconciliation_interval: Duration::from_secs(30),
+        reconciliation_threshold: Decimal::new(1, 1),
+        orderbook_depth: 50,
+        record_path: None,
+        control_addr: "127.0.0.1:0".parse().unwrap(),
+    };
+    let exchanges = vec![
+        NamedExchange {
+            name: "bybit_linear".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_a.rest_url(),
+                ws_url: exchange_a.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+        NamedExchange {
+            name: "binance_perp".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_b.rest_url(),
+                ws_url: exchange_b.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+    ];
+    let mut strategy = PairsTradingArbitrage::default();
+    let config_value: toml::Value = toml::from_str(
+        r#"
+        lookback = 4
+        entry_z = 1.5
+        exit_z = 0.8
+        symbols = ["bybit_linear:BTCUSDT", "binance_perp:BTCUSDT"]
+        "#,
+    )?;
+    strategy.configure(config_value)?;
+    let symbols = strategy.subscriptions();
+    let shutdown = ShutdownSignal::new();
+    let run_handle = spawn_live_runtime(
+        Box::new(strategy),
+        symbols,
+        exchanges,
+        settings,
+        shutdown.clone(),
+    );
+    wait_for_fill_count(&exchange_a, 2, Duration::from_secs(10)).await?;
+    wait_for_fill_count(&exchange_b, 2, Duration::from_secs(10)).await?;
+    shutdown.trigger();
+    run_handle.await??;
+    for exchange in [&exchange_a, &exchange_b] {
+        let positions = exchange
+            .state()
+            .account_positions("test-key")
+            .await
+            .expect("positions");
+        assert!(positions
+            .into_iter()
+            .all(|position| position.quantity.is_zero()));
+    }
     exchange_a.shutdown().await;
     exchange_b.shutdown().await;
     Ok(())

@@ -19,7 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tesser_core::{
-    Candle, ExecutionHint, Fill, OrderBook, Position, Signal, SignalKind, Symbol, Tick,
+    Candle, ExecutionHint, Fill, OrderBook, Position, Side, Signal, SignalKind, Symbol, Tick,
 };
 use tesser_cortex::{CortexConfig, CortexDevice, CortexEngine, FeatureBuffer};
 use tesser_indicators::{
@@ -1165,6 +1165,13 @@ pub struct PairsTradingConfig {
     pub exit_z: Decimal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpreadBias {
+    Flat,
+    ShortFirst,
+    LongFirst,
+}
+
 impl Default for PairsTradingConfig {
     fn default() -> Self {
         Self {
@@ -1181,6 +1188,7 @@ pub struct PairsTradingArbitrage {
     signals: Vec<Signal>,
     entry_z_level: Decimal,
     exit_z_level: Decimal,
+    bias: SpreadBias,
 }
 
 impl Default for PairsTradingArbitrage {
@@ -1198,6 +1206,7 @@ impl PairsTradingArbitrage {
             signals: Vec::new(),
             entry_z_level: Decimal::ZERO,
             exit_z_level: Decimal::ZERO,
+            bias: SpreadBias::Flat,
         };
         strategy.rebuild_thresholds()?;
         Ok(strategy)
@@ -1286,6 +1295,7 @@ impl Strategy for PairsTradingArbitrage {
             if let Some(spreads) = self.spreads(ctx) {
                 if let Some(z) = z_score(&spreads) {
                     if z >= self.entry_z_level {
+                        self.bias = SpreadBias::ShortFirst;
                         // Asset A rich: short A, long B.
                         self.signals.push(Signal::new(
                             self.cfg.symbols[0],
@@ -1298,6 +1308,7 @@ impl Strategy for PairsTradingArbitrage {
                             0.8,
                         ));
                     } else if z <= -self.entry_z_level {
+                        self.bias = SpreadBias::LongFirst;
                         // Asset B rich: long A, short B.
                         self.signals.push(Signal::new(
                             self.cfg.symbols[0],
@@ -1310,10 +1321,33 @@ impl Strategy for PairsTradingArbitrage {
                             0.8,
                         ));
                     } else if z.abs() <= self.exit_z_level {
-                        for symbol in &self.cfg.symbols {
-                            self.signals
-                                .push(Signal::new(*symbol, SignalKind::Flatten, 0.6));
+                        for (idx, symbol) in self.cfg.symbols.iter().enumerate() {
+                            let exit_kind = match self.bias {
+                                SpreadBias::ShortFirst => {
+                                    if idx == 0 {
+                                        SignalKind::ExitShort
+                                    } else {
+                                        SignalKind::ExitLong
+                                    }
+                                }
+                                SpreadBias::LongFirst => {
+                                    if idx == 0 {
+                                        SignalKind::ExitLong
+                                    } else {
+                                        SignalKind::ExitShort
+                                    }
+                                }
+                                SpreadBias::Flat => {
+                                    match ctx.position(*symbol).and_then(|position| position.side) {
+                                        Some(Side::Buy) => SignalKind::ExitLong,
+                                        Some(Side::Sell) => SignalKind::ExitShort,
+                                        None => SignalKind::Flatten,
+                                    }
+                                }
+                            };
+                            self.signals.push(Signal::new(*symbol, exit_kind, 0.6));
                         }
+                        self.bias = SpreadBias::Flat;
                     }
                 }
             }
