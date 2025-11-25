@@ -710,6 +710,8 @@ pub struct Signal {
     pub quantity: Option<Quantity>,
     #[serde(default)]
     pub group_id: Option<Uuid>,
+    #[serde(default)]
+    pub panic_behavior: Option<SignalPanicBehavior>,
     pub generated_at: DateTime<Utc>,
     pub note: Option<String>,
     pub stop_loss: Option<Price>,
@@ -755,6 +757,7 @@ impl Signal {
             confidence,
             quantity: None,
             group_id: None,
+            panic_behavior: None,
             generated_at: Utc::now(),
             note: None,
             stop_loss: None,
@@ -783,6 +786,22 @@ impl Signal {
         self.group_id = Some(group_id);
         self
     }
+
+    /// Override the default panic close behavior for this signal's execution group.
+    #[must_use]
+    pub fn with_panic_behavior(mut self, behavior: SignalPanicBehavior) -> Self {
+        self.panic_behavior = Some(behavior);
+        self
+    }
+}
+
+/// Overrides applied to the orchestrator's panic close logic for a specific signal/group.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum SignalPanicBehavior {
+    /// Flatten positions using market orders.
+    Market,
+    /// Use an aggressive limit offset (in basis points) before falling back to market.
+    AggressiveLimit { offset_bps: Decimal },
 }
 
 #[cfg(test)]

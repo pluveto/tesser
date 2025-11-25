@@ -16,7 +16,7 @@ use crate::repository::{AlgoStateRepository, StoredAlgoState};
 use crate::{ExecutionEngine, PanicCloseConfig, PanicCloseMode, RiskContext};
 use tesser_core::{
     ExecutionHint, Fill, Order, OrderRequest, OrderStatus, OrderType, Price, Quantity, Side,
-    Signal, Symbol, Tick, TimeInForce,
+    Signal, SignalPanicBehavior, Symbol, Tick, TimeInForce,
 };
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
@@ -60,14 +60,17 @@ impl ExecutionGroupLeg {
 struct ExecutionGroupState {
     id: Uuid,
     legs: HashMap<Symbol, ExecutionGroupLeg>,
+    panic_config: PanicCloseConfig,
+    panic_observer: Option<Arc<dyn PanicObserver>>,
     panic_triggered: bool,
 }
 
 impl ExecutionGroupState {
-    fn new(id: Uuid) -> Self {
+    fn new(id: Uuid, config: PanicCloseConfig) -> Self {
         Self {
             id,
             legs: HashMap::new(),
+            panic_config: config,
             panic_triggered: false,
         }
     }
@@ -116,6 +119,10 @@ impl ExecutionGroupState {
         self.panic_triggered = true;
         Some(actions)
     }
+
+    fn override_config(&mut self, config: PanicCloseConfig) {
+        self.panic_config = config;
+    }
 }
 
 pub const ORDER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
@@ -162,6 +169,7 @@ impl OrderOrchestrator {
         state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
         open_orders: Vec<Order>,
         panic_config: PanicCloseConfig,
+        panic_observer: Option<Arc<dyn PanicObserver>>,
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
         let order_mapping = Arc::new(Mutex::new(HashMap::new()));
@@ -176,6 +184,7 @@ impl OrderOrchestrator {
             execution_engine,
             state_repo,
             panic_config,
+            panic_observer,
             execution_groups: Arc::new(Mutex::new(HashMap::new())),
             group_order_mapping: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -334,11 +343,28 @@ impl OrderOrchestrator {
     fn register_group_signal(&self, signal: &Signal) {
         if let Some(group_id) = signal.group_id {
             let mut groups = self.execution_groups.lock().unwrap();
+            let default_config = self.panic_config;
             let state = groups
                 .entry(group_id)
-                .or_insert_with(|| ExecutionGroupState::new(group_id));
+                .or_insert_with(|| ExecutionGroupState::new(group_id, default_config));
+            if let Some(override_cfg) = self.panic_override_from_signal(signal) {
+                state.override_config(override_cfg);
+            }
             state.leg_entry(signal.symbol, signal.kind.side());
         }
+    }
+
+    fn panic_override_from_signal(&self, signal: &Signal) -> Option<PanicCloseConfig> {
+        signal.panic_behavior.map(|behavior| match behavior {
+            SignalPanicBehavior::Market => PanicCloseConfig {
+                mode: PanicCloseMode::Market,
+                ..self.panic_config
+            },
+            SignalPanicBehavior::AggressiveLimit { offset_bps } => PanicCloseConfig {
+                mode: PanicCloseMode::AggressiveLimit,
+                limit_offset_bps: offset_bps.max(Decimal::ZERO),
+            },
+        })
     }
 
     fn track_group_order(&self, group_id: Uuid, order: &Order) {
@@ -422,9 +448,12 @@ impl OrderOrchestrator {
             }
         }
         if let Some(actions) = maybe_actions {
-            self.execute_panic_actions(group_id, reason, actions)
+            let config = group_config.unwrap_or(self.panic_config);
+            self.execute_panic_actions(group_id, reason, actions, config)
                 .await?;
             self.purge_group_orders(group_id);
+        } else if group_config.is_some() {
+            self.notify_panic(group_id, symbol, Decimal::ZERO, reason);
         }
         Ok(())
     }
@@ -434,6 +463,7 @@ impl OrderOrchestrator {
         group_id: Uuid,
         reason: &str,
         actions: Vec<(Symbol, Side, Quantity)>,
+        config: PanicCloseConfig,
     ) -> Result<()> {
         for (symbol, original_side, qty) in actions {
             if qty <= Decimal::ZERO {
@@ -451,7 +481,8 @@ impl OrderOrchestrator {
                 );
                 continue;
             };
-            let (order_type, price, time_in_force) = self.panic_order_parameters(panic_side, &ctx);
+            let (order_type, price, time_in_force) =
+                self.panic_order_parameters(config, panic_side, &ctx);
             let mut request = OrderRequest {
                 symbol,
                 side: panic_side,
@@ -484,6 +515,7 @@ impl OrderOrchestrator {
                     "failed to place panic close order"
                 );
             } else {
+                self.notify_panic(group_id, symbol, qty, reason);
                 tracing::error!(
                     %symbol,
                     qty = %qty,
@@ -505,13 +537,14 @@ impl OrderOrchestrator {
 
     fn panic_order_parameters(
         &self,
+        config: PanicCloseConfig,
         side: Side,
         ctx: &RiskContext,
     ) -> (OrderType, Option<Price>, Option<TimeInForce>) {
-        match self.panic_config.mode {
+        match config.mode {
             PanicCloseMode::Market => (OrderType::Market, None, None),
             PanicCloseMode::AggressiveLimit => {
-                if let Some(price) = self.panic_limit_price(side, ctx) {
+                if let Some(price) = self.panic_limit_price(config, side, ctx) {
                     (
                         OrderType::Limit,
                         Some(price),
@@ -524,12 +557,17 @@ impl OrderOrchestrator {
         }
     }
 
-    fn panic_limit_price(&self, side: Side, ctx: &RiskContext) -> Option<Price> {
+    fn panic_limit_price(
+        &self,
+        config: PanicCloseConfig,
+        side: Side,
+        ctx: &RiskContext,
+    ) -> Option<Price> {
         let last = ctx.last_price;
         if last <= Decimal::ZERO {
             return None;
         }
-        let offset_fraction = (self.panic_config.limit_offset_bps.max(Decimal::ZERO)
+        let offset_fraction = (config.limit_offset_bps.max(Decimal::ZERO)
             / Decimal::from(10_000u32))
         .max(Decimal::ZERO);
         let multiplier = match side {
@@ -540,6 +578,12 @@ impl OrderOrchestrator {
             return None;
         }
         Some(last * multiplier)
+    }
+
+    fn notify_panic(&self, group_id: Uuid, symbol: Symbol, qty: Quantity, reason: &str) {
+        if let Some(observer) = &self.panic_observer {
+            observer.on_group_event(group_id, symbol, qty, reason);
+        }
     }
 
     fn extract_algo_id(client_id: &str) -> Option<Uuid> {
@@ -566,6 +610,15 @@ impl OrderOrchestrator {
             return Uuid::parse_str(rest).ok();
         }
         None
+    }
+
+    fn group_from_request(request: &OrderRequest) -> Option<Uuid> {
+        request
+            .client_order_id
+            .as_deref()
+            .and_then(|value| value.split("|grp:").nth(1))
+            .and_then(|suffix| suffix.split('|').next())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
     }
 
     /// Handle a signal from a strategy.
@@ -913,17 +966,30 @@ impl OrderOrchestrator {
                     .ok_or_else(|| anyhow!("missing risk context for symbol {}", symbol))?;
                 // Keep cache warm with the latest context.
                 self.update_risk_context(symbol, resolved_ctx);
-
-                let order = self
+                let group_hint = Self::group_from_request(&order_request);
+                let order = match self
                     .execution_engine
-                    .send_order(order_request, &resolved_ctx)
-                    .await?;
+                    .send_order(order_request.clone(), &resolved_ctx)
+                    .await
+                {
+                    Ok(order) => order,
+                    Err(err) => {
+                        if let Some(group_id) = group_hint {
+                            let message = format!("order placement failed: {err}");
+                            self.fail_group_leg(group_id, symbol, &message).await?;
+                        }
+                        return Err(anyhow!(err.to_string()));
+                    }
+                };
 
                 {
                     let mut mapping = self.order_mapping.lock().unwrap();
                     mapping.insert(order.id.clone(), parent_algo_id);
                 }
                 self.register_pending(&order);
+                if let Some(group_id) = group_hint {
+                    self.track_group_order(group_id, &order);
+                }
                 self.notify_algo_child(parent_algo_id, &order);
                 Ok(order)
             }

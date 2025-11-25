@@ -58,8 +58,8 @@ use tesser_events::{
 };
 use tesser_execution::{
     AlgoStateRepository, BasicRiskChecker, ExecutionEngine, FixedOrderSizer, OrderOrchestrator,
-    PanicCloseConfig, PreTradeRiskChecker, RiskContext, RiskLimits, SqliteAlgoStateRepository,
-    StoredAlgoState,
+    PanicCloseConfig, PanicObserver, PreTradeRiskChecker, RiskContext, RiskLimits,
+    SqliteAlgoStateRepository, StoredAlgoState,
 };
 use tesser_journal::LmdbJournal;
 use tesser_markets::{InstrumentCatalog, MarketRegistry};
@@ -79,6 +79,29 @@ use crate::PublicChannel;
 pub enum BrokerEvent {
     OrderUpdate(Order),
     Fill(Fill),
+}
+
+struct PanicAlertHook {
+    metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
+}
+
+impl PanicAlertHook {
+    fn new(metrics: Arc<LiveMetrics>, alerts: Arc<AlertManager>) -> Self {
+        Self { metrics, alerts }
+    }
+}
+
+impl PanicObserver for PanicAlertHook {
+    fn on_group_event(&self, group_id: Uuid, symbol: Symbol, quantity: Quantity, reason: &str) {
+        self.metrics.inc_panic_close();
+        let alerts = self.alerts.clone();
+        let title = "Execution group panic close";
+        let message = format!("Group {group_id} panic-closed {symbol} qty={quantity}: {reason}");
+        tokio::spawn(async move {
+            alerts.notify(title, &message).await;
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -497,7 +520,8 @@ pub async fn run_live_with_shutdown(
         Arc::new(execution),
         persistence.algo.clone(),
         initial_open_orders,
-        settings.panic_close.clone(),
+        settings.panic_close,
+        Some(panic_hook.clone()),
     )
     .await?;
 
@@ -754,6 +778,8 @@ impl LiveRuntime {
         let alerts = Arc::new(alerts);
         let alert_task = alerts.spawn_watchdog();
         let metrics = Arc::new(metrics);
+        let panic_hook: Arc<dyn PanicObserver> =
+            Arc::new(PanicAlertHook::new(metrics.clone(), alerts.clone()));
         let mut connection_monitors = Vec::new();
         connection_monitors.push(spawn_connection_monitor(
             shutdown.clone(),

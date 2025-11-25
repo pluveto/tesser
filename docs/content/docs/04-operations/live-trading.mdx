@@ -117,6 +117,8 @@ Multi-leg executions now inherit an explicit “panic close” strategy so a par
 
 Both modes generate group-aware client order IDs (the router tags each venue’s `client_order_id` with the execution group) so exchange logs and alerts show which legs belong together when something goes wrong.
 
+Every panic-close increments `tesser_panic_closes_total` (exposed on the Prometheus endpoint) and emits an alert via the existing webhook, so operators see the unwind in Grafana and PagerDuty immediately.
+
 ## Flight Recorder
 
 Set `--record-data <path>` when you launch `tesser-cli live run` to stream every `Tick`, `Candle`, `Fill`, and order update into partitioned Parquet files. The recorder runs on its own Tokio task, buffers data in Arrow `RecordBatch`es, and rotates files per day under the provided directory (defaults to `data/flight_recorder`).

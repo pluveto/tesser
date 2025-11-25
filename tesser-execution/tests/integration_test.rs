@@ -150,6 +150,7 @@ async fn orchestrator_restores_from_sqlite() {
         repo.clone(),
         Vec::new(),
         PanicCloseConfig::default(),
+        None,
     )
     .await
     .unwrap();
@@ -172,8 +173,9 @@ async fn orchestrator_restores_from_sqlite() {
 
     drop(orchestrator);
 
-    let restored = OrderOrchestrator::new(engine, repo, Vec::new(), PanicCloseConfig::default())
-        .await
-        .unwrap();
+    let restored =
+        OrderOrchestrator::new(engine, repo, Vec::new(), PanicCloseConfig::default(), None)
+            .await
+            .unwrap();
     assert_eq!(restored.active_algorithms_count(), 1);
 }

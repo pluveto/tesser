@@ -19,6 +19,7 @@ use tesser_core::{
 };
 use thiserror::Error;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Determines how the orchestrator unwinds partially filled execution groups.
 #[derive(Clone, Copy, Debug)]
@@ -34,7 +35,7 @@ impl Default for PanicCloseMode {
 }
 
 /// Configuration describing how panic-close orders should be sent.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct PanicCloseConfig {
     pub mode: PanicCloseMode,
     /// Offset applied to the observed mid price when using [`PanicCloseMode::AggressiveLimit`] (basis points).
@@ -48,6 +49,11 @@ impl Default for PanicCloseConfig {
             limit_offset_bps: Decimal::from(50u32),
         }
     }
+}
+
+/// Observes panic-close events so callers can emit alerts or metrics.
+pub trait PanicObserver {
+    fn on_group_event(&self, group_id: Uuid, symbol: Symbol, quantity: Quantity, reason: &str);
 }
 
 /// Determine how large an order should be for a given signal.
