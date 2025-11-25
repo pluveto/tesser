@@ -121,7 +121,15 @@ impl ExecutionClient for RouterExecutionClient {
         }
         let client = self.client_for(exchange)?;
         let internal_id = generate_internal_id();
-        let external_client_id = format!("{}-{}", CLIENT_NAMESPACE, internal_id);
+        let group_suffix = request
+            .client_order_id
+            .as_deref()
+            .and_then(extract_group_suffix);
+        let external_client_id = if let Some(tag) = group_suffix {
+            format!("{}-{}-{}", CLIENT_NAMESPACE, tag, internal_id)
+        } else {
+            format!("{}-{}", CLIENT_NAMESPACE, internal_id)
+        };
 
         let mut outbound = request.clone();
         outbound.client_order_id = Some(external_client_id.clone());
@@ -239,6 +247,17 @@ fn generate_internal_id() -> String {
 
 fn is_router_namespace(value: &str) -> bool {
     value.starts_with(CLIENT_NAMESPACE)
+}
+
+fn extract_group_suffix(value: &str) -> Option<String> {
+    value.split("|grp:").nth(1).map(|segment| {
+        let token = segment.split('|').next().unwrap_or(segment);
+        let mut label: String = token.chars().take(8).collect();
+        if label.is_empty() {
+            label = "grp".into();
+        }
+        label.to_ascii_uppercase()
+    })
 }
 
 #[derive(Clone, Debug)]

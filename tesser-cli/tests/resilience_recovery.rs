@@ -16,8 +16,8 @@ use tesser_core::{
     Signal, SignalKind, Symbol, Tick,
 };
 use tesser_execution::{
-    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderOrchestrator, RiskContext,
-    SqliteAlgoStateRepository,
+    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderOrchestrator, PanicCloseConfig,
+    RiskContext, SqliteAlgoStateRepository,
 };
 use tesser_test_utils::{AccountConfig, MockExchange, MockExchangeConfig};
 
@@ -112,7 +112,13 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
     let algo_path = temp.path().join("algos.db");
     let repo = Arc::new(SqliteAlgoStateRepository::new(&algo_path)?);
 
-    let orchestrator = OrderOrchestrator::new(engine.clone(), repo.clone(), Vec::new()).await?;
+    let orchestrator = OrderOrchestrator::new(
+        engine.clone(),
+        repo.clone(),
+        Vec::new(),
+        PanicCloseConfig::default(),
+    )
+    .await?;
 
     let symbol = test_symbol();
     let signal = Signal::new(symbol, SignalKind::EnterLong, 0.8).with_hint(ExecutionHint::Twap {
@@ -163,7 +169,13 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         }),
         Arc::new(NoopRiskChecker),
     ));
-    let restored = OrderOrchestrator::new(restarted_engine, repo.clone(), open_orders).await?;
+    let restored = OrderOrchestrator::new(
+        restarted_engine,
+        repo.clone(),
+        open_orders,
+        PanicCloseConfig::default(),
+    )
+    .await?;
     restored.update_risk_context(adopted.request.symbol, ctx);
     restored.update_risk_context(Symbol::from(SYMBOL), ctx);
     assert_eq!(restored.active_algorithms_count(), 1);

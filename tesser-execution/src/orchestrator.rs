@@ -13,10 +13,10 @@ use crate::algorithm::{
     PeggedBestAlgorithm, SniperAlgorithm, TrailingStopAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
 use crate::repository::{AlgoStateRepository, StoredAlgoState};
-use crate::{ExecutionEngine, RiskContext};
+use crate::{ExecutionEngine, PanicCloseConfig, PanicCloseMode, RiskContext};
 use tesser_core::{
     ExecutionHint, Fill, Order, OrderRequest, OrderStatus, OrderType, Price, Quantity, Side,
-    Signal, Symbol, Tick,
+    Signal, Symbol, Tick, TimeInForce,
 };
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
@@ -147,6 +147,8 @@ pub struct OrderOrchestrator {
     /// State persistence backend.
     state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
 
+    panic_config: PanicCloseConfig,
+
     /// Active multi-leg execution groups keyed by identifier.
     execution_groups: Arc<Mutex<HashMap<Uuid, ExecutionGroupState>>>,
     /// Maps order IDs to their execution group identifiers.
@@ -159,6 +161,7 @@ impl OrderOrchestrator {
         execution_engine: Arc<ExecutionEngine>,
         state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
         open_orders: Vec<Order>,
+        panic_config: PanicCloseConfig,
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
         let order_mapping = Arc::new(Mutex::new(HashMap::new()));
@@ -172,6 +175,7 @@ impl OrderOrchestrator {
             risk_contexts,
             execution_engine,
             state_repo,
+            panic_config,
             execution_groups: Arc::new(Mutex::new(HashMap::new())),
             group_order_mapping: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -447,20 +451,31 @@ impl OrderOrchestrator {
                 );
                 continue;
             };
-            let request = OrderRequest {
+            let (order_type, price, time_in_force) = self.panic_order_parameters(panic_side, &ctx);
+            let mut request = OrderRequest {
                 symbol,
                 side: panic_side,
-                order_type: OrderType::Market,
+                order_type,
                 quantity: qty,
-                price: None,
+                price,
                 trigger_price: None,
-                time_in_force: None,
+                time_in_force,
                 client_order_id: Some(format!("panic-{group_id}")),
                 take_profit: None,
                 stop_loss: None,
                 display_quantity: None,
             };
-            if let Err(err) = self.execution_engine.send_order(request, &ctx).await {
+            let mut sent = self
+                .execution_engine
+                .send_order(request.clone(), &ctx)
+                .await;
+            if sent.is_err() && matches!(order_type, OrderType::Limit) {
+                request.order_type = OrderType::Market;
+                request.price = None;
+                request.time_in_force = None;
+                sent = self.execution_engine.send_order(request, &ctx).await;
+            }
+            if let Err(err) = sent {
                 tracing::error!(
                     %symbol,
                     qty = %qty,
@@ -486,6 +501,45 @@ impl OrderOrchestrator {
             status,
             OrderStatus::PendingNew | OrderStatus::Accepted | OrderStatus::PartiallyFilled
         )
+    }
+
+    fn panic_order_parameters(
+        &self,
+        side: Side,
+        ctx: &RiskContext,
+    ) -> (OrderType, Option<Price>, Option<TimeInForce>) {
+        match self.panic_config.mode {
+            PanicCloseMode::Market => (OrderType::Market, None, None),
+            PanicCloseMode::AggressiveLimit => {
+                if let Some(price) = self.panic_limit_price(side, ctx) {
+                    (
+                        OrderType::Limit,
+                        Some(price),
+                        Some(TimeInForce::ImmediateOrCancel),
+                    )
+                } else {
+                    (OrderType::Market, None, None)
+                }
+            }
+        }
+    }
+
+    fn panic_limit_price(&self, side: Side, ctx: &RiskContext) -> Option<Price> {
+        let last = ctx.last_price;
+        if last <= Decimal::ZERO {
+            return None;
+        }
+        let offset_fraction = (self.panic_config.limit_offset_bps.max(Decimal::ZERO)
+            / Decimal::from(10_000u32))
+        .max(Decimal::ZERO);
+        let multiplier = match side {
+            Side::Buy => Decimal::ONE + offset_fraction,
+            Side::Sell => Decimal::ONE - offset_fraction,
+        };
+        if multiplier <= Decimal::ZERO {
+            return None;
+        }
+        Some(last * multiplier)
     }
 
     fn extract_algo_id(client_id: &str) -> Option<Uuid> {

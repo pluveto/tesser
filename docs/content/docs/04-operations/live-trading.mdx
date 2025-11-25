@@ -108,6 +108,15 @@ Tips:
 - Amendments inherit the existing order ID/state. When the process restarts, the orchestrator rebinds open children and resumes chasing without resubmitting fresh orders.
 - If an exchange rejects an amend (e.g., because the order already filled), the runtime automatically falls back to placing a new child order on the next tick.
 
+### Panic Close Modes
+
+Multi-leg executions now inherit an explicit “panic close” strategy so a partial fill on one venue doesn’t leave you naked:
+
+- `--panic-mode market` (default) fires market orders that immediately flatten the filled legs.
+- `--panic-mode aggressive-limit --panic-limit-offset-bps 25` uses an IOC limit priced 25 bps past the last mark, giving the book a chance to cross naturally before paying taker fees.
+
+Both modes generate group-aware client order IDs (the router tags each venue’s `client_order_id` with the execution group) so exchange logs and alerts show which legs belong together when something goes wrong.
+
 ## Flight Recorder
 
 Set `--record-data <path>` when you launch `tesser-cli live run` to stream every `Tick`, `Candle`, `Fill`, and order update into partitioned Parquet files. The recorder runs on its own Tokio task, buffers data in Arrow `RecordBatch`es, and rotates files per day under the provided directory (defaults to `data/flight_recorder`).

@@ -58,7 +58,8 @@ use tesser_events::{
 };
 use tesser_execution::{
     AlgoStateRepository, BasicRiskChecker, ExecutionEngine, FixedOrderSizer, OrderOrchestrator,
-    PreTradeRiskChecker, RiskContext, RiskLimits, SqliteAlgoStateRepository, StoredAlgoState,
+    PanicCloseConfig, PreTradeRiskChecker, RiskContext, RiskLimits, SqliteAlgoStateRepository,
+    StoredAlgoState,
 };
 use tesser_journal::LmdbJournal;
 use tesser_markets::{InstrumentCatalog, MarketRegistry};
@@ -337,6 +338,7 @@ pub struct LiveSessionSettings {
     pub orderbook_depth: usize,
     pub record_path: Option<PathBuf>,
     pub control_addr: SocketAddr,
+    pub panic_close: PanicCloseConfig,
 }
 
 impl LiveSessionSettings {
@@ -495,6 +497,7 @@ pub async fn run_live_with_shutdown(
         Arc::new(execution),
         persistence.algo.clone(),
         initial_open_orders,
+        settings.panic_close.clone(),
     )
     .await?;
 
@@ -2130,6 +2133,8 @@ async fn emit_signals(
 fn normalize_group_quantities(signals: &mut [Signal], registry: &MarketRegistry) {
     use std::collections::HashMap;
 
+    assign_implicit_group_ids(signals);
+
     let mut groups: HashMap<Uuid, Vec<usize>> = HashMap::new();
     for (idx, signal) in signals.iter().enumerate() {
         if let Some(group_id) = signal.group_id {
@@ -2167,6 +2172,55 @@ fn normalize_group_quantities(signals: &mut [Signal], registry: &MarketRegistry)
         for idx in indices {
             signals[*idx].quantity = Some(qty);
         }
+    }
+}
+
+fn assign_implicit_group_ids(signals: &mut [Signal]) {
+    use std::collections::HashMap;
+
+    let mut note_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, signal) in signals.iter().enumerate() {
+        if signal.group_id.is_some() {
+            continue;
+        }
+        if let Some(note) = signal.note.as_deref() {
+            if !note.is_empty() {
+                note_groups.entry(note).or_default().push(idx);
+            }
+        }
+    }
+    for indices in note_groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let group = Uuid::new_v4();
+        for idx in indices {
+            signals[*idx].group_id = Some(group);
+        }
+    }
+
+    let mut untagged: Vec<usize> = signals
+        .iter()
+        .enumerate()
+        .filter(|(_, signal)| signal.group_id.is_none())
+        .map(|(idx, _)| idx)
+        .collect();
+    if untagged.len() == 2 {
+        let a = signals[untagged[0]].kind;
+        let b = signals[untagged[1]].kind;
+        if signal_kind_family(a) == signal_kind_family(b) && signal_kind_family(a).is_some() {
+            let group = Uuid::new_v4();
+            for idx in untagged.drain(..) {
+                signals[idx].group_id = Some(group);
+            }
+        }
+    }
+}
+
+fn signal_kind_family(kind: SignalKind) -> Option<u8> {
+    match kind {
+        SignalKind::EnterLong | SignalKind::EnterShort => Some(0),
+        SignalKind::ExitLong | SignalKind::ExitShort | SignalKind::Flatten => Some(1),
     }
 }
 

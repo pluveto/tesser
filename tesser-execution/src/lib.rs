@@ -20,6 +20,36 @@ use tesser_core::{
 use thiserror::Error;
 use tracing::{info, warn};
 
+/// Determines how the orchestrator unwinds partially filled execution groups.
+#[derive(Clone, Copy, Debug)]
+pub enum PanicCloseMode {
+    Market,
+    AggressiveLimit,
+}
+
+impl Default for PanicCloseMode {
+    fn default() -> Self {
+        Self::Market
+    }
+}
+
+/// Configuration describing how panic-close orders should be sent.
+#[derive(Clone, Debug)]
+pub struct PanicCloseConfig {
+    pub mode: PanicCloseMode,
+    /// Offset applied to the observed mid price when using [`PanicCloseMode::AggressiveLimit`] (basis points).
+    pub limit_offset_bps: Decimal,
+}
+
+impl Default for PanicCloseConfig {
+    fn default() -> Self {
+        Self {
+            mode: PanicCloseMode::Market,
+            limit_offset_bps: Decimal::from(50u32),
+        }
+    }
+}
+
 /// Determine how large an order should be for a given signal.
 pub trait OrderSizer: Send + Sync {
     /// Calculate the desired base asset quantity.
@@ -542,7 +572,11 @@ impl ExecutionEngine {
             return Ok(None);
         }
 
-        let client_order_id = signal.id.to_string();
+        let client_order_id = if let Some(group) = signal.group_id {
+            format!("{}|grp:{}", signal.id, group)
+        } else {
+            signal.id.to_string()
+        };
         let request = match signal.kind {
             SignalKind::EnterLong => {
                 self.build_request(signal.symbol, Side::Buy, qty, Some(client_order_id.clone()))

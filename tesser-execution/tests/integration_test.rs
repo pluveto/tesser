@@ -6,7 +6,7 @@ use tesser_core::{ExecutionHint, Signal, SignalKind, Symbol};
 use tesser_execution::{
     algorithm::{ChildOrderAction, TwapAlgorithm},
     AlgoStatus, ExecutionAlgorithm, ExecutionEngine, FixedOrderSizer, NoopRiskChecker,
-    OrderOrchestrator, RiskContext, SqliteAlgoStateRepository,
+    OrderOrchestrator, PanicCloseConfig, RiskContext, SqliteAlgoStateRepository,
 };
 use tesser_paper::PaperExecutionClient;
 
@@ -79,9 +79,14 @@ async fn test_orchestrator_integration() {
     let algo_state_repo = Arc::new(SqliteAlgoStateRepository::new(temp_path).unwrap());
 
     // Create orchestrator
-    let orchestrator = OrderOrchestrator::new(execution_engine, algo_state_repo, Vec::new())
-        .await
-        .unwrap();
+    let orchestrator = OrderOrchestrator::new(
+        execution_engine,
+        algo_state_repo,
+        Vec::new(),
+        PanicCloseConfig::default(),
+    )
+    .await
+    .unwrap();
 
     // Create TWAP signal
     let signal =
@@ -140,9 +145,14 @@ async fn orchestrator_restores_from_sqlite() {
     let risk_checker = Arc::new(NoopRiskChecker);
     let engine = Arc::new(ExecutionEngine::new(client, sizer, risk_checker));
 
-    let orchestrator = OrderOrchestrator::new(engine.clone(), repo.clone(), Vec::new())
-        .await
-        .unwrap();
+    let orchestrator = OrderOrchestrator::new(
+        engine.clone(),
+        repo.clone(),
+        Vec::new(),
+        PanicCloseConfig::default(),
+    )
+    .await
+    .unwrap();
     let signal =
         Signal::new("BTCUSDT", SignalKind::EnterLong, 0.5).with_hint(ExecutionHint::Twap {
             duration: Duration::minutes(1),
@@ -162,7 +172,7 @@ async fn orchestrator_restores_from_sqlite() {
 
     drop(orchestrator);
 
-    let restored = OrderOrchestrator::new(engine, repo, Vec::new())
+    let restored = OrderOrchestrator::new(engine, repo, Vec::new(), PanicCloseConfig::default())
         .await
         .unwrap();
     assert_eq!(restored.active_algorithms_count(), 1);

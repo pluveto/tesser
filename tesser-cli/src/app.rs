@@ -50,8 +50,8 @@ use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
 use tesser_data::transform::Resampler;
 use tesser_execution::{
-    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
-    RiskAdjustedSizer,
+    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PanicCloseConfig,
+    PanicCloseMode, PortfolioPercentSizer, RiskAdjustedSizer,
 };
 use tesser_markets::MarketRegistry;
 use tesser_paper::{
@@ -1018,6 +1018,12 @@ pub struct LiveRunArgs {
     /// Order sizer (e.g. "fixed:0.01", "percent:0.02")
     #[arg(long, default_value = "fixed:1.0")]
     sizer: String,
+    /// Panic-close mode used when multi-leg groups desync
+    #[arg(long, value_enum, default_value = "market")]
+    panic_mode: PanicModeArg,
+    /// Basis points added/subtracted from the last price when using `panic_mode=aggressive-limit`
+    #[arg(long, default_value = "50")]
+    panic_limit_offset_bps: Decimal,
 }
 
 impl LiveRunArgs {
@@ -1711,6 +1717,10 @@ impl LiveRunArgs {
         let orderbook_depth = self
             .orderbook_depth
             .unwrap_or(super::live::default_order_book_depth());
+        let panic_close = PanicCloseConfig {
+            mode: self.panic_mode.into(),
+            limit_offset_bps: self.panic_limit_offset_bps.max(Decimal::ZERO),
+        };
 
         let settings = LiveSessionSettings {
             category,
@@ -1732,6 +1742,7 @@ impl LiveRunArgs {
             orderbook_depth,
             record_path: Some(self.record_data.clone()),
             control_addr,
+            panic_close,
         };
 
         let exchange_labels: Vec<String> = named_exchanges
@@ -2304,5 +2315,20 @@ fn parse_sizer(value: &str, cli_quantity: Option<Decimal>) -> Result<Box<dyn Ord
         _ => Err(anyhow!(
             "invalid sizer format, expected 'fixed:value', 'percent:value', or 'risk-adjusted:value'"
         )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum PanicModeArg {
+    Market,
+    AggressiveLimit,
+}
+
+impl From<PanicModeArg> for PanicCloseMode {
+    fn from(arg: PanicModeArg) -> Self {
+        match arg {
+            PanicModeArg::Market => PanicCloseMode::Market,
+            PanicModeArg::AggressiveLimit => PanicCloseMode::AggressiveLimit,
+        }
     }
 }
