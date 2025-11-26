@@ -114,12 +114,9 @@ impl RouterExecutionClient {
     /// Returns `None` when the router has no mapping for the fill's order ID.
     pub fn normalize_fill_event(&self, exchange: ExchangeId, mut fill: Fill) -> Option<Fill> {
         let guard = self.state.lock().unwrap();
-        let Some(internal) = guard
+        let internal = guard
             .lookup_external_order(exchange, &fill.order_id)
-            .cloned()
-        else {
-            return None;
-        };
+            .cloned()?;
         if let Some(entry) = guard.get(&internal) {
             fill.order_id = internal;
             fill.symbol = entry.symbol;

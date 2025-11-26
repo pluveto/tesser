@@ -321,7 +321,7 @@ fn require_field<T>(
     field: &'static str,
     value: Option<T>,
 ) -> Result<T, MarketRegistryError> {
-    value.ok_or_else(|| MarketRegistryError::MissingField { symbol, field })
+    value.ok_or(MarketRegistryError::MissingField { symbol, field })
 }
 
 impl From<Instrument> for InstrumentInfo {
