@@ -904,13 +904,15 @@ impl LiveRuntime {
         let last_data_timestamp = Arc::new(AtomicI64::new(0));
         let control_task = control::spawn_control_plane(
             settings.control_addr,
-            portfolio.clone(),
-            orchestrator.clone(),
-            persisted.clone(),
-            last_data_timestamp.clone(),
-            event_bus.clone(),
-            strategy.clone(),
-            shutdown.clone(),
+            control::ControlPlaneComponents {
+                portfolio: portfolio.clone(),
+                orchestrator: orchestrator.clone(),
+                persisted: persisted.clone(),
+                last_data_timestamp: last_data_timestamp.clone(),
+                event_bus: event_bus.clone(),
+                strategy: strategy.clone(),
+                shutdown: shutdown.clone(),
+            },
         );
         let reconciliation_ctx = (!settings.exec_backend.is_paper()).then(|| {
             Arc::new(ReconciliationContext::new(ReconciliationContextConfig {

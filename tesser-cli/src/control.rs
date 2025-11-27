@@ -30,17 +30,27 @@ use uuid::Uuid;
 
 use crate::live::ShutdownSignal;
 
+pub struct ControlPlaneComponents {
+    pub portfolio: Arc<Mutex<Portfolio>>,
+    pub orchestrator: Arc<OrderOrchestrator>,
+    pub persisted: Arc<Mutex<LiveState>>,
+    pub last_data_timestamp: Arc<AtomicI64>,
+    pub event_bus: Arc<EventBus>,
+    pub strategy: Arc<Mutex<Box<dyn Strategy>>>,
+    pub shutdown: ShutdownSignal,
+}
+
 /// Launch the Control Plane gRPC server alongside the live runtime.
-pub fn spawn_control_plane(
-    addr: SocketAddr,
-    portfolio: Arc<Mutex<Portfolio>>,
-    orchestrator: Arc<OrderOrchestrator>,
-    persisted: Arc<Mutex<LiveState>>,
-    last_data_timestamp: Arc<AtomicI64>,
-    event_bus: Arc<EventBus>,
-    strategy: Arc<Mutex<Box<dyn Strategy>>>,
-    shutdown: ShutdownSignal,
-) -> JoinHandle<()> {
+pub fn spawn_control_plane(addr: SocketAddr, components: ControlPlaneComponents) -> JoinHandle<()> {
+    let ControlPlaneComponents {
+        portfolio,
+        orchestrator,
+        persisted,
+        last_data_timestamp,
+        event_bus,
+        strategy,
+        shutdown,
+    } = components;
     let service = ControlGrpcService::new(
         portfolio,
         orchestrator,
@@ -149,6 +159,7 @@ impl ControlGrpcService {
         f(pairs).map_err(|err| Status::internal(err.to_string()))
     }
 
+    #[allow(clippy::result_large_err)]
     fn snapshot_to_proto(snapshot: PairTradeSnapshot) -> Result<ManagedTradeInfo, Status> {
         let exit_strategy_json = serde_json::to_string(&snapshot.exit_strategy)
             .map_err(|err| Status::internal(format!("failed to encode exit strategy: {err}")))?;
