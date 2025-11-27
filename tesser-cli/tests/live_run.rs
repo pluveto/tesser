@@ -134,17 +134,25 @@ async fn wait_for_fill_count(
 
 async fn wait_for_positions_flat(exchange: &MockExchange, timeout_dur: Duration) -> Result<()> {
     let state = exchange.state();
+    let venue = state.exchange().await;
     timeout(timeout_dur, async move {
+        let mut iterations = 0u32;
         loop {
             let positions = state.account_positions("test-key").await?;
             if positions.iter().all(|position| position.quantity.is_zero()) {
                 return Ok::<(), anyhow::Error>(());
             }
+            if iterations % 20 == 0 {
+                println!(
+                    "[pairs-test] waiting for {venue} positions to flatten, snapshot={positions:?}"
+                );
+            }
+            iterations = iterations.wrapping_add(1);
             sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .context("timed out waiting for positions to flatten")??;
+    .with_context(|| format!("timed out waiting for {venue} positions to flatten"))??;
     Ok(())
 }
 
@@ -710,10 +718,12 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
     );
     wait_for_fill_count(&exchange_a, 2, Duration::from_secs(10)).await?;
     wait_for_fill_count(&exchange_b, 2, Duration::from_secs(10)).await?;
+    tokio::try_join!(
+        wait_for_positions_flat(&exchange_a, Duration::from_secs(10)),
+        wait_for_positions_flat(&exchange_b, Duration::from_secs(10))
+    )?;
     shutdown.trigger();
     run_handle.await??;
-    wait_for_positions_flat(&exchange_a, Duration::from_secs(5)).await?;
-    wait_for_positions_flat(&exchange_b, Duration::from_secs(5)).await?;
     exchange_a.shutdown().await;
     exchange_b.shutdown().await;
     Ok(())
