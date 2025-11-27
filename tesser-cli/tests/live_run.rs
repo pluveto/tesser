@@ -31,14 +31,15 @@ use tesser_cli::live::{
 use tesser_cli::PublicChannel;
 use tesser_config::{AlertingConfig, ExchangeConfig, PersistenceEngine, RiskManagementConfig};
 use tesser_core::{
-    AccountBalance, AssetId, Candle, ExchangeId, Interval, Position, Side, Signal, SignalKind,
-    Symbol, Tick,
+    AccountBalance, AssetId, Candle, ExchangeId, ExitStrategy, Interval, Position, Side, Signal,
+    SignalKind, Symbol, Tick,
 };
 use tesser_execution::PanicCloseConfig;
 use tesser_portfolio::{SqliteStateRepository, StateRepository};
 use tesser_rpc::proto::control_service_client::ControlServiceClient;
 use tesser_rpc::proto::{
     CancelAllRequest, GetOpenOrdersRequest, GetPortfolioRequest, GetStatusRequest,
+    ListManagedTradesRequest, UpdateTradeExitStrategyRequest,
 };
 use tesser_strategy::{PairsTradingArbitrage, Strategy, StrategyContext, StrategyResult};
 use tesser_test_utils::{
@@ -611,8 +612,12 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
     let account_b = AccountConfig::new("test-key", "test-secret")
         .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
-    let series_a = [100, 100, 100, 300, 110, 95];
-    let series_b = [100, 100, 100, 100, 100, 100];
+    let series_a = [
+        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100,
+    ];
+    let series_b = [
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    ];
     let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
     let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
     let config_a = MockExchangeConfig::new()
@@ -727,6 +732,173 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
             .into_iter()
             .all(|position| position.quantity.is_zero()));
     }
+    exchange_a.shutdown().await;
+    exchange_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_plane_updates_pairs_exit_strategy() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let account_a = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
+    let account_b = AccountConfig::new("test-key", "test-secret")
+        .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
+    let base_time = Utc::now();
+    let series_a = [
+        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100,
+    ];
+    let series_b = [
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    ];
+    let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
+    let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
+    let config_a = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
+        .with_account(account_a)
+        .with_candles(candles_a)
+        .with_ticks(ticks_a)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(10_000, 0)),
+        });
+    let config_b = MockExchangeConfig::new()
+        .with_exchange(binance_exchange())
+        .with_account(account_b)
+        .with_candles(candles_b)
+        .with_ticks(ticks_b)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(9_950, 0)),
+        });
+    let mut exchange_a = MockExchange::start(config_a).await?;
+    let mut exchange_b = MockExchange::start(config_b).await?;
+    let control_addr = next_control_addr();
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let alerting = AlertingConfig {
+        max_drawdown: Decimal::new(2, 0),
+        ..AlertingConfig::default()
+    };
+    let risk = RiskManagementConfig {
+        max_drawdown: Decimal::new(2, 0),
+        ..RiskManagementConfig::default()
+    };
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 16,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
+        initial_balances: dual_initial_balances(),
+        reporting_currency: usdt_asset(),
+        markets_file: Some(markets_file),
+        alerting,
+        exec_backend: ExecutionBackend::Live,
+        risk,
+        reconciliation_interval: Duration::from_secs(30),
+        reconciliation_threshold: Decimal::new(1, 1),
+        orderbook_depth: 50,
+        record_path: None,
+        control_addr,
+        panic_close: PanicCloseConfig::default(),
+    };
+    let exchanges = vec![
+        NamedExchange {
+            name: "bybit_linear".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_a.rest_url(),
+                ws_url: exchange_a.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+        NamedExchange {
+            name: "binance_perp".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_b.rest_url(),
+                ws_url: exchange_b.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+    ];
+    let mut strategy = PairsTradingArbitrage::default();
+    let config_value: toml::Value = toml::from_str(
+        r#"
+        lookback = 4
+        entry_z = 1.5
+        exit_z = 0.8
+        symbols = ["bybit_linear:BTCUSDT", "binance_perp:BTCUSDT"]
+
+        [default_exit_strategy]
+        type = "half_life_time_stop"
+        half_life_candles = 200
+        multiplier = 10
+        "#,
+    )?;
+    strategy.configure(config_value)?;
+    let symbols = strategy.subscriptions();
+    let shutdown = ShutdownSignal::new();
+    let run_handle = spawn_live_runtime(
+        Box::new(strategy),
+        symbols,
+        exchanges,
+        settings,
+        shutdown.clone(),
+    );
+
+    let mut client = connect_control_client(control_addr).await?;
+    let trade_id = timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client
+                .list_managed_trades(ListManagedTradesRequest {})
+                .await?
+                .into_inner();
+            if let Some(trade) = response.trades.first() {
+                return Ok::<String, anyhow::Error>(trade.trade_id.clone());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for managed trade")??;
+
+    let new_exit = ExitStrategy::StandardZScore {
+        exit_z: Decimal::new(3, 1),
+    };
+    let update_request = UpdateTradeExitStrategyRequest {
+        trade_id: trade_id.clone(),
+        new_strategy_json: serde_json::to_string(&new_exit)?,
+    };
+    let response = client
+        .update_trade_exit_strategy(update_request)
+        .await?
+        .into_inner();
+    assert!(response.success);
+
+    let updated = client
+        .list_managed_trades(ListManagedTradesRequest {})
+        .await?
+        .into_inner();
+    let current = updated
+        .trades
+        .iter()
+        .find(|trade| trade.trade_id == trade_id)
+        .expect("managed trade still active");
+    let parsed: ExitStrategy = serde_json::from_str(&current.exit_strategy_json)?;
+    assert_eq!(parsed, new_exit, "exit strategy should reflect update");
+
+    shutdown.trigger();
+    run_handle.await??;
     exchange_a.shutdown().await;
     exchange_b.shutdown().await;
     Ok(())

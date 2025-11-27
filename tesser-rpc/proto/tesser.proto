@@ -271,6 +271,33 @@ message CancelAllResponse {
   uint32 cancelled_algorithms = 2;
 }
 
+message ManagedTradeInfo {
+  string trade_id = 1;
+  string symbol_a = 2;
+  string symbol_b = 3;
+  string direction = 4;
+  google.protobuf.Timestamp entry_timestamp = 5;
+  Decimal entry_z = 6;
+  uint64 candles_held = 7;
+  string exit_strategy_json = 8;
+}
+
+message ListManagedTradesRequest {}
+
+message ListManagedTradesResponse {
+  repeated ManagedTradeInfo trades = 1;
+}
+
+message UpdateTradeExitStrategyRequest {
+  string trade_id = 1;
+  string new_strategy_json = 2;
+}
+
+message UpdateTradeExitStrategyResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
 message MonitorRequest {}
 
 message Event {
@@ -297,5 +324,7 @@ service ControlService {
   rpc GetOpenOrders (GetOpenOrdersRequest) returns (GetOpenOrdersResponse);
   rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
   rpc CancelAll (CancelAllRequest) returns (CancelAllResponse);
+  rpc ListManagedTrades (ListManagedTradesRequest) returns (ListManagedTradesResponse);
+  rpc UpdateTradeExitStrategy (UpdateTradeExitStrategyRequest) returns (UpdateTradeExitStrategyResponse);
   rpc Monitor (MonitorRequest) returns (stream Event);
 }

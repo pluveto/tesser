@@ -6,7 +6,7 @@ use async_trait::async_trait;
 pub use tesser_strategy_macros::register_strategy;
 pub use toml::Value;
 
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use once_cell::sync::Lazy;
 use rust_decimal::MathematicalOps;
 use rust_decimal::{
@@ -14,13 +14,14 @@ use rust_decimal::{
     Decimal,
 };
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tesser_core::{
-    Candle, ExecutionHint, Fill, OrderBook, Position, Quantity, Side, Signal, SignalKind, Symbol,
-    Tick,
+    Candle, ExecutionHint, ExitStrategy, Fill, OrderBook, Position, Quantity, Signal, SignalKind,
+    Symbol, Tick,
 };
 use tesser_cortex::{CortexConfig, CortexDevice, CortexEngine, FeatureBuffer};
 use tesser_indicators::{
@@ -218,7 +219,7 @@ impl Default for StrategyContext {
 
 /// Strategy lifecycle hooks used by engines that drive market data and fills.
 #[async_trait]
-pub trait Strategy: Send + Sync {
+pub trait Strategy: Send + Sync + Any {
     /// Human-friendly identifier used in logs and telemetry.
     fn name(&self) -> &str;
 
@@ -1187,13 +1188,72 @@ pub struct PairsTradingConfig {
     pub entry_z: Decimal,
     pub exit_z: Decimal,
     pub clip_size: Decimal,
+    pub default_exit_strategy: Option<ExitStrategy>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpreadBias {
-    Flat,
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PairTradeDirection {
     ShortFirst,
     LongFirst,
+}
+
+impl PairTradeDirection {
+    fn entry_kinds(self) -> (SignalKind, SignalKind) {
+        match self {
+            Self::ShortFirst => (SignalKind::EnterShort, SignalKind::EnterLong),
+            Self::LongFirst => (SignalKind::EnterLong, SignalKind::EnterShort),
+        }
+    }
+
+    fn exit_kinds(self) -> (SignalKind, SignalKind) {
+        match self {
+            Self::ShortFirst => (SignalKind::ExitShort, SignalKind::ExitLong),
+            Self::LongFirst => (SignalKind::ExitLong, SignalKind::ExitShort),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManagedPairTrade {
+    id: Uuid,
+    direction: PairTradeDirection,
+    entry_timestamp: DateTime<Utc>,
+    entry_candle_index: u64,
+    entry_z_score: Decimal,
+    exit_strategy: ExitStrategy,
+    clip: Option<Decimal>,
+    symbols: [Symbol; 2],
+}
+
+impl ManagedPairTrade {
+    fn snapshot(&self, candles_held: u64) -> PairTradeSnapshot {
+        PairTradeSnapshot {
+            trade_id: self.id,
+            direction: self.direction,
+            entry_timestamp: self.entry_timestamp,
+            entry_z_score: self.entry_z_score,
+            exit_strategy: self.exit_strategy.clone(),
+            candles_held,
+            symbols: self.symbols,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PairsTradingState {
+    trades: Vec<ManagedPairTrade>,
+    candle_counter: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairTradeSnapshot {
+    pub trade_id: Uuid,
+    pub direction: PairTradeDirection,
+    pub entry_timestamp: DateTime<Utc>,
+    pub entry_z_score: Decimal,
+    pub exit_strategy: ExitStrategy,
+    pub candles_held: u64,
+    pub symbols: [Symbol; 2],
 }
 
 impl Default for PairsTradingConfig {
@@ -1204,6 +1264,7 @@ impl Default for PairsTradingConfig {
             entry_z: Decimal::from(2),
             exit_z: Decimal::new(5, 1),
             clip_size: Decimal::ZERO,
+            default_exit_strategy: None,
         }
     }
 }
@@ -1212,8 +1273,9 @@ pub struct PairsTradingArbitrage {
     cfg: PairsTradingConfig,
     signals: Vec<Signal>,
     entry_z_level: Decimal,
-    exit_z_level: Decimal,
-    bias: SpreadBias,
+    default_exit_strategy: ExitStrategy,
+    active_trades: HashMap<Uuid, ManagedPairTrade>,
+    candle_counter: u64,
 }
 
 impl Default for PairsTradingArbitrage {
@@ -1230,8 +1292,11 @@ impl PairsTradingArbitrage {
             cfg,
             signals: Vec::new(),
             entry_z_level: Decimal::ZERO,
-            exit_z_level: Decimal::ZERO,
-            bias: SpreadBias::Flat,
+            default_exit_strategy: ExitStrategy::StandardZScore {
+                exit_z: Decimal::new(5, 1),
+            },
+            active_trades: HashMap::new(),
+            candle_counter: 0,
         };
         strategy.rebuild_thresholds()?;
         Ok(strategy)
@@ -1255,12 +1320,57 @@ impl PairsTradingArbitrage {
 
     fn rebuild_thresholds(&mut self) -> StrategyResult<()> {
         self.entry_z_level = self.cfg.entry_z;
-        self.exit_z_level = self.cfg.exit_z;
-        if self.entry_z_level <= self.exit_z_level {
+        let exit = self
+            .cfg
+            .default_exit_strategy
+            .clone()
+            .unwrap_or(ExitStrategy::StandardZScore {
+                exit_z: self.cfg.exit_z,
+            });
+        if self.entry_z_level <= Decimal::ZERO {
             return Err(StrategyError::InvalidConfig(
-                "`entry_z` must be greater than `exit_z`".into(),
+                "`entry_z` must be positive".into(),
             ));
         }
+        match &exit {
+            ExitStrategy::StandardZScore { exit_z } => {
+                if self.entry_z_level <= *exit_z {
+                    return Err(StrategyError::InvalidConfig(
+                        "`entry_z` must be greater than `exit_z` for z-score exits".into(),
+                    ));
+                }
+            }
+            ExitStrategy::DecayingThreshold { initial_exit_z, .. } => {
+                if self.entry_z_level <= *initial_exit_z {
+                    return Err(StrategyError::InvalidConfig(
+                        "`entry_z` must start above the decaying threshold".into(),
+                    ));
+                }
+            }
+            ExitStrategy::HalfLifeTimeStop {
+                half_life_candles,
+                multiplier,
+            } => {
+                if *half_life_candles == 0 {
+                    return Err(StrategyError::InvalidConfig(
+                        "`half_life_candles` must be greater than zero".into(),
+                    ));
+                }
+                if multiplier <= &Decimal::ZERO {
+                    return Err(StrategyError::InvalidConfig(
+                        "`multiplier` must be positive for half-life exits".into(),
+                    ));
+                }
+            }
+            ExitStrategy::HardTimeStop { max_duration_secs } => {
+                if *max_duration_secs == 0 {
+                    return Err(StrategyError::InvalidConfig(
+                        "`max_duration_secs` must be greater than zero".into(),
+                    ));
+                }
+            }
+        }
+        self.default_exit_strategy = exit;
         Ok(())
     }
 
@@ -1305,6 +1415,120 @@ impl PairsTradingArbitrage {
         }
         self.signals.push(signal);
     }
+
+    fn should_exit_trade(&self, trade: &ManagedPairTrade, z: Decimal, now: DateTime<Utc>) -> bool {
+        match &trade.exit_strategy {
+            ExitStrategy::StandardZScore { exit_z } => z.abs() <= *exit_z,
+            ExitStrategy::HardTimeStop { max_duration_secs } => {
+                let elapsed = now
+                    .signed_duration_since(trade.entry_timestamp)
+                    .num_seconds()
+                    .max(0);
+                (elapsed as u64) >= *max_duration_secs
+            }
+            ExitStrategy::HalfLifeTimeStop {
+                half_life_candles,
+                multiplier,
+            } => {
+                let elapsed = self.candle_counter.saturating_sub(trade.entry_candle_index);
+                let multiple =
+                    Decimal::from_u32(*half_life_candles).unwrap_or(Decimal::ZERO) * *multiplier;
+                let threshold = multiple.ceil().to_u64().unwrap_or(u64::MAX).max(1);
+                elapsed >= threshold
+            }
+            ExitStrategy::DecayingThreshold {
+                initial_exit_z,
+                decay_rate_per_hour,
+            } => {
+                let elapsed_ms = now
+                    .signed_duration_since(trade.entry_timestamp)
+                    .num_milliseconds()
+                    .max(0);
+                let elapsed_decimal = Decimal::from_i64(elapsed_ms).unwrap_or(Decimal::ZERO)
+                    / Decimal::new(3_600_000, 0);
+                let threshold =
+                    *initial_exit_z + (*decay_rate_per_hour * elapsed_decimal.max(Decimal::ZERO));
+                if threshold <= Decimal::ZERO {
+                    true
+                } else {
+                    z.abs() <= threshold
+                }
+            }
+        }
+    }
+
+    fn evaluate_trades(&mut self, ctx: &StrategyContext, z: Decimal, now: DateTime<Utc>) {
+        let mut completed = Vec::new();
+        for trade in self.active_trades.values() {
+            if self.should_exit_trade(trade, z, now) {
+                completed.push(trade.id);
+            }
+        }
+        for trade_id in completed {
+            if let Some(trade) = self.active_trades.remove(&trade_id) {
+                let group_id = Some(trade.id);
+                let clip = trade.clip.or_else(|| self.manual_clip(ctx));
+                let (first_kind, second_kind) = trade.direction.exit_kinds();
+                self.push_signal_with_clip(self.cfg.symbols[0], first_kind, 0.6, clip, group_id);
+                self.push_signal_with_clip(self.cfg.symbols[1], second_kind, 0.6, clip, group_id);
+            }
+        }
+    }
+
+    fn should_open_short(&self, z: Decimal) -> bool {
+        self.active_trades.is_empty() && z >= self.entry_z_level
+    }
+
+    fn should_open_long(&self, z: Decimal) -> bool {
+        self.active_trades.is_empty() && z <= -self.entry_z_level
+    }
+
+    fn open_trade(
+        &mut self,
+        ctx: &StrategyContext,
+        z: Decimal,
+        now: DateTime<Utc>,
+        direction: PairTradeDirection,
+    ) {
+        let group_id = Uuid::new_v4();
+        let clip = self.manual_clip(ctx);
+        let (first_kind, second_kind) = direction.entry_kinds();
+        self.push_signal_with_clip(self.cfg.symbols[0], first_kind, 0.8, clip, Some(group_id));
+        self.push_signal_with_clip(self.cfg.symbols[1], second_kind, 0.8, clip, Some(group_id));
+        let trade = ManagedPairTrade {
+            id: group_id,
+            direction,
+            entry_timestamp: now,
+            entry_candle_index: self.candle_counter,
+            entry_z_score: z,
+            exit_strategy: self.default_exit_strategy.clone(),
+            clip,
+            symbols: self.cfg.symbols,
+        };
+        self.active_trades.insert(group_id, trade);
+    }
+
+    pub fn managed_trades(&self) -> Vec<PairTradeSnapshot> {
+        self.active_trades
+            .values()
+            .map(|trade| {
+                let candles_held = self.candle_counter.saturating_sub(trade.entry_candle_index);
+                trade.snapshot(candles_held)
+            })
+            .collect()
+    }
+
+    pub fn update_trade_exit_strategy(
+        &mut self,
+        trade_id: Uuid,
+        new_strategy: ExitStrategy,
+    ) -> StrategyResult<()> {
+        let trade = self.active_trades.get_mut(&trade_id).ok_or_else(|| {
+            StrategyError::InvalidConfig(format!("unknown managed trade: {trade_id}"))
+        })?;
+        trade.exit_strategy = new_strategy;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1334,7 +1558,10 @@ impl Strategy for PairsTradingArbitrage {
         }
         Self::validate_symbols(&cfg)?;
         self.cfg = cfg;
-        self.rebuild_thresholds()
+        self.rebuild_thresholds()?;
+        self.active_trades.clear();
+        self.candle_counter = 0;
+        Ok(())
     }
 
     async fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
@@ -1342,83 +1569,19 @@ impl Strategy for PairsTradingArbitrage {
     }
 
     async fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
-        if self.cfg.symbols.contains(&candle.symbol) {
-            if let Some(spreads) = self.spreads(ctx) {
-                if let Some(z) = z_score(&spreads) {
-                    let clip = self.manual_clip(ctx);
-                    if z >= self.entry_z_level && matches!(self.bias, SpreadBias::Flat) {
-                        self.bias = SpreadBias::ShortFirst;
-                        let group_id = Uuid::new_v4();
-                        // Asset A rich: short A, long B.
-                        self.push_signal_with_clip(
-                            self.cfg.symbols[0],
-                            SignalKind::EnterShort,
-                            0.8,
-                            clip,
-                            Some(group_id),
-                        );
-                        self.push_signal_with_clip(
-                            self.cfg.symbols[1],
-                            SignalKind::EnterLong,
-                            0.8,
-                            clip,
-                            Some(group_id),
-                        );
-                    } else if z <= -self.entry_z_level && matches!(self.bias, SpreadBias::Flat) {
-                        self.bias = SpreadBias::LongFirst;
-                        let group_id = Uuid::new_v4();
-                        // Asset B rich: long A, short B.
-                        self.push_signal_with_clip(
-                            self.cfg.symbols[0],
-                            SignalKind::EnterLong,
-                            0.8,
-                            clip,
-                            Some(group_id),
-                        );
-                        self.push_signal_with_clip(
-                            self.cfg.symbols[1],
-                            SignalKind::EnterShort,
-                            0.8,
-                            clip,
-                            Some(group_id),
-                        );
-                    } else if z.abs() <= self.exit_z_level {
-                        let group_id = Uuid::new_v4();
-                        let symbols = self.cfg.symbols;
-                        for (idx, symbol) in symbols.iter().copied().enumerate() {
-                            let exit_kind = match self.bias {
-                                SpreadBias::ShortFirst => {
-                                    if idx == 0 {
-                                        SignalKind::ExitShort
-                                    } else {
-                                        SignalKind::ExitLong
-                                    }
-                                }
-                                SpreadBias::LongFirst => {
-                                    if idx == 0 {
-                                        SignalKind::ExitLong
-                                    } else {
-                                        SignalKind::ExitShort
-                                    }
-                                }
-                                SpreadBias::Flat => {
-                                    match ctx.position(symbol).and_then(|position| position.side) {
-                                        Some(Side::Buy) => SignalKind::ExitLong,
-                                        Some(Side::Sell) => SignalKind::ExitShort,
-                                        None => SignalKind::Flatten,
-                                    }
-                                }
-                            };
-                            self.push_signal_with_clip(
-                                symbol,
-                                exit_kind,
-                                0.6,
-                                clip,
-                                Some(group_id),
-                            );
-                        }
-                        self.bias = SpreadBias::Flat;
-                    }
+        if !self.cfg.symbols.contains(&candle.symbol) {
+            return Ok(());
+        }
+        self.candle_counter = self.candle_counter.saturating_add(1);
+        if let Some(spreads) = self.spreads(ctx) {
+            if let Some(z) = z_score(&spreads) {
+                tracing::info!(target: "strategy", %z, "pairs-trading z-score");
+                let now = candle.timestamp;
+                self.evaluate_trades(ctx, z, now);
+                if self.should_open_short(z) {
+                    self.open_trade(ctx, z, now, PairTradeDirection::ShortFirst);
+                } else if self.should_open_long(z) {
+                    self.open_trade(ctx, z, now, PairTradeDirection::LongFirst);
                 }
             }
         }
@@ -1431,6 +1594,32 @@ impl Strategy for PairsTradingArbitrage {
 
     fn drain_signals(&mut self) -> Vec<Signal> {
         std::mem::take(&mut self.signals)
+    }
+
+    fn snapshot(&self) -> StrategyResult<serde_json::Value> {
+        let state = PairsTradingState {
+            trades: self.active_trades.values().cloned().collect(),
+            candle_counter: self.candle_counter,
+        };
+        serde_json::to_value(state).map_err(|err| {
+            StrategyError::Internal(format!("failed to serialize pairs trading state: {err}"))
+        })
+    }
+
+    fn restore(&mut self, state: serde_json::Value) -> StrategyResult<()> {
+        if state.is_null() {
+            return Ok(());
+        }
+        let restored: PairsTradingState = serde_json::from_value(state).map_err(|err| {
+            StrategyError::Internal(format!("failed to restore pairs trading state: {err}"))
+        })?;
+        self.active_trades = restored
+            .trades
+            .into_iter()
+            .map(|trade| (trade.id, trade))
+            .collect();
+        self.candle_counter = restored.candle_counter;
+        Ok(())
     }
 }
 

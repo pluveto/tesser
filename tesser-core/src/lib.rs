@@ -157,6 +157,26 @@ pub enum ExecutionHint {
     },
 }
 
+/// Configurable exit management policies shared by strategies and control surfaces.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExitStrategy {
+    /// Exit once the z-score mean reverts to the configured level.
+    StandardZScore { exit_z: Decimal },
+    /// Force an exit once the holding period exceeds the configured duration.
+    HardTimeStop { max_duration_secs: u64 },
+    /// Force an exit after a multiple of the observed half-life (in candles).
+    HalfLifeTimeStop {
+        half_life_candles: u32,
+        multiplier: Decimal,
+    },
+    /// Gradually relax the exit threshold over time.
+    DecayingThreshold {
+        initial_exit_z: Decimal,
+        decay_rate_per_hour: Decimal,
+    },
+}
+
 /// The side of an order or position.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Side {

@@ -909,6 +909,7 @@ impl LiveRuntime {
             persisted.clone(),
             last_data_timestamp.clone(),
             event_bus.clone(),
+            strategy.clone(),
             shutdown.clone(),
         );
         let reconciliation_ctx = (!settings.exec_backend.is_paper()).then(|| {

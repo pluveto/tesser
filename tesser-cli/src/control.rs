@@ -1,8 +1,10 @@
+use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -10,6 +12,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
+use tesser_core::ExitStrategy;
 use tesser_events::{Event as RuntimeEvent, EventBus};
 use tesser_execution::OrderOrchestrator;
 use tesser_portfolio::{LiveState, Portfolio};
@@ -17,9 +20,13 @@ use tesser_rpc::conversions::to_decimal_proto;
 use tesser_rpc::proto::control_service_server::{ControlService, ControlServiceServer};
 use tesser_rpc::proto::{
     self, CancelAllRequest, CancelAllResponse, Event, GetOpenOrdersRequest, GetOpenOrdersResponse,
-    GetPortfolioRequest, GetPortfolioResponse, GetStatusRequest, GetStatusResponse, MonitorRequest,
-    OrderSnapshot, PortfolioSnapshot,
+    GetPortfolioRequest, GetPortfolioResponse, GetStatusRequest, GetStatusResponse,
+    ListManagedTradesRequest, ListManagedTradesResponse, ManagedTradeInfo, MonitorRequest,
+    OrderSnapshot, PortfolioSnapshot, UpdateTradeExitStrategyRequest,
+    UpdateTradeExitStrategyResponse,
 };
+use tesser_strategy::{PairTradeSnapshot, PairsTradingArbitrage, Strategy, StrategyResult};
+use uuid::Uuid;
 
 use crate::live::ShutdownSignal;
 
@@ -31,6 +38,7 @@ pub fn spawn_control_plane(
     persisted: Arc<Mutex<LiveState>>,
     last_data_timestamp: Arc<AtomicI64>,
     event_bus: Arc<EventBus>,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
     shutdown: ShutdownSignal,
 ) -> JoinHandle<()> {
     let service = ControlGrpcService::new(
@@ -39,6 +47,7 @@ pub fn spawn_control_plane(
         persisted,
         last_data_timestamp,
         event_bus,
+        strategy,
         shutdown.clone(),
     );
     info!(%addr, "starting control plane gRPC server");
@@ -59,6 +68,7 @@ struct ControlGrpcService {
     persisted: Arc<Mutex<LiveState>>,
     last_data_timestamp: Arc<AtomicI64>,
     event_bus: Arc<EventBus>,
+    strategy: Arc<Mutex<Box<dyn Strategy>>>,
     shutdown: ShutdownSignal,
 }
 
@@ -69,6 +79,7 @@ impl ControlGrpcService {
         persisted: Arc<Mutex<LiveState>>,
         last_data_timestamp: Arc<AtomicI64>,
         event_bus: Arc<EventBus>,
+        strategy: Arc<Mutex<Box<dyn Strategy>>>,
         shutdown: ShutdownSignal,
     ) -> Self {
         Self {
@@ -77,6 +88,7 @@ impl ControlGrpcService {
             persisted,
             last_data_timestamp,
             event_bus,
+            strategy,
             shutdown,
         }
     }
@@ -121,6 +133,35 @@ impl ControlGrpcService {
             }
         }
         Ok((cancelled_orders, cancelled_algorithms))
+    }
+
+    async fn with_pairs_strategy<R>(
+        &self,
+        f: impl FnOnce(&mut PairsTradingArbitrage) -> StrategyResult<R>,
+    ) -> Result<R, Status> {
+        let mut guard = self.strategy.lock().await;
+        let any = (&mut **guard) as &mut dyn Any;
+        let Some(pairs) = any.downcast_mut::<PairsTradingArbitrage>() else {
+            return Err(Status::failed_precondition(
+                "active strategy does not expose managed trades",
+            ));
+        };
+        f(pairs).map_err(|err| Status::internal(err.to_string()))
+    }
+
+    fn snapshot_to_proto(snapshot: PairTradeSnapshot) -> Result<ManagedTradeInfo, Status> {
+        let exit_strategy_json = serde_json::to_string(&snapshot.exit_strategy)
+            .map_err(|err| Status::internal(format!("failed to encode exit strategy: {err}")))?;
+        Ok(ManagedTradeInfo {
+            trade_id: snapshot.trade_id.to_string(),
+            symbol_a: snapshot.symbols[0].to_string(),
+            symbol_b: snapshot.symbols[1].to_string(),
+            direction: format!("{:?}", snapshot.direction),
+            entry_timestamp: Some(timestamp_from_datetime(snapshot.entry_timestamp)),
+            entry_z: Some(to_decimal_proto(snapshot.entry_z_score)),
+            candles_held: snapshot.candles_held,
+            exit_strategy_json,
+        })
     }
 }
 
@@ -184,6 +225,43 @@ impl ControlService for ControlGrpcService {
             })),
             Err(err) => Err(Status::internal(err.to_string())),
         }
+    }
+
+    async fn list_managed_trades(
+        &self,
+        _request: Request<ListManagedTradesRequest>,
+    ) -> Result<Response<ListManagedTradesResponse>, Status> {
+        let snapshots = self
+            .with_pairs_strategy(|strategy| Ok(strategy.managed_trades()))
+            .await?;
+        let mut trades = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            trades.push(Self::snapshot_to_proto(snapshot)?);
+        }
+        Ok(Response::new(ListManagedTradesResponse { trades }))
+    }
+
+    async fn update_trade_exit_strategy(
+        &self,
+        request: Request<UpdateTradeExitStrategyRequest>,
+    ) -> Result<Response<UpdateTradeExitStrategyResponse>, Status> {
+        let payload = request.into_inner();
+        let trade_id = Uuid::parse_str(&payload.trade_id)
+            .map_err(|err| Status::invalid_argument(format!("invalid trade_id: {err}")))?;
+        let new_strategy: ExitStrategy =
+            serde_json::from_str(&payload.new_strategy_json).map_err(|err| {
+                Status::invalid_argument(format!("invalid exit strategy json: {err}"))
+            })?;
+        self.with_pairs_strategy(|strategy| {
+            strategy
+                .update_trade_exit_strategy(trade_id, new_strategy.clone())
+                .map(|_| ())
+        })
+        .await?;
+        Ok(Response::new(UpdateTradeExitStrategyResponse {
+            success: true,
+            error_message: String::new(),
+        }))
     }
 
     async fn monitor(
@@ -256,5 +334,12 @@ fn event_label(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::Fill(_) => "fill",
         RuntimeEvent::OrderUpdate(_) => "order",
         RuntimeEvent::OrderBook(_) => "order_book",
+    }
+}
+
+fn timestamp_from_datetime(ts: DateTime<Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: ts.timestamp(),
+        nanos: ts.timestamp_subsec_nanos() as i32,
     }
 }
