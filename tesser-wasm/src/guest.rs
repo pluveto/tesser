@@ -1,24 +1,16 @@
-use crate::types::{
-    PluginChildOrderAction, PluginChildOrderRequest, PluginFill, PluginInitContext,
-    PluginOrderRequest, PluginOrderType, PluginOrderUpdateRequest, PluginResult, PluginSide,
-    PluginTick, PluginTimeInForce,
-};
+use crate::types::{PluginFill, PluginInitContext, PluginResult, PluginSide, PluginTick};
 use once_cell::sync::OnceCell;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::sync::Mutex;
 
+#[allow(clippy::too_many_arguments)]
 mod bindings {
     wit_bindgen::generate!({
         world: "execution-plugin",
         path: "wit",
-        exports: {
-            "tesser:execution/execution-plugin": ExecutionPlugin
-        }
     });
 }
-
-pub use bindings::exports::tesser::execution::execution_plugin::Guest as WasmGuest;
 use bindings::tesser::execution::primitives::Side as AbiSide;
 pub use bindings::tesser::execution::primitives::Tick as AbiTick;
 

@@ -723,11 +723,9 @@ pub async fn run_live_with_shutdown(
         .map(|data| data.open_orders.clone())
         .unwrap_or_default();
     let wasm_plugins = if let Some(dir) = settings.plugins_dir.as_ref() {
-        Some(Arc::new(
-            WasmPluginEngine::new(dir).with_context(|| {
-                format!("failed to initialize plugin runtime at {}", dir.display())
-            })?,
-        ))
+        Some(Arc::new(WasmPluginEngine::new(dir).with_context(|| {
+            format!("failed to initialize plugin runtime at {}", dir.display())
+        })?))
     } else {
         None
     };

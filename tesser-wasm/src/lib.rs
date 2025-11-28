@@ -7,4 +7,4 @@ pub use types::*;
 pub mod guest;
 
 #[cfg(feature = "guest")]
-pub use guest::{export_plugin, ExecutionPlugin, PluginError, PluginResult};
+pub use guest::{ExecutionPlugin, PluginError};
