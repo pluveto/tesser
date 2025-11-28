@@ -1,0 +1,31 @@
+package tesser:execution;
+
+interface primitives {
+    record decimal-value {
+        value: string,
+    }
+
+    enum side {
+        buy,
+        sell,
+    }
+
+    record tick {
+        symbol: string,
+        price: decimal-value,
+        size: decimal-value,
+        side: side,
+        timestamp-ms: s64,
+    }
+}
+
+world execution-plugin {
+    use primitives.{tick};
+
+    export init: func(config-json: string) -> result<string, string>;
+    export on-tick: func(tick: tick) -> string;
+    export on-fill: func(fill-json: string) -> string;
+    export on-timer: func() -> string;
+    export snapshot: func() -> string;
+    export restore: func(state-json: string);
+}

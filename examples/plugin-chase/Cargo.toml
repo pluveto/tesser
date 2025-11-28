@@ -1,0 +1,11 @@
+[package]
+name = "plugin-chase"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rust_decimal = "1.35"
+tesser-wasm = { path = "../../tesser-wasm", features = ["guest"] }

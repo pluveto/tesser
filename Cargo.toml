@@ -21,7 +21,7 @@ members = [
     "tesser-rpc",
     "tesser",
     "tesser-cortex",
-    "tesser-journal",
+    "tesser-journal", "tesser-wasm",
 ]
 
 [workspace.package]
