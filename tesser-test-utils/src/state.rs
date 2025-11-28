@@ -416,16 +416,16 @@ impl MockExchangeState {
         guard.private_ws_sender = None;
     }
 
-pub async fn emit_private_message(&self, payload: PrivateMessage) -> Result<()> {
-    let mut guard = self.inner.lock().await;
-    if let Some(tx) = guard.private_ws_sender.clone() {
-        tx.send(payload)
-            .map_err(|err| anyhow!("failed to deliver private stream message: {err}"))
-    } else {
-        guard.pending_private_messages.push_back(payload);
-        Ok(())
+    pub async fn emit_private_message(&self, payload: PrivateMessage) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        if let Some(tx) = guard.private_ws_sender.clone() {
+            tx.send(payload)
+                .map_err(|err| anyhow!("failed to deliver private stream message: {err}"))
+        } else {
+            guard.pending_private_messages.push_back(payload);
+            Ok(())
+        }
     }
-}
 
     pub async fn account_secret(&self, api_key: &str) -> Option<String> {
         let guard = self.inner.lock().await;
