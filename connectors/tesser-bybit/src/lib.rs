@@ -258,15 +258,25 @@ impl BybitClient {
         if method != Method::GET {
             request = request.json(&body);
         }
-        let resp = request
+        let response = request
             .send()
             .await
-            .map_err(|err| BrokerError::Transport(err.to_string()))?
-            .json::<ApiResponse<T>>()
+            .map_err(|err| BrokerError::Transport(err.to_string()))?;
+        let status = response.status();
+        let response_body = response
+            .text()
             .await
-            .map_err(|err| BrokerError::Serialization(err.to_string()))?;
-        self.ensure_success(&resp)?;
-        Ok(resp)
+            .unwrap_or_else(|_| "Failed to read response body".into());
+        if !status.is_success() {
+            return Err(BrokerError::Exchange(format!(
+                "status {} {}: {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown"),
+                response_body
+            )));
+        }
+        serde_json::from_str::<ApiResponse<T>>(&response_body)
+            .map_err(|err| BrokerError::Serialization(format!("{err}: {response_body}")))
     }
 
     fn map_time_in_force(tif: Option<TimeInForce>) -> &'static str {
