@@ -82,6 +82,8 @@ pub struct LiveRuntimeConfig {
     pub reconciliation_threshold: Decimal,
     #[serde(default)]
     pub alerting: AlertingConfig,
+    #[serde(default)]
+    pub plugins_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -129,6 +131,7 @@ impl Default for LiveRuntimeConfig {
             reconciliation_interval_secs: default_reconciliation_interval_secs(),
             reconciliation_threshold: default_reconciliation_threshold(),
             alerting: AlertingConfig::default(),
+            plugins_dir: None,
         }
     }
 }

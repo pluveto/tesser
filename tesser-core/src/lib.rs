@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use crc32fast::Hasher;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 mod identifiers;
@@ -154,6 +155,12 @@ pub enum ExecutionHint {
     TrailingStop {
         activation_price: Price,
         callback_rate: Decimal,
+    },
+    /// Execute via an externally supplied WebAssembly plugin.
+    Plugin {
+        name: String,
+        #[serde(default)]
+        params: Value,
     },
 }
 

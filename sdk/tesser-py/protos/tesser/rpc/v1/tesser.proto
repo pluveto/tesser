@@ -112,6 +112,11 @@ message TrailingStopHint {
   Decimal callback_rate = 2;
 }
 
+message PluginHint {
+  string name = 1;
+  string params_json = 2;
+}
+
 message ExecutionHint {
   oneof hint {
     TwapHint twap = 1;
@@ -120,6 +125,7 @@ message ExecutionHint {
     PeggedHint pegged = 4;
     SniperHint sniper = 5;
     TrailingStopHint trailing_stop = 6;
+    PluginHint plugin = 7;
   }
 }
 

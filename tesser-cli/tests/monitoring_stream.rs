@@ -526,6 +526,7 @@ impl LiveTestHarness {
             record_path: record_data.then(|| record_root.clone()),
             control_addr,
             panic_close: PanicCloseConfig::default(),
+            plugins_dir: None,
         };
 
         let shutdown = ShutdownSignal::new();

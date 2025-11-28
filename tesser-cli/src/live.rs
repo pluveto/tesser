@@ -554,6 +554,7 @@ pub struct LiveSessionSettings {
     pub record_path: Option<PathBuf>,
     pub control_addr: SocketAddr,
     pub panic_close: PanicCloseConfig,
+    pub plugins_dir: Option<PathBuf>,
 }
 
 impl LiveSessionSettings {

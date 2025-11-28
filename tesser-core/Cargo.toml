@@ -16,3 +16,4 @@ rust_decimal.workspace = true
 crc32fast = "1.4"
 once_cell = "1.19"
 parking_lot = "0.12"
+serde_json.workspace = true

@@ -118,6 +118,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         Vec::new(),
         PanicCloseConfig::default(),
         None,
+        None,
     )
     .await?;
 
@@ -176,6 +177,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         repo.clone(),
         open_orders,
         PanicCloseConfig::default(),
+        None,
         None,
     )
     .await?;

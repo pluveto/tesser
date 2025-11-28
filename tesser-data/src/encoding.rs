@@ -635,6 +635,11 @@ fn execution_hint_metadata(hint: &ExecutionHint) -> serde_json::Value {
             "activation_price": activation_price.to_string(),
             "callback_rate": callback_rate.to_string(),
         }),
+        ExecutionHint::Plugin { name, params } => json!({
+            "type": "plugin",
+            "name": name,
+            "params": params,
+        }),
     }
 }
 

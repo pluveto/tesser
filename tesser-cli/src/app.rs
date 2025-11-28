@@ -1024,6 +1024,9 @@ pub struct LiveRunArgs {
     /// Basis points added/subtracted from the last price when using `panic_mode=aggressive-limit`
     #[arg(long, default_value = "50")]
     panic_limit_offset_bps: Decimal,
+    /// Directory containing compiled WASM execution plugins.
+    #[arg(long = "plugins-dir")]
+    plugins_dir: Option<PathBuf>,
 }
 
 impl LiveRunArgs {
@@ -1721,6 +1724,10 @@ impl LiveRunArgs {
             mode: self.panic_mode.into(),
             limit_offset_bps: self.panic_limit_offset_bps.max(Decimal::ZERO),
         };
+        let plugins_dir = self
+            .plugins_dir
+            .clone()
+            .or_else(|| config.live.plugins_dir.clone());
 
         let settings = LiveSessionSettings {
             category,
@@ -1743,6 +1750,7 @@ impl LiveRunArgs {
             record_path: Some(self.record_data.clone()),
             control_addr,
             panic_close,
+            plugins_dir,
         };
 
         let exchange_labels: Vec<String> = named_exchanges
