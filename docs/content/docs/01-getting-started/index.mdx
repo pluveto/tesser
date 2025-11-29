@@ -28,11 +28,13 @@ Run the `SmaCross` strategy against the sample Bitcoin data:
 cargo run -p tesser-cli -- \
     backtest run \
     --strategy-config examples/strategies/sma_cross.toml \
-    --data examples/data/btcusdt_1m_sample.csv \
+    --data examples/data/btcusdt_1m_sample.parquet \
     --quantity 0.01
 ```
 
 You should see a performance report printed to the console, including Total Return, Sharpe Ratio, and Max Drawdown.
+
+> Need different symbols? Run `tesser-cli data normalize` on your CSV downloads (with a mapping from `configs/etl/`) so `--data` always points at canonical Parquet files.
 
 ## Next Steps
 

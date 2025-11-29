@@ -152,7 +152,8 @@ tesser/
 
 The repository now ships with a minimal end-to-end bundle under `examples/`:
 
-- `examples/data/btcusdt_1m_sample.csv` – 6h of deterministic BTCUSDT 1m candles.
+- `examples/data/btcusdt_1m_sample.parquet` – canonical 6h BTCUSDT 1m candles produced via `tesser-cli data normalize`.
+- `examples/data/btcusdt_1m_sample.csv` – the raw CSV source that can be re-normalized if needed.
 - `examples/strategies/sma_cross.toml` – double moving-average crossover tuned for the sample data.
 - `examples/strategies/rsi_reversion.toml` – RSI mean-reversion variant for the same symbol.
 
@@ -162,11 +163,21 @@ Use them to exercise the entire pipeline without downloading external data:
 cargo run -p tesser-cli -- \
     backtest run \
     --strategy-config examples/strategies/sma_cross.toml \
-    --data examples/data/btcusdt_1m_sample.csv \
+    --data examples/data/btcusdt_1m_sample.parquet \
     --quantity 0.01
 ```
 
-Swap in `examples/strategies/rsi_reversion.toml` (or any file under `research/`) to compare behaviors. Omit `--data` to fall back to synthetic candles, or add multiple CSV paths to stitch larger datasets.
+Swap in `examples/strategies/rsi_reversion.toml` (or any file under `research/`) to compare behaviors. Omit `--data` to fall back to synthetic candles, or pass multiple canonical Parquet paths to stitch larger datasets. Normalize new downloads first:
+
+```sh
+cargo run -p tesser-cli -- data normalize \
+    --source ./raw/binance/*.csv \
+    --output ./data_lake/candles \
+    --config ./configs/etl/sample_iso_csv.toml \
+    --symbol binance_perp:BTCUSDT
+```
+
+Point `--data` at the resulting `.parquet` files (globbed or enumerated) to keep the backtester consistent and fast.
 
 ### Tick-Level Backtests & Advanced Execution
 
@@ -200,7 +211,7 @@ tesser-cli --env default <COMMAND>
 
 Commands:
   data download|validate|resample   # Download/inspect historical data
-  backtest run --strategy-config    # Executes a single backtest (supports multiple --data inputs)
+  backtest run --strategy-config    # Executes a single backtest (pass canonical Parquet via --data)
   backtest batch --config ...       # Runs multiple configs and writes an optional summary CSV
   live run --strategy-config        # Runs the live exchange stream (Bybit/Binance) + paper execution loop
   state inspect [--path <file>]     # Prints the persisted SQLite state snapshot (use --raw for JSON)

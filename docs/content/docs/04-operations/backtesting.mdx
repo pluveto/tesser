@@ -11,11 +11,13 @@ The backtester wires the data layer, strategies, and execution logic exactly lik
 cargo run -p tesser-cli -- \
     backtest run \
     --strategy-config examples/strategies/sma_cross.toml \
-    --data examples/data/btcusdt_1m_sample.csv \
+    --data examples/data/btcusdt_1m_sample.parquet \
     --mode candle
 ```
 
 Switch to `--mode tick` and provide order-book snapshots when you need depth-aware simulations.
+
+> ℹ️ Normalize fresh CSV downloads first via `tesser-cli data normalize --config ./configs/etl/<mapping>.toml` so the backtester receives canonical Parquet files.
 
 ### Streaming Tick Mode from Flight Recorder
 

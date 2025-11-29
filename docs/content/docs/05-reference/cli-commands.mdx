@@ -9,16 +9,17 @@ tesser-cli --env <profile> <COMMAND>
 
 ## Data
 
-- `data download --symbol BTCUSDT --interval 1m --out data/btc.csv`
+- `data download --symbol BTCUSDT --interval 1m --output data/raw/btc.csv`
 - `data download-trades --exchange bybit --symbol BTCUSDT --partition-by-day --resume --source bybit-public`
 - `data download-trades --exchange binance --symbol BTCUSDT --partition-by-day --resume --source binance-public --binance-market futures-um`
-- `data validate --input data/btc.csv`
-- `data resample --input data/btc.csv --interval 5m`
+- `data validate --path data/raw/btc.csv`
+- `data normalize --source data/raw/btc.csv --output data/candles --config configs/etl/sample_iso_csv.toml --symbol binance_perp:BTCUSDT`
+- `data resample --input data/candles/symbol=BTCUSDT/interval=1m/.../part-00000.parquet --interval 5m`
 
 ## Backtesting
 
-- `backtest run --strategy-config strategies/sma_cross.toml --data data/btc.csv`
-- `backtest batch --config research/batch.toml --out reports/batch.csv`
+- `backtest run --strategy-config strategies/sma_cross.toml --data data/candles/symbol=BTCUSDT/*.parquet`
+- `backtest batch --config research/batch.toml --data data/candles/symbol=BTCUSDT/*.parquet --out reports/batch.csv`
 
 ## Live Operations
 

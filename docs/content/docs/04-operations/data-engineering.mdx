@@ -6,13 +6,13 @@ description: Acquire, validate, and store high quality market data.
 ## Sources
 
 - **Bybit/Binance Historical** – Use `tesser-cli data download` for candles or `tesser-cli data download-trades` for tick data. For Bybit, pass `--source bybit-public --partition-by-day --resume` to stream the public archive with automatic resume. For Binance, `--source binance-public --binance-market futures-um` (or `spot` / `futures-cm`) pulls and caches the daily ZIPs before normalizing them to Tesser ticks.
-- **Custom Feeds** – Drop CSV/JSONL files under `data/` and point backtests to them via `--data`.
+- **Custom Feeds** – Drop CSV/JSONL files under `data/`, run `tesser-cli data normalize` to convert them into the canonical Parquet schema, then point backtests to those `.parquet` outputs via `--data`.
 
 ## Validation
 
 ```bash
 cargo run -p tesser-cli -- data validate \
-    --input data/btcusdt_1m_sample.csv
+    --path data/btcusdt_1m_sample.csv
 ```
 
 The validator detects:
@@ -23,7 +23,8 @@ The validator detects:
 
 ## Storage
 
-- CSV is the default interchange format for candles and quick diagnostics.
+- CSV is used for quick diagnostics and as the staging format before normalization.
+- Canonical candle datasets live in Parquet files emitted by `tesser-cli data normalize`, matching the schema replayed by the backtester.
 - Tick downloads are written as Parquet using the exact schema produced by the flight recorder, so the backtester can consume them without conversion.
 
 Keep raw downloads immutable and derive normalized datasets via scripts in `research/` so simulations remain reproducible.
