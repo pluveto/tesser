@@ -1,6 +1,6 @@
 [package]
 name = "tesser-ledger"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 authors = ["Tesser Contributors <dev@tesser.local>"]
 license = "MIT OR Apache-2.0"
