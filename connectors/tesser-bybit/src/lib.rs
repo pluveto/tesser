@@ -23,13 +23,14 @@ use tesser_core::{
     OrderBook, OrderRequest, OrderStatus, OrderType, OrderUpdateRequest, Position, Quantity, Side,
     Symbol, TimeInForce,
 };
-use tracing::warn;
+use tracing::{trace, warn};
 
 pub mod ws;
 
 pub use ws::{BybitMarketStream, BybitSubscription, PublicChannel};
 
 type HmacSha256 = Hmac<Sha256>;
+const EXECUTION_MAX_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// API credentials required for private REST endpoints.
 #[derive(Clone)]
@@ -46,6 +47,7 @@ pub struct BybitConfig {
     pub ws_url: Option<String>,
     pub public_quota: Option<Quota>,
     pub private_quota: Option<Quota>,
+    pub settle_coin: Option<String>,
 }
 
 impl Default for BybitConfig {
@@ -57,6 +59,7 @@ impl Default for BybitConfig {
             ws_url: None,
             public_quota: None,
             private_quota: None,
+            settle_coin: Some("USDT".into()),
         }
     }
 }
@@ -70,6 +73,13 @@ pub struct BybitClient {
     public_limiter: Option<RateLimiter>,
     private_limiter: Option<RateLimiter>,
     exchange: ExchangeId,
+}
+
+/// Execution record enriched with the originating `exec_id`.
+#[derive(Clone, Debug)]
+pub struct BybitExecution {
+    pub fill: Fill,
+    pub exec_id: Option<String>,
 }
 
 impl BybitClient {
@@ -241,14 +251,24 @@ impl BybitClient {
             .map_err(|err| BrokerError::Other(format!("failed to create signing key: {err}")))?;
         mac.update(payload.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
-        let mut request = self.http.request(
-            method.clone(),
-            if query_string.is_empty() {
-                self.url(path)
+        let url = if query_string.is_empty() {
+            self.url(path)
+        } else {
+            format!("{}?{}", self.url(path), query_string)
+        };
+        trace!(
+            method = %method,
+            path = %path,
+            url = %url,
+            query = %query_string,
+            body = ?if method == Method::GET {
+                serde_json::Value::Null
             } else {
-                format!("{}?{}", self.url(path), query_string)
+                body.clone()
             },
+            "sending Bybit signed request"
         );
+        let mut request = self.http.request(method.clone(), url);
         request = request
             .header("X-BAPI-API-KEY", &creds.api_key)
             .header("X-BAPI-TIMESTAMP", timestamp.to_string())
@@ -258,15 +278,29 @@ impl BybitClient {
         if method != Method::GET {
             request = request.json(&body);
         }
-        let resp = request
+        let response = request
             .send()
             .await
-            .map_err(|err| BrokerError::Transport(err.to_string()))?
-            .json::<ApiResponse<T>>()
+            .map_err(|err| BrokerError::Transport(err.to_string()))?;
+        let status = response.status();
+        let text = response
+            .text()
             .await
             .map_err(|err| BrokerError::Serialization(err.to_string()))?;
-        self.ensure_success(&resp)?;
-        Ok(resp)
+        trace!(
+            path = %path,
+            status = %status,
+            body = %preview_json(&text),
+            "received response from Bybit"
+        );
+        let parsed = serde_json::from_str::<ApiResponse<T>>(&text).map_err(|err| {
+            BrokerError::Serialization(format!(
+                "failed to decode Bybit response: {err}; body={}",
+                preview_json(&text)
+            ))
+        })?;
+        self.ensure_success(&parsed)?;
+        Ok(parsed)
     }
 
     fn map_time_in_force(tif: Option<TimeInForce>) -> &'static str {
@@ -316,71 +350,90 @@ impl BybitClient {
     pub async fn list_executions_since(
         &self,
         since: chrono::DateTime<chrono::Utc>,
-    ) -> BrokerResult<Vec<Fill>> {
-        let mut cursor: Option<String> = None;
-        let mut out: Vec<Fill> = Vec::new();
-        let start_ms = since.timestamp_millis();
+    ) -> BrokerResult<Vec<BybitExecution>> {
+        let mut out: Vec<BybitExecution> = Vec::new();
+        let mut chunk_start = since.timestamp_millis();
         let end_ms = chrono::Utc::now().timestamp_millis();
+        let min_start = end_ms.saturating_sub(EXECUTION_MAX_WINDOW_MS);
+        if chunk_start < min_start {
+            warn!(
+                requested_start = chunk_start,
+                clamped_start = min_start,
+                "Bybit execution history limited to 7 days; clamping startTime"
+            );
+            chunk_start = min_start;
+        }
 
-        loop {
-            let mut query = vec![
-                ("category".to_string(), self.config.category.clone()),
-                ("limit".to_string(), "100".to_string()),
-                ("startTime".to_string(), start_ms.to_string()),
-                ("endTime".to_string(), end_ms.to_string()),
-            ];
-            if let Some(ref cur) = cursor {
-                query.push(("cursor".to_string(), cur.clone()));
-            }
-            let resp: ApiResponse<ExecutionListResult> = self
-                .signed_request(Method::GET, "/v5/execution/list", Value::Null, Some(query))
-                .await?;
+        while chunk_start < end_ms {
+            let chunk_end = (chunk_start + EXECUTION_MAX_WINDOW_MS - 1).min(end_ms);
+            let mut cursor: Option<String> = None;
 
-            for item in resp.result.list.into_iter() {
-                // Filter only entries with non-zero quantity
-                if item.exec_qty.is_empty() {
+            loop {
+                let mut query = vec![
+                    ("category".to_string(), self.config.category.clone()),
+                    ("limit".to_string(), "100".to_string()),
+                    ("startTime".to_string(), chunk_start.to_string()),
+                    ("endTime".to_string(), chunk_end.to_string()),
+                ];
+                if let Some(ref cur) = cursor {
+                    query.push(("cursor".to_string(), cur.clone()));
+                }
+                let resp: ApiResponse<ExecutionListResult> = self
+                    .signed_request(Method::GET, "/v5/execution/list", Value::Null, Some(query))
+                    .await?;
+
+                for item in resp.result.list.into_iter() {
+                    // Filter only entries with non-zero quantity
+                    if item.exec_qty.is_empty() {
+                        continue;
+                    }
+                    let exec_qty: Decimal = item.exec_qty.parse().unwrap_or(Decimal::ZERO);
+                    if exec_qty.is_zero() {
+                        continue;
+                    }
+                    let price: Decimal = item.exec_price.parse().unwrap_or(Decimal::ZERO);
+                    let fee: Option<Decimal> = if item.exec_fee.is_empty() {
+                        None
+                    } else {
+                        item.exec_fee.parse::<Decimal>().ok()
+                    };
+                    let ts = millis_to_datetime(&item.exec_time);
+                    let side = match item.side.as_str() {
+                        "Buy" => Side::Buy,
+                        _ => Side::Sell,
+                    };
+                    let fee_asset = item
+                        .fee_currency
+                        .as_deref()
+                        .filter(|code| !code.is_empty())
+                        .map(|code| self.parse_asset(code));
+                    out.push(BybitExecution {
+                        fill: Fill {
+                            order_id: item.order_id,
+                            symbol: self.parse_symbol(&item.symbol),
+                            side,
+                            fill_price: price,
+                            fill_quantity: exec_qty,
+                            fee,
+                            fee_asset,
+                            timestamp: ts,
+                        },
+                        exec_id: Some(item.exec_id.clone()),
+                    });
+                }
+
+                if let Some(c) = resp.result.next_page_cursor {
+                    if c.is_empty() {
+                        break;
+                    }
+                    cursor = Some(c);
                     continue;
                 }
-                let exec_qty: Decimal = item.exec_qty.parse().unwrap_or(Decimal::ZERO);
-                if exec_qty.is_zero() {
-                    continue;
-                }
-                let price: Decimal = item.exec_price.parse().unwrap_or(Decimal::ZERO);
-                let fee: Option<Decimal> = if item.exec_fee.is_empty() {
-                    None
-                } else {
-                    item.exec_fee.parse::<Decimal>().ok()
-                };
-                let ts = millis_to_datetime(&item.exec_time);
-                let side = match item.side.as_str() {
-                    "Buy" => Side::Buy,
-                    _ => Side::Sell,
-                };
-                let fee_asset = item
-                    .fee_currency
-                    .as_deref()
-                    .filter(|code| !code.is_empty())
-                    .map(|code| self.parse_asset(code));
-                out.push(Fill {
-                    order_id: item.order_id,
-                    symbol: self.parse_symbol(&item.symbol),
-                    side,
-                    fill_price: price,
-                    fill_quantity: exec_qty,
-                    fee,
-                    fee_asset,
-                    timestamp: ts,
-                });
-            }
 
-            if let Some(c) = resp.result.next_page_cursor {
-                if c.is_empty() {
-                    break;
-                }
-                cursor = Some(c);
-            } else {
                 break;
             }
+
+            chunk_start = chunk_end.saturating_add(1);
         }
 
         Ok(out)
@@ -583,7 +636,16 @@ impl ExecutionClient for BybitClient {
     }
 
     async fn positions(&self) -> BrokerResult<Vec<Position>> {
-        let query = vec![("category".to_string(), self.config.category.clone())];
+        let mut query = vec![("category".to_string(), self.config.category.clone())];
+        if let Some(coin) = self
+            .config
+            .settle_coin
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            query.push(("settleCoin".to_string(), coin.to_string()));
+        }
         let resp: ApiResponse<PositionListResult> = self
             .signed_request(Method::GET, "/v5/position/list", Value::Null, Some(query))
             .await?;
@@ -658,6 +720,15 @@ fn map_instrument_kind(contract_type: Option<&str>, category: &str) -> Instrumen
             _ => InstrumentKind::LinearPerpetual,
         },
     }
+}
+
+fn preview_json(body: &str) -> String {
+    const MAX_CHARS: usize = 2048;
+    if body.chars().count() <= MAX_CHARS {
+        return body.to_string();
+    }
+    let truncated: String = body.chars().take(MAX_CHARS).collect();
+    format!("{truncated}… <{} chars total>", body.chars().count())
 }
 
 pub(crate) fn millis_to_datetime(value: &str) -> chrono::DateTime<Utc> {
@@ -802,6 +873,8 @@ struct ExecutionListResult {
 
 #[derive(Deserialize)]
 struct ExecutionListItem {
+    #[serde(rename = "execId")]
+    exec_id: String,
     symbol: String,
     #[serde(rename = "orderId")]
     order_id: String,
@@ -834,6 +907,8 @@ struct BybitConnectorConfig {
     api_secret: String,
     #[serde(default = "default_recv_window")]
     recv_window: u64,
+    #[serde(default = "default_settle_coin")]
+    settle_coin: Option<String>,
     #[serde(default = "default_rate_limit_tier")]
     rate_limit_tier: RateLimitTier,
     #[serde(default)]
@@ -868,6 +943,10 @@ fn resolve_exchange_id(cfg: &BybitConnectorConfig) -> ExchangeId {
 
 fn default_recv_window() -> u64 {
     5_000
+}
+
+fn default_settle_coin() -> Option<String> {
+    Some("USDT".into())
 }
 
 fn default_rate_limit_tier() -> RateLimitTier {
@@ -953,6 +1032,7 @@ impl ConnectorFactory for BybitFactory {
             ws_url: Some(cfg.ws_url.clone()),
             public_quota,
             private_quota,
+            settle_coin: cfg.settle_coin.clone(),
         };
         Ok(Arc::new(BybitClient::new(
             bybit_cfg,

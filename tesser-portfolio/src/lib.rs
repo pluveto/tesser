@@ -683,6 +683,14 @@ pub struct PortfolioState {
     pub sub_accounts: HashMap<ExchangeId, SubAccountState>,
 }
 
+/// Tracks the last known execution timestamp and corresponding identifiers.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ExecutionCheckpoint {
+    pub last_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub exec_ids: Vec<String>,
+}
+
 /// Durable snapshot of the live trading runtime persisted on disk.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LiveState {
@@ -691,6 +699,8 @@ pub struct LiveState {
     pub last_prices: HashMap<Symbol, Price>,
     pub last_candle_ts: Option<DateTime<Utc>>,
     pub strategy_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub execution_checkpoint: ExecutionCheckpoint,
 }
 
 /// Abstraction over state persistence backends.

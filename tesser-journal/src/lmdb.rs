@@ -228,6 +228,7 @@ mod tests {
             last_prices: HashMap::new(),
             last_candle_ts: None,
             strategy_state: None,
+            execution_checkpoint: Default::default(),
         }
     }
 

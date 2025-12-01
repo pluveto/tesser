@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use hyper::body::Body;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Request, Response, StatusCode};
@@ -72,6 +73,9 @@ pub struct LiveMetrics {
     connection_status: GaugeVec,
     last_data_timestamp: Gauge,
     checksum_mismatches: IntCounterVec,
+    execution_timestamp: Gauge,
+    execution_events: IntCounterVec,
+    execution_backfills: IntCounter,
 }
 
 impl LiveMetrics {
@@ -143,6 +147,24 @@ impl LiveMetrics {
             &["reason"],
         )
         .unwrap();
+        let execution_timestamp = Gauge::new(
+            "tesser_last_execution_timestamp_seconds",
+            "Unix timestamp of the most recent execution observed",
+        )
+        .unwrap();
+        let execution_events = IntCounterVec::new(
+            prometheus::Opts::new(
+                "tesser_execution_events_total",
+                "Count of execution events by source (ws/rest)",
+            ),
+            &["source"],
+        )
+        .unwrap();
+        let execution_backfills = IntCounter::new(
+            "tesser_execution_backfills_total",
+            "Total number of executions recovered via REST catch-up",
+        )
+        .unwrap();
 
         registry.register(Box::new(ticks_total.clone())).unwrap();
         registry.register(Box::new(candles_total.clone())).unwrap();
@@ -171,6 +193,15 @@ impl LiveMetrics {
         registry
             .register(Box::new(router_failures.clone()))
             .unwrap();
+        registry
+            .register(Box::new(execution_timestamp.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(execution_events.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(execution_backfills.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -189,6 +220,9 @@ impl LiveMetrics {
             checksum_mismatches,
             panic_closes,
             router_failures,
+            execution_timestamp,
+            execution_events,
+            execution_backfills,
         }
     }
 
@@ -222,6 +256,15 @@ impl LiveMetrics {
 
     pub fn inc_router_failure(&self, reason: &str) {
         self.router_failures.with_label_values(&[reason]).inc();
+    }
+
+    pub fn record_execution_event(&self, source: &str, timestamp: DateTime<Utc>) {
+        self.execution_events.with_label_values(&[source]).inc();
+        self.execution_timestamp.set(timestamp.timestamp() as f64);
+    }
+
+    pub fn inc_execution_backfills(&self, count: u64) {
+        self.execution_backfills.inc_by(count);
     }
 
     pub fn update_equity(&self, equity: f64) {
