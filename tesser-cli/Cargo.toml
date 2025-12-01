@@ -31,24 +31,25 @@ hyper.workspace = true
 tracing-appender.workspace = true
 csv.workspace = true
 async-trait.workspace = true
-tesser-backtester = { version = "0.9.1", path = "../tesser-backtester" }
-tesser-config = { version = "0.9.1", path = "../tesser-config" }
-tesser-core = { version = "0.9.1", path = "../tesser-core" }
-tesser-data = { version = "0.9.1", path = "../tesser-data" }
-tesser-events = { version = "0.9.1", path = "../tesser-events" }
-tesser-execution = { version = "0.9.1", path = "../tesser-execution" }
-tesser-portfolio = { version = "0.9.1", path = "../tesser-portfolio" }
-tesser-markets = { version = "0.9.1", path = "../tesser-markets" }
-tesser-strategy = { version = "0.9.1", path = "../tesser-strategy" }
-tesser-broker = { version = "0.9.1", path = "../tesser-broker" }
-tesser-paper = { version = "0.9.1", path = "../connectors/tesser-paper" }
-tesser-journal = { version = "0.9.1", path = "../tesser-journal" }
-tesser-bybit = { version = "0.9.1", path = "../connectors/tesser-bybit", optional = true }
-tesser-binance = { version = "0.9.1", path = "../connectors/tesser-binance", optional = true }
+tesser-backtester = { version = "0.9.2", path = "../tesser-backtester" }
+tesser-config = { version = "0.9.2", path = "../tesser-config" }
+tesser-core = { version = "0.9.2", path = "../tesser-core" }
+tesser-data = { version = "0.9.2", path = "../tesser-data" }
+tesser-events = { version = "0.9.2", path = "../tesser-events" }
+tesser-execution = { version = "0.9.2", path = "../tesser-execution" }
+tesser-portfolio = { version = "0.9.2", path = "../tesser-portfolio" }
+tesser-ledger = { version = "0.9.2", path = "../tesser-ledger" }
+tesser-markets = { version = "0.9.2", path = "../tesser-markets" }
+tesser-strategy = { version = "0.9.2", path = "../tesser-strategy" }
+tesser-broker = { version = "0.9.2", path = "../tesser-broker" }
+tesser-paper = { version = "0.9.2", path = "../connectors/tesser-paper" }
+tesser-journal = { version = "0.9.2", path = "../tesser-journal" }
+tesser-bybit = { version = "0.9.2", path = "../connectors/tesser-bybit", optional = true }
+tesser-binance = { version = "0.9.2", path = "../connectors/tesser-binance", optional = true }
 rust_decimal.workspace = true
 arrow.workspace = true
 parquet.workspace = true
-tesser-rpc = { version = "0.8.1", path = "../tesser-rpc" }
+tesser-rpc = { version = "0.8.2", path = "../tesser-rpc" }
 tonic = { version = "0.11", features = ["transport"] }
 prost-types = "0.12"
 tokio-stream.workspace = true
@@ -57,6 +58,6 @@ crossterm = { version = "0.27", features = ["event-stream"] }
 uuid.workspace = true
 
 [dev-dependencies]
-tesser-test-utils = { version = "0.9.1", path = "../tesser-test-utils" }
+tesser-test-utils = { version = "0.9.2", path = "../tesser-test-utils" }
 tempfile = "3.10"
 assert_cmd = "2.0"

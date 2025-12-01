@@ -7,6 +7,24 @@ description: Build custom execution algorithms in WebAssembly and load them with
 
 `ExecutionHint::Plugin` lets a strategy delegate its order lifecycle to a WebAssembly module. The runtime keeps persistence, panic handling, and risk checks in Rust, but loads the execution logic dynamically, so teams can iterate on proprietary algos without recompiling `tesser-cli`.
 
+## Architecture at a glance
+
+- **Host responsibilities** – Order orchestration, capital tracking, reconciliation, and crash-safe state management remain in Rust. The orchestrator also owns rate limits and risk guards so every child order emitted by a plugin is still validated centrally.
+- **Plugin responsibilities** – Compute whether/when to place, amend, or finish child orders for a specific signal. Plugins see a slice of the strategy context (signal metadata + risk snapshot) and react to ticks, fills, and timer heartbeats.
+- **ABI** – The [`tesser-wasm`](../../../tesser-wasm/README.md) crate defines the shared types (`PluginSignal`, `PluginRiskContext`, `PluginResult`, …) and provides the `ExecutionPlugin` trait behind the `guest` feature. Each plugin compiles into a WASI module that exports the callbacks generated via `wit-bindgen`.
+
+### Callback lifecycle
+
+| Callback | When it's invoked | Typical uses |
+| --- | --- | --- |
+| `init(ctx)` | After the module is loaded and just before the first action | Deserialize custom params, seed state from the signal/risk context, swap into warm-up mode. |
+| `on_tick(tick)` | Whenever the orchestrator forwards a market data tick relevant to this signal | Reprice child orders, recalculate remaining quantity, update trailing anchors. |
+| `on_fill(fill)` | After a child order fills | Reconcile remaining target quantity, adjust inventory risk models, trigger completion thresholds. |
+| `on_timer()` | Periodic heartbeat (configurable in the host) | Drip slices for TWAP-like behavior, kick off retries if no ticks arrive, enforce timeouts. |
+| `snapshot()` / `restore(state)` | Host persistence boundary | Keep lightweight JSON describing your internal state so restarts are seamless. |
+
+Each callback returns a `PluginResult` that can accumulate one or more `PluginChildOrderRequest`s and optional log lines that will surface under the `plugin` tracing target.
+
 ## Author a Plugin
 
 1. **Scaffold a crate**:
@@ -98,7 +116,7 @@ description: Build custom execution algorithms in WebAssembly and load them with
 3. **Attach the hint** when emitting a signal:
    ```rust
    use serde_json::json;
-   use tesser_core::{ExecutionHint, Signal};
+   use tesser_core::{ExecutionHint, Signal, SignalKind};
 
    let signal = Signal::new(symbol, SignalKind::EnterLong, 0.7).with_hint(
        ExecutionHint::Plugin {
@@ -113,9 +131,11 @@ The orchestrator persists plugin state just like TWAP/VWAP. If the process resta
 
 ## Diagnostics & Best Practices
 
-- **Logging** – return strings in `PluginResult.logs` to surface structured messages in the host logs (`target=plugin`).
-- **State size** – keep snapshot payloads small (JSON is stored in SQLite/Lmdb alongside other algos).
-- **Validation** – keep risk-sensitive checks in Rust. Plugins should assume their child orders still run through the standard pre-trade filters.
-- **Versioning** – ship new modules alongside existing ones and switch strategies to the new `name` when you are ready; the engine caches compiled components, so hot swaps are fast.
+- **Logging** – return strings in `PluginResult.logs` to surface structured messages in the host logs (`target=plugin`). Include enough context (symbol, slice size, etc.) to make post-mortems useful.
+- **State discipline** – keep `snapshot` payloads compact and deterministic; they are stored in SQLite/Lmdb next to other execution algos. Validate your `restore` path with malformed payloads during testing to ensure graceful failure.
+- **Validation** – keep fat-finger and compliance checks in Rust. Plugins should treat order creation as a request; the orchestrator still enforces the central risk policy.
+- **Versioning** – ship new modules alongside existing ones and switch strategies to the new `name` when you are ready; the engine caches compiled components, so hot swaps are fast. For long-running sessions, drop in the new module, update the signal hint, and let the orchestrator spin up the new logic alongside the existing one.
+- **Local iteration** – instantiate your plugin via `tesser_wasm::guest::PluginRuntime` in unit tests to replay JSON fixtures, or use the `examples/plugin-chase` crate as a template for integration tests.
+- **Distribution** – store the compiled WASM artifacts in an internal registry or artifact bucket and deploy them with the same rigor as other production binaries. Track the `params` schema per module revision to keep change management clear.
 
-With these pieces in place you can iterate on execution logic without touching the monorepo or interrupting a live session.
+With these pieces in place you can iterate on execution logic without touching the monorepo or interrupting a live session. See [`tesser-wasm/README.md`](../../../tesser-wasm/README.md) or the public docs at [tesser.space](https://www.tesser.space/docs/03-strategy-lab/execution-plugins) for additional reference material.

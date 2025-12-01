@@ -1,0 +1,26 @@
+[package]
+name = "tesser-ledger"
+version = "0.9.2"
+edition = "2021"
+authors = ["Tesser Contributors <dev@tesser.local>"]
+license = "MIT OR Apache-2.0"
+description = "Ledger primitives for Tesser accounting"
+repository = "https://github.com/tesserspace/tesser"
+readme = "README.md"
+
+[dependencies]
+arrow = { workspace = true }
+chrono = { workspace = true }
+parking_lot = "0.12"
+parquet = { workspace = true }
+rusqlite = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tesser-core = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+rust_decimal_macros = "1.35"

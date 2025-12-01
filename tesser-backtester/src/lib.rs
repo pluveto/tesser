@@ -20,6 +20,7 @@ use tesser_core::{
 };
 use tesser_data::merger::{UnifiedEvent, UnifiedEventKind};
 use tesser_execution::{ExecutionEngine, RiskContext};
+use tesser_ledger::{entries_from_fill, FillLedgerContext};
 use tesser_markets::MarketRegistry;
 use tesser_paper::{MatchingEngine, PaperExecutionClient};
 use tesser_portfolio::{Portfolio, PortfolioConfig};
@@ -565,9 +566,22 @@ impl Backtester {
     }
 
     async fn record_fill(&mut self, fill: &Fill, all_fills: &mut Vec<Fill>) -> anyhow::Result<()> {
-        self.portfolio
-            .apply_fill(fill)
+        let impact = self
+            .portfolio
+            .apply_fill_positions(fill)
             .context("failed to update portfolio with fill")?;
+        let instrument = self
+            .market_registry
+            .get(fill.symbol)
+            .ok_or_else(|| anyhow!("unknown instrument {}", fill.symbol))?;
+        let entries = entries_from_fill(FillLedgerContext::new(
+            fill,
+            &instrument,
+            impact.realized_pnl,
+        ));
+        self.portfolio
+            .apply_ledger_entries(&entries)
+            .context("failed to update portfolio ledger")?;
         all_fills.push(fill.clone());
         self.strategy_ctx
             .update_positions(self.portfolio.positions());

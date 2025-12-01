@@ -15,6 +15,7 @@ use futures::StreamExt;
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -62,10 +63,15 @@ use tesser_execution::{
     SqliteAlgoStateRepository, StoredAlgoState, WasmPluginEngine,
 };
 use tesser_journal::LmdbJournal;
+use tesser_ledger::{
+    entries_from_fill, FillLedgerContext, LedgerEntry, LedgerRepository, LedgerSequencer,
+    SqliteLedgerRepository,
+};
 use tesser_markets::{InstrumentCatalog, MarketRegistry};
 use tesser_paper::{FeeScheduleConfig, PaperExecutionClient, PaperFactory};
 use tesser_portfolio::{
-    LiveState, Portfolio, PortfolioConfig, PortfolioState, SqliteStateRepository, StateRepository,
+    ExecutionCheckpoint, LiveState, Portfolio, PortfolioConfig, PortfolioState,
+    SqliteStateRepository, StateRepository,
 };
 use tesser_strategy::{
     PairTradeSnapshot, PairsTradingArbitrage, Strategy, StrategyContext, StrategyError,
@@ -82,6 +88,66 @@ use crate::PublicChannel;
 pub enum BrokerEvent {
     OrderUpdate(Order),
     Fill(Fill),
+}
+
+#[derive(Clone)]
+struct ExecutionTracker {
+    inner: Arc<tokio::sync::Mutex<ExecutionCheckpoint>>,
+}
+
+impl ExecutionTracker {
+    fn new(initial: ExecutionCheckpoint) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(initial)),
+        }
+    }
+
+    async fn record_if_new(&self, exec_id: Option<&str>, timestamp: DateTime<Utc>) -> bool {
+        let mut state = self.inner.lock().await;
+        match state.last_timestamp {
+            Some(prev) if timestamp < prev => false,
+            Some(prev) if timestamp > prev => {
+                state.last_timestamp = Some(timestamp);
+                state.exec_ids.clear();
+                if let Some(id) = exec_id {
+                    state.exec_ids.push(id.to_string());
+                }
+                true
+            }
+            Some(_) => {
+                if let Some(id) = exec_id {
+                    if state.exec_ids.iter().any(|existing| existing == id) {
+                        return false;
+                    }
+                    state.exec_ids.push(id.to_string());
+                }
+                true
+            }
+            None => {
+                state.last_timestamp = Some(timestamp);
+                if let Some(id) = exec_id {
+                    state.exec_ids.push(id.to_string());
+                }
+                true
+            }
+        }
+    }
+
+    async fn snapshot(&self) -> ExecutionCheckpoint {
+        self.inner.lock().await.clone()
+    }
+
+    async fn replay_start(&self, fallback: DateTime<Utc>) -> DateTime<Utc> {
+        let state = self.inner.lock().await;
+        state
+            .last_timestamp
+            .map(|ts| ts - chrono::Duration::seconds(1))
+            .unwrap_or(fallback)
+    }
+
+    async fn last_timestamp(&self) -> Option<DateTime<Utc>> {
+        self.inner.lock().await.last_timestamp
+    }
 }
 
 #[derive(Clone)]
@@ -332,6 +398,9 @@ pub const fn default_order_book_depth() -> usize {
 }
 const STRATEGY_CALL_WARN_THRESHOLD: Duration = Duration::from_millis(250);
 const MARKET_EVENT_TIMEOUT: Duration = Duration::from_millis(10);
+const EXECUTION_GAP_THRESHOLD_SECS: i64 = 120;
+const EXECUTION_BACKFILL_INTERVAL_SECS: u64 = 60;
+const EXECUTION_FALLBACK_LOOKBACK_MINS: i64 = 30;
 
 #[async_trait::async_trait]
 trait LiveMarketStream: Send {
@@ -505,11 +574,20 @@ impl PersistenceSettings {
     fn algo_repo_path(&self) -> &PathBuf {
         &self.algo_path
     }
+
+    fn ledger_path(&self) -> PathBuf {
+        match self.engine {
+            PersistenceEngine::Sqlite => self.state_path.clone(),
+            PersistenceEngine::Lmdb => self.state_path.join("ledger.db"),
+        }
+    }
 }
 
 struct PersistenceHandles {
     state: Arc<dyn StateRepository<Snapshot = LiveState>>,
     algo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
+    ledger: Arc<dyn LedgerRepository>,
+    ledger_seq: Arc<LedgerSequencer>,
 }
 
 #[derive(Clone)]
@@ -579,9 +657,19 @@ fn build_persistence_handles(settings: &LiveSessionSettings) -> Result<Persisten
             let algo_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>> = Arc::new(
                 SqliteAlgoStateRepository::new(settings.persistence.algo_repo_path())?,
             );
+            let ledger_repo: Arc<dyn LedgerRepository> = Arc::new(
+                SqliteLedgerRepository::new(settings.persistence.ledger_path())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
+            let ledger_seq = Arc::new(
+                LedgerSequencer::bootstrap(ledger_repo.as_ref())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
             Ok(PersistenceHandles {
                 state: state_repo,
                 algo: algo_repo,
+                ledger: ledger_repo,
+                ledger_seq,
             })
         }
         PersistenceEngine::Lmdb => {
@@ -590,9 +678,19 @@ fn build_persistence_handles(settings: &LiveSessionSettings) -> Result<Persisten
                 Arc::new(journal.state_repo());
             let algo_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>> =
                 Arc::new(journal.algo_repo());
+            let ledger_repo: Arc<dyn LedgerRepository> = Arc::new(
+                SqliteLedgerRepository::new(settings.persistence.ledger_path())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
+            let ledger_seq = Arc::new(
+                LedgerSequencer::bootstrap(ledger_repo.as_ref())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
             Ok(PersistenceHandles {
                 state: state_repo,
                 algo: algo_repo,
+                ledger: ledger_repo,
+                ledger_seq,
             })
         }
     }
@@ -746,7 +844,9 @@ pub async fn run_live_with_shutdown(
         routes,
         router.clone(),
         orchestrator,
-        persistence.state,
+        persistence.state.clone(),
+        persistence.ledger.clone(),
+        persistence.ledger_seq.clone(),
         settings,
         metrics,
         alerts,
@@ -894,7 +994,7 @@ struct LiveRuntime {
     _oms_handle: OmsHandle,
     _orchestrator: Arc<OrderOrchestrator>,
     #[allow(dead_code)]
-    last_private_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
+    execution_tracker: Arc<ExecutionTracker>,
     _public_connection: Arc<AtomicBool>,
     _private_connection: Option<Arc<AtomicBool>>,
 }
@@ -915,6 +1015,8 @@ impl LiveRuntime {
         router: Option<Arc<RouterExecutionClient>>,
         orchestrator: OrderOrchestrator,
         state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
+        ledger_repo: Arc<dyn LedgerRepository>,
+        ledger_seq: Arc<LedgerSequencer>,
         settings: LiveSessionSettings,
         metrics: Arc<LiveMetrics>,
         alerts: Arc<AlertManager>,
@@ -1001,7 +1103,9 @@ impl LiveRuntime {
         }
         let metrics_task = spawn_metrics_server(metrics.registry(), settings.metrics_addr);
         let (private_event_tx, private_event_rx) = mpsc::channel(1024);
-        let last_private_sync = Arc::new(tokio::sync::Mutex::new(persisted.last_candle_ts));
+        let execution_tracker = Arc::new(ExecutionTracker::new(
+            persisted.execution_checkpoint.clone(),
+        ));
         let alert_task = alerts.spawn_watchdog();
         let mut connection_monitors = Vec::new();
         connection_monitors.push(spawn_connection_monitor(
@@ -1043,9 +1147,10 @@ impl LiveRuntime {
                                 private_event_tx.clone(),
                                 route.execution.clone(),
                                 symbols.clone(),
-                                last_private_sync.clone(),
+                                execution_tracker.clone(),
                                 private_connection.clone(),
                                 metrics.clone(),
+                                alerts.clone(),
                                 router_handle.clone(),
                                 shutdown.clone(),
                             );
@@ -1202,7 +1307,10 @@ impl LiveRuntime {
             strategy_handle.clone(),
             market_registry.clone(),
             settings.exec_backend,
+            ledger_repo,
+            ledger_seq,
             shutdown.clone(),
+            execution_tracker.clone(),
         );
         for symbol in &symbols {
             let ctx = shared_risk_context(
@@ -1258,7 +1366,7 @@ impl LiveRuntime {
             _strategy_handle: strategy_handle,
             _oms_handle: oms_handle,
             _orchestrator: orchestrator,
-            last_private_sync,
+            execution_tracker,
             _public_connection: public_connection,
             _private_connection: private_connection,
         })
@@ -1946,7 +2054,10 @@ struct OmsActor {
     strategy: StrategyHandle,
     market_registry: Arc<MarketRegistry>,
     exec_backend: ExecutionBackend,
+    ledger_repo: Arc<dyn LedgerRepository>,
+    ledger_seq: Arc<LedgerSequencer>,
     shutdown: ShutdownSignal,
+    execution_tracker: Arc<ExecutionTracker>,
 }
 
 impl OmsActor {
@@ -1968,7 +2079,10 @@ impl OmsActor {
         strategy: StrategyHandle,
         market_registry: Arc<MarketRegistry>,
         exec_backend: ExecutionBackend,
+        ledger_repo: Arc<dyn LedgerRepository>,
+        ledger_seq: Arc<LedgerSequencer>,
         shutdown: ShutdownSignal,
+        execution_tracker: Arc<ExecutionTracker>,
     ) -> Self {
         Self {
             market_rx,
@@ -1987,7 +2101,10 @@ impl OmsActor {
             strategy,
             market_registry,
             exec_backend,
+            ledger_repo,
+            ledger_seq,
             shutdown,
+            execution_tracker,
         }
     }
 
@@ -2122,24 +2239,42 @@ impl OmsActor {
 
     async fn handle_fill(&mut self, fill: Fill) -> Result<()> {
         let was_liquidate_only = self.portfolio.liquidate_only();
+        let instrument = self
+            .market_registry
+            .get(fill.symbol)
+            .ok_or_else(|| anyhow!("unknown instrument {}", fill.symbol))?
+            .clone();
+        let impact = self
+            .portfolio
+            .apply_fill_positions(&fill)
+            .with_context(|| format!("failed to update positions for {}", fill.symbol))?;
+        let mut ledger_entries = entries_from_fill(FillLedgerContext::new(
+            &fill,
+            &instrument,
+            impact.realized_pnl,
+        ));
+        for entry in &mut ledger_entries {
+            entry.sequence = self.ledger_seq.next();
+        }
         self.portfolio
-            .apply_fill(&fill)
-            .with_context(|| format!("Failed to apply fill to portfolio for {}", fill.symbol))?;
+            .apply_ledger_entries(&ledger_entries)
+            .context("failed to update portfolio balances from ledger entries")?;
+        self.persist_ledger_entries(ledger_entries).await;
         self.snapshot_portfolio();
-        if let Some(instr) = self.market_registry.get(fill.symbol) {
+        {
             let base_balance = self
                 .portfolio
-                .balance(instr.base)
+                .balance(instrument.base)
                 .map(|cash| cash.quantity)
                 .unwrap_or_default();
             let quote_balance = self
                 .portfolio
-                .balance(instr.quote)
+                .balance(instrument.quote)
                 .map(|cash| cash.quantity)
                 .unwrap_or_default();
             let settlement_balance = self
                 .portfolio
-                .balance(instr.settlement_currency)
+                .balance(instrument.settlement_currency)
                 .map(|cash| cash.quantity)
                 .unwrap_or_default();
             debug!(
@@ -2252,7 +2387,22 @@ impl OmsActor {
                 snapshot.strategy_state = Some(state);
             }
         }
+        snapshot.execution_checkpoint = self.execution_tracker.snapshot().await;
         self.persistence.save(snapshot).await;
+    }
+
+    async fn persist_ledger_entries(&self, entries: Vec<LedgerEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let repo = self.ledger_repo.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || repo.append_batch(&entries))
+            .await
+            .map_err(|err| anyhow!("ledger persistence task failed: {err}"))
+            .and_then(|result| result.map_err(|e| anyhow!(e.to_string())))
+        {
+            warn!(error = %err, "failed to persist ledger entries");
+        }
     }
 
     fn snapshot_portfolio(&mut self) {
@@ -2683,9 +2833,10 @@ fn spawn_bybit_private_stream(
     private_tx: mpsc::Sender<BrokerEvent>,
     exec_client: Arc<dyn ExecutionClient>,
     symbols: Vec<Symbol>,
-    last_sync: Arc<tokio::sync::Mutex<Option<DateTime<Utc>>>>,
+    execution_tracker: Arc<ExecutionTracker>,
     private_connection_flag: Option<Arc<AtomicBool>>,
     metrics: Arc<LiveMetrics>,
+    alerts: Arc<AlertManager>,
     router: Option<Arc<RouterExecutionClient>>,
     shutdown: ShutdownSignal,
 ) {
@@ -2714,6 +2865,7 @@ fn spawn_bybit_private_stream(
                     }
                     metrics.update_connection_status("private", true);
                     info!("Connected to Bybit private WebSocket stream");
+                    let mut gap_alerted = false;
                     for symbol in &venue_symbols {
                         match exec_client.list_open_orders(*symbol).await {
                             Ok(orders) => {
@@ -2737,118 +2889,211 @@ fn spawn_bybit_private_stream(
                         }
                     }
                     if let Some(bybit) = exec_client.as_any().downcast_ref::<BybitClient>() {
-                        let since = {
-                            let guard = last_sync.lock().await;
-                            let raw_since =
-                                guard.unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(30));
-                            if Utc::now() - raw_since > chrono::Duration::days(7) {
-                                Utc::now() - chrono::Duration::minutes(30)
-                            } else {
-                                raw_since
-                            }
-                        };
-                        match bybit.list_executions_since(since).await {
-                            Ok(fills) => {
-                                for mut fill in fills {
-                                    if let Some(router) = &router {
-                                        match router.normalize_fill_event(exchange_id, fill) {
-                                            Some(normalized) => fill = normalized,
-                                            None => {
-                                                metrics.inc_router_failure("orphan_fill");
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await
-                                    {
-                                        error!("failed to send reconciled fill: {err}");
+                        match replay_bybit_executions(
+                            bybit,
+                            &execution_tracker,
+                            &metrics,
+                            router.as_ref(),
+                            &private_tx,
+                            exchange_id,
+                        )
+                        .await
+                        {
+                            Ok(count) => {
+                                if count > 0 {
+                                    metrics.inc_execution_backfills(count as u64);
+                                    info!(count, "replayed executions via REST after reconnect");
+                                    if gap_alerted {
+                                        gap_alerted = false;
+                                        alerts
+                                            .notify(
+                                                "Execution feed restored",
+                                                "Bybit REST replay filled the execution gap after reconnect",
+                                            )
+                                            .await;
                                     }
                                 }
                             }
                             Err(e) => {
-                                error!("failed to reconcile executions since {:?}: {}", since, e);
+                                alerts
+                                    .notify(
+                                        "Execution replay failed",
+                                        &format!(
+                                            "Failed to reconcile executions after reconnect: {e}"
+                                        ),
+                                    )
+                                    .await;
+                                error!("failed to reconcile executions after reconnect: {e}");
                             }
                         }
-                        let mut guard = last_sync.lock().await;
-                        *guard = Some(Utc::now());
                     }
 
-                    while let Some(msg) = socket.next().await {
-                        if shutdown.triggered() {
-                            break;
-                        }
-                        if let Ok(Message::Text(text)) = msg {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
-                                    match topic {
-                                        "order" => {
-                                            if let Ok(msg) = serde_json::from_value::<
-                                                PrivateMessage<BybitWsOrder>,
-                                            >(
-                                                value.clone()
-                                            ) {
-                                                for update in msg.data {
-                                                    if let Ok(mut order) =
-                                                        update.to_tesser_order(exchange_id, None)
-                                                    {
-                                                        if let Some(router) = &router {
-                                                            order = router.normalize_order_event(
-                                                                exchange_id,
-                                                                order,
-                                                            );
-                                                        }
-                                                        if let Err(err) = private_tx
-                                                            .send(BrokerEvent::OrderUpdate(order))
-                                                            .await
-                                                        {
-                                                            error!(
-                                                                "failed to send private order update: {err}"
-                                                            );
-                                                        }
+                    let mut backfill_timer = tokio::time::interval(Duration::from_secs(
+                        EXECUTION_BACKFILL_INTERVAL_SECS,
+                    ));
+                    backfill_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.wait() => break,
+                            _ = backfill_timer.tick() => {
+                                if let Some(bybit) = exec_client.as_any().downcast_ref::<BybitClient>() {
+                                    let now = Utc::now();
+                                    let (stale, gap_secs) = match execution_tracker.last_timestamp().await {
+                                        Some(last) => {
+                                            let diff = now - last;
+                                            (diff.num_seconds() >= EXECUTION_GAP_THRESHOLD_SECS, diff.num_seconds())
+                                        }
+                                        None => (false, 0),
+                                    };
+                                    if stale {
+                                        warn!(
+                                            gap_seconds = gap_secs,
+                                            "no executions observed recently; triggering REST catch-up"
+                                        );
+                                        if !gap_alerted {
+                                            gap_alerted = true;
+                                            alerts
+                                                .notify(
+                                                    "Execution data gap",
+                                                    &format!(
+                                                        "No Bybit executions received for {gap_secs} seconds; attempting REST catch-up"
+                                                    ),
+                                                )
+                                                .await;
+                                        }
+                                        match replay_bybit_executions(
+                                            bybit,
+                                            &execution_tracker,
+                                            &metrics,
+                                            router.as_ref(),
+                                            &private_tx,
+                                            exchange_id,
+                                        ).await {
+                                            Ok(count) => {
+                                                if count > 0 {
+                                                    metrics.inc_execution_backfills(count as u64);
+                                                    info!(count, "REST replay recovered executions during gap");
+                                                    if gap_alerted {
+                                                        gap_alerted = false;
+                                                        alerts
+                                                            .notify(
+                                                                "Execution feed restored",
+                                                                &format!("REST replay recovered {count} execution(s); feed back in sync"),
+                                                            )
+                                                            .await;
                                                     }
                                                 }
                                             }
+                                            Err(err) => {
+                                                alerts
+                                                    .notify(
+                                                        "Execution catch-up failed",
+                                                        &format!("Execution gap catch-up failed: {err}"),
+                                                    )
+                                                    .await;
+                                                error!("execution gap catch-up failed: {err}");
+                                            }
                                         }
-                                        "execution" => {
-                                            if let Ok(msg) = serde_json::from_value::<
-                                                PrivateMessage<BybitWsExecution>,
-                                            >(
-                                                value.clone()
-                                            ) {
-                                                for exec in msg.data {
-                                                    if let Ok(mut fill) =
-                                                        exec.to_tesser_fill(exchange_id)
-                                                    {
-                                                        if let Some(router) = &router {
-                                                            match router.normalize_fill_event(
-                                                                exchange_id,
-                                                                fill,
-                                                            ) {
-                                                                Some(normalized) => {
-                                                                    fill = normalized
-                                                                }
-                                                                None => {
-                                                                    metrics.inc_router_failure(
-                                                                        "orphan_fill",
-                                                                    );
-                                                                    continue;
+                                    }
+                                }
+                            }
+                            msg = socket.next() => {
+                                match msg {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
+                                                match topic {
+                                                    "order" => {
+                                                        if let Ok(msg) = serde_json::from_value::<
+                                                            PrivateMessage<BybitWsOrder>,
+                                                        >(value.clone()) {
+                                                            for update in msg.data {
+                                                                if let Ok(mut order) =
+                                                                    update.to_tesser_order(exchange_id, None)
+                                                                {
+                                                                    if let Some(router) = &router {
+                                                                        order = router.normalize_order_event(
+                                                                            exchange_id,
+                                                                            order,
+                                                                        );
+                                                                    }
+                                                                    if let Err(err) = private_tx
+                                                                        .send(BrokerEvent::OrderUpdate(order))
+                                                                        .await
+                                                                    {
+                                                                        error!(
+                                                                            "failed to send private order update: {err}"
+                                                                        );
+                                                                    }
                                                                 }
                                                             }
                                                         }
-                                                        if let Err(err) = private_tx
-                                                            .send(BrokerEvent::Fill(fill))
-                                                            .await
-                                                        {
-                                                            error!(
-                                                                "failed to send private fill event: {err}"
-                                                            );
+                                                    }
+                                                    "execution" => {
+                                                        if let Ok(msg) = serde_json::from_value::<
+                                                            PrivateMessage<BybitWsExecution>,
+                                                        >(value.clone()) {
+                                                            for exec in msg.data {
+                                                                if let Ok(mut fill) =
+                                                                    exec.to_tesser_fill(exchange_id)
+                                                                {
+                                                                    if !execution_tracker
+                                                                        .record_if_new(
+                                                                            Some(&exec.exec_id),
+                                                                            fill.timestamp,
+                                                                        )
+                                                                        .await
+                                                                    {
+                                                                        continue;
+                                                                    }
+                                                                    if let Some(router) = &router {
+                                                                        match router.normalize_fill_event(
+                                                                            exchange_id,
+                                                                            fill,
+                                                                        ) {
+                                                                            Some(normalized) => fill = normalized,
+                                                                            None => {
+                                                                                metrics.inc_router_failure(
+                                                                                    "orphan_fill",
+                                                                                );
+                                                                                continue;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    if gap_alerted {
+                                                                        gap_alerted = false;
+                                                                        alerts
+                                                                            .notify(
+                                                                                "Execution feed restored",
+                                                                                "Bybit execution feed resumed via websocket",
+                                                                            )
+                                                                            .await;
+                                                                    }
+                                                                    metrics.record_execution_event("ws", fill.timestamp);
+                                                                    if let Err(err) = private_tx
+                                                                        .send(BrokerEvent::Fill(fill))
+                                                                        .await
+                                                                    {
+                                                                        error!(
+                                                                            "failed to send private fill event: {err}"
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
+                                                    _ => {}
                                                 }
                                             }
                                         }
-                                        _ => {}
                                     }
+                                    Some(Ok(_)) => {}
+                                    Some(Err(err)) => {
+                                        error!("error from Bybit private stream: {err}");
+                                        break;
+                                    }
+                                    None => break,
                                 }
                             }
                         }
@@ -2868,6 +3113,46 @@ fn spawn_bybit_private_stream(
             }
         }
     });
+}
+
+#[cfg(feature = "bybit")]
+async fn replay_bybit_executions(
+    bybit: &BybitClient,
+    execution_tracker: &ExecutionTracker,
+    metrics: &Arc<LiveMetrics>,
+    router: Option<&Arc<RouterExecutionClient>>,
+    private_tx: &mpsc::Sender<BrokerEvent>,
+    exchange_id: ExchangeId,
+) -> BrokerResult<usize> {
+    let fallback = Utc::now() - chrono::Duration::minutes(EXECUTION_FALLBACK_LOOKBACK_MINS);
+    let since = execution_tracker.replay_start(fallback).await;
+    let mut applied = 0usize;
+    let records = bybit.list_executions_since(since).await?;
+    for record in records {
+        if !execution_tracker
+            .record_if_new(record.exec_id.as_deref(), record.fill.timestamp)
+            .await
+        {
+            continue;
+        }
+        let mut fill = record.fill;
+        if let Some(router) = router {
+            match router.normalize_fill_event(exchange_id, fill) {
+                Some(normalized) => fill = normalized,
+                None => {
+                    metrics.inc_router_failure("orphan_fill");
+                    continue;
+                }
+            }
+        }
+        metrics.record_execution_event("rest", fill.timestamp);
+        if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await {
+            error!("failed to send reconciled fill: {err}");
+            continue;
+        }
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 #[cfg(feature = "binance")]

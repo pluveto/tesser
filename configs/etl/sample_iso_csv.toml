@@ -1,0 +1,14 @@
+[csv]
+delimiter = ","
+has_header = true
+
+[fields]
+# Source columns: symbol,timestamp,open,high,low,close,volume
+timestamp = { col = 1, format = "rfc3339" }
+open = { col = 2 }
+high = { col = 3 }
+low = { col = 4 }
+close = { col = 5 }
+volume = { col = 6 }
+
+interval = "1m"

@@ -1,10 +1,11 @@
 [package]
 name = "tesser-rpc"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 description = "gRPC interface for external Tesser strategies"
+readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
@@ -15,10 +16,10 @@ prost-types = "0.12"
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tesser-core = { version = "0.9.1", path = "../tesser-core" }
-tesser-strategy = { version = "0.9.1", path = "../tesser-strategy" }
-tesser-strategy-macros = { version = "0.9.1", path = "../tesser-strategy-macros" }
-tesser-portfolio = { version = "0.9.1", path = "../tesser-portfolio" }
+tesser-core = { version = "0.9.2", path = "../tesser-core" }
+tesser-strategy = { version = "0.9.2", path = "../tesser-strategy" }
+tesser-strategy-macros = { version = "0.9.2", path = "../tesser-strategy-macros" }
+tesser-portfolio = { version = "0.9.2", path = "../tesser-portfolio" }
 thiserror.workspace = true
 tokio.workspace = true
 tonic = "0.11"

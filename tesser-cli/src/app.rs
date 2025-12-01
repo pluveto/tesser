@@ -45,6 +45,9 @@ use tesser_data::analytics::ExecutionAnalysisRequest;
 use tesser_data::download::{
     BinanceDownloader, BybitDownloader, KlineRequest, NormalizedTrade, TradeRequest, TradeSource,
 };
+use tesser_data::etl::{
+    MappingConfig as EtlMappingConfig, Partitioning as EtlPartitioning, Pipeline as EtlPipeline,
+};
 use tesser_data::io::{self, DatasetFormat as IoDatasetFormat, TicksWriter};
 use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
@@ -120,6 +123,8 @@ pub enum DataCommand {
     Resample(DataResampleArgs),
     /// Inspect a parquet file emitted by the flight recorder
     InspectParquet(DataInspectParquetArgs),
+    /// Normalize raw data into the canonical schema
+    Normalize(DataNormalizeArgs),
 }
 
 #[derive(Subcommand)]
@@ -211,6 +216,34 @@ pub struct DataDownloadTradesArgs {
     /// Binance public archive market (spot/futures)
     #[arg(long, value_enum, default_value_t = BinanceMarketArg::FuturesUm)]
     binance_market: BinanceMarketArg,
+}
+
+#[derive(Args)]
+pub struct DataNormalizeArgs {
+    /// Glob pointing at the raw input files (e.g. ./raw/binance/*.csv)
+    #[arg(long)]
+    pub source: String,
+    /// Output directory for canonical parquet partitions
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Path to the mapping configuration TOML file
+    #[arg(long)]
+    pub config: PathBuf,
+    /// Symbol identifier recorded in the canonical set (e.g. binance:BTCUSDT)
+    #[arg(long)]
+    pub symbol: String,
+    /// Partitioning strategy (daily or monthly)
+    #[arg(long, value_enum, default_value = "daily")]
+    pub partition: DataPartitionArg,
+    /// Override the canonical interval label defined in the mapping config
+    #[arg(long)]
+    pub interval: Option<String>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum DataPartitionArg {
+    Daily,
+    Monthly,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -617,6 +650,36 @@ impl DataDownloadTradesArgs {
     }
 }
 
+impl DataNormalizeArgs {
+    fn run(&self) -> Result<()> {
+        let raw = fs::read_to_string(&self.config)
+            .with_context(|| format!("failed to read {}", self.config.display()))?;
+        let mut mapping: EtlMappingConfig = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse mapping config {}", self.config.display()))?;
+        if let Some(interval) = &self.interval {
+            mapping.interval = interval.clone();
+        }
+        let pipeline = EtlPipeline::new(mapping);
+        let rows = pipeline.run(
+            &self.source,
+            &self.output,
+            &self.symbol,
+            self.partition.into(),
+        )?;
+        info!(rows, output = %self.output.display(), "normalized data written");
+        Ok(())
+    }
+}
+
+impl From<DataPartitionArg> for EtlPartitioning {
+    fn from(value: DataPartitionArg) -> Self {
+        match value {
+            DataPartitionArg::Daily => EtlPartitioning::Daily,
+            DataPartitionArg::Monthly => EtlPartitioning::Monthly,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct DataValidateArgs {
     /// One or more CSV files to inspect
@@ -860,7 +923,7 @@ impl From<QueueModelArg> for QueueModel {
 pub struct BacktestRunArgs {
     #[arg(long)]
     strategy_config: PathBuf,
-    /// One or more CSV files with historical candles (symbol,timestamp,...)
+    /// One or more canonical parquet files produced via `tesser-cli data normalize`
     #[arg(long = "data", value_name = "PATH", num_args = 0.., action = clap::ArgAction::Append)]
     data_paths: Vec<PathBuf>,
     #[arg(long, default_value_t = 500)]
@@ -908,7 +971,7 @@ pub struct BacktestBatchArgs {
     /// Glob or directory containing strategy config files
     #[arg(long = "config", value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
     config_paths: Vec<PathBuf>,
-    /// Candle CSVs available to every strategy
+    /// Canonical parquet paths available to every strategy
     #[arg(long = "data", value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
     data_paths: Vec<PathBuf>,
     #[arg(long, default_value = "0.01")]
@@ -1187,6 +1250,9 @@ async fn handle_data(cmd: DataCommand, config: &AppConfig) -> Result<()> {
         DataCommand::InspectParquet(args) => {
             args.run()?;
         }
+        DataCommand::Normalize(args) => {
+            args.run()?;
+        }
     }
     Ok(())
 }
@@ -1360,17 +1426,8 @@ impl BacktestRunArgs {
             return Ok(memory_market_stream(symbols[0], generated));
         }
 
-        match detect_data_format(&self.data_paths)? {
-            DataFormat::Csv => {
-                let mut candles = load_candles_from_paths(&self.data_paths)?;
-                if candles.is_empty() {
-                    bail!("no candles loaded from --data paths");
-                }
-                candles.sort_by_key(|c| c.timestamp);
-                Ok(memory_market_stream(symbols[0], candles))
-            }
-            DataFormat::Parquet => Ok(parquet_market_stream(symbols, self.data_paths.clone())),
-        }
+        ensure_parquet_inputs(&self.data_paths)?;
+        Ok(parquet_market_stream(symbols, self.data_paths.clone()))
     }
 
     fn detect_lob_source(&self) -> Result<LobSource> {
@@ -1432,7 +1489,6 @@ impl BacktestBatchArgs {
                 format!("failed to load markets from {}", markets_path.display())
             })?,
         );
-        let data_format = detect_data_format(&self.data_paths)?;
         let mut aggregated = Vec::new();
         let fee_schedule = if let Some(path) = &self.fee_schedule {
             load_fee_schedule_file(path)?
@@ -1444,6 +1500,7 @@ impl BacktestBatchArgs {
         };
         let reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
         let initial_balances = clone_initial_balances(&config.backtest);
+        ensure_parquet_inputs(&self.data_paths)?;
         for config_path in &self.config_paths {
             let contents = std::fs::read_to_string(config_path).with_context(|| {
                 format!("failed to read strategy config {}", config_path.display())
@@ -1458,17 +1515,7 @@ impl BacktestBatchArgs {
             if symbols.is_empty() {
                 bail!("strategy {} did not declare subscriptions", strategy.name());
             }
-            let stream = match data_format {
-                DataFormat::Csv => {
-                    let mut candles = load_candles_from_paths(&self.data_paths)?;
-                    if candles.is_empty() {
-                        bail!("no candles loaded from --data paths");
-                    }
-                    candles.sort_by_key(|c| c.timestamp);
-                    memory_market_stream(symbols[0], candles)
-                }
-                DataFormat::Parquet => parquet_market_stream(&symbols, self.data_paths.clone()),
-            };
+            let stream = parquet_market_stream(&symbols, self.data_paths.clone());
             let execution_client = build_sim_execution_client(
                 &format!("paper-batch-{}", def.name),
                 &symbols,
@@ -1971,34 +2018,23 @@ fn load_candles_from_paths(paths: &[PathBuf]) -> Result<Vec<Candle>> {
     Ok(candles)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DataFormat {
-    Csv,
-    Parquet,
-}
-
-fn detect_data_format(paths: &[PathBuf]) -> Result<DataFormat> {
-    let mut detected: Option<DataFormat> = None;
+fn ensure_parquet_inputs(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        bail!("provide at least one --data path (canonical parquet)");
+    }
     for path in paths {
         let ext = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase())
-            .unwrap_or_else(|| String::from(""));
-        let current = if ext == "parquet" {
-            DataFormat::Parquet
-        } else {
-            DataFormat::Csv
-        };
-        if let Some(existing) = detected {
-            if existing != current {
-                bail!("cannot mix CSV and Parquet inputs in --data");
-            }
-        } else {
-            detected = Some(current);
+            .map(|ext| ext.to_ascii_lowercase());
+        if ext.as_deref() != Some("parquet") {
+            bail!(
+                "{} is not a parquet file; run `tesser-cli data normalize` before backtesting",
+                path.display()
+            );
         }
     }
-    detected.ok_or_else(|| anyhow!("no data paths provided"))
+    Ok(())
 }
 
 fn memory_market_stream(symbol: Symbol, candles: Vec<Candle>) -> BacktestStream {

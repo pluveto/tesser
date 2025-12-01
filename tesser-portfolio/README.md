@@ -8,7 +8,7 @@ Portfolio accounting primitives: tracks cash, positions, and realized/unrealized
 - Includes `PortfolioConfig` for setting initial equity and future risk parameters.
 
 ## Typical Usage
-- Backtester and live runtime call `apply_fill` whenever orders settle.
+- Backtester and live runtime call `apply_fill_positions` and then feed the resulting ledger entries through `apply_ledger_entries` whenever orders settle.
 - Strategies can inspect positions through `Portfolio::positions()` via the `StrategyContext`.
 - Live trading snapshots the state with `portfolio.snapshot()` and restores with `Portfolio::from_state`.
 

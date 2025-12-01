@@ -57,6 +57,7 @@ research/.venv/
 *.csv
 !examples/data/*.csv
 *.parquet
+!examples/data/*.parquet
 *.jsonl
 *.db
 *.sqlite
