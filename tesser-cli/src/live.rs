@@ -779,7 +779,7 @@ pub async fn run_live_with_shutdown(
     if matches!(settings.exec_backend, ExecutionBackend::Live) {
         info!("synchronizing portfolio snapshot from exchange");
         let positions = execution_client
-            .positions()
+            .positions(Some(&symbols))
             .await
             .context("failed to fetch remote positions")?;
         let balances = execution_client
@@ -1501,9 +1501,14 @@ fn spawn_reconciliation_loop(
 
 async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()> {
     info!("running state reconciliation");
+    let local_summary = ctx.oms.portfolio_summary().await;
+    let local_positions = local_summary.positions.clone();
+    let local_cash = local_summary.cash;
+    let local_map = positions_to_map(local_positions);
+
     let remote_positions = ctx
         .client
-        .positions()
+        .positions(Some(&local_map.keys().cloned().collect::<Vec<_>>()))
         .await
         .context("failed to fetch remote positions")?;
     let remote_balances = ctx
@@ -1511,12 +1516,8 @@ async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()>
         .account_balances()
         .await
         .context("failed to fetch remote balances")?;
-    let local_summary = ctx.oms.portfolio_summary().await;
-    let local_positions = local_summary.positions.clone();
-    let local_cash = local_summary.cash;
 
     let remote_map = positions_to_map(remote_positions);
-    let local_map = positions_to_map(local_positions);
     let mut tracked_symbols: HashSet<Symbol> = HashSet::new();
     tracked_symbols.extend(remote_map.keys().cloned());
     tracked_symbols.extend(local_map.keys().cloned());

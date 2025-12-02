@@ -222,10 +222,10 @@ impl ExecutionClient for RouterExecutionClient {
         Ok(balances)
     }
 
-    async fn positions(&self) -> BrokerResult<Vec<Position>> {
+    async fn positions(&self, symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
         let mut positions = Vec::new();
         for client in self.routes.values() {
-            positions.extend(client.positions().await?);
+            positions.extend(client.positions(symbols).await?);
         }
         Ok(positions)
     }
@@ -426,7 +426,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn positions(&self) -> BrokerResult<Vec<Position>> {
+        async fn positions(&self, _symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
             Ok(Vec::new())
         }
 

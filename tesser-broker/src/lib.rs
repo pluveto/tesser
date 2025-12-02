@@ -123,7 +123,7 @@ pub trait ExecutionClient: Send + Sync {
     async fn account_balances(&self) -> BrokerResult<Vec<AccountBalance>>;
 
     /// Retrieve the current open positions.
-    async fn positions(&self) -> BrokerResult<Vec<Position>>;
+    async fn positions(&self, symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>>;
 
     /// Retrieve instrument metadata for the provided market category.
     async fn list_instruments(&self, category: &str) -> BrokerResult<Vec<Instrument>>;

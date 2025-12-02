@@ -267,7 +267,10 @@ impl ExecutionClient for FailingClient {
         Ok(Vec::new())
     }
 
-    async fn positions(&self) -> Result<Vec<tesser_core::Position>, BrokerError> {
+    async fn positions(
+        &self,
+        _symbol: Option<&Vec<Symbol>>,
+    ) -> Result<Vec<tesser_core::Position>, BrokerError> {
         Ok(Vec::new())
     }
 

@@ -635,42 +635,43 @@ impl ExecutionClient for BybitClient {
         Ok(balances)
     }
 
-    async fn positions(&self) -> BrokerResult<Vec<Position>> {
-        let mut query = vec![("category".to_string(), self.config.category.clone())];
-        if let Some(coin) = self
-            .config
-            .settle_coin
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            query.push(("settleCoin".to_string(), coin.to_string()));
+    async fn positions(&self, symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
+        if self.config.category == "linear" && symbols.is_none() {
+            return Err(BrokerError::InvalidRequest(
+                "Bybit linear positions require symbols".into(),
+            ));
         }
-        let resp: ApiResponse<PositionListResult> = self
-            .signed_request(Method::GET, "/v5/position/list", Value::Null, Some(query))
-            .await?;
+
         let mut positions = Vec::new();
-        for item in resp.result.list {
-            let quantity: Decimal = item
-                .size
-                .parse()
-                .map_err(|err| BrokerError::from_display(err, BrokerErrorKind::Serialization))?;
-            if quantity.is_zero() {
-                continue;
+        for symbol in symbols.unwrap_or(&vec![]) {
+            let query = vec![
+                ("category".to_string(), self.config.category.clone()),
+                ("symbol".to_string(), Self::symbol_code(*symbol).to_string()),
+            ];
+            let resp: ApiResponse<PositionListResult> = self
+                .signed_request(Method::GET, "/v5/position/list", Value::Null, Some(query))
+                .await?;
+            for item in resp.result.list {
+                let quantity: Decimal = item.size.parse().map_err(|err| {
+                    BrokerError::from_display(err, BrokerErrorKind::Serialization)
+                })?;
+                if quantity.is_zero() {
+                    continue;
+                }
+                let entry_price = item.avg_price.parse().ok();
+                positions.push(Position {
+                    symbol: self.parse_symbol(&item.symbol),
+                    side: match item.side.as_str() {
+                        "Buy" => Some(Side::Buy),
+                        "Sell" => Some(Side::Sell),
+                        _ => None,
+                    },
+                    quantity,
+                    entry_price,
+                    unrealized_pnl: item.unrealised_pnl.parse().unwrap_or(Decimal::ZERO),
+                    updated_at: millis_to_datetime(&item.updated_time),
+                });
             }
-            let entry_price = item.avg_price.parse().ok();
-            positions.push(Position {
-                symbol: self.parse_symbol(&item.symbol),
-                side: match item.side.as_str() {
-                    "Buy" => Some(Side::Buy),
-                    "Sell" => Some(Side::Sell),
-                    _ => None,
-                },
-                quantity,
-                entry_price,
-                unrealized_pnl: item.unrealised_pnl.parse().unwrap_or(Decimal::ZERO),
-                updated_at: millis_to_datetime(&item.updated_time),
-            });
         }
         Ok(positions)
     }

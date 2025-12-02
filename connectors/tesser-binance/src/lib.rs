@@ -349,7 +349,7 @@ impl ExecutionClient for BinanceClient {
             .collect())
     }
 
-    async fn positions(&self) -> BrokerResult<Vec<Position>> {
+    async fn positions(&self, _symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
         self.throttle_weight(QUERY_WEIGHT).await?;
         let params = rest_api::PositionInformationV2Params::builder()
             .recv_window(Some(self.config.recv_window as i64))

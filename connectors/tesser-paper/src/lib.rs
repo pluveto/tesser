@@ -809,7 +809,7 @@ impl ExecutionClient for MatchingEngine {
         Ok(self.balances.lock().await.clone())
     }
 
-    async fn positions(&self) -> BrokerResult<Vec<Position>> {
+    async fn positions(&self, _symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
         let positions = self.positions.lock().await;
         Ok(positions.values().cloned().collect())
     }
@@ -1676,7 +1676,7 @@ impl ExecutionClient for PaperExecutionClient {
         Ok(self.balances.lock().await.clone())
     }
 
-    async fn positions(&self) -> BrokerResult<Vec<Position>> {
+    async fn positions(&self, _symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
         let positions = self.positions.lock().await;
         Ok(positions.values().cloned().collect())
     }
