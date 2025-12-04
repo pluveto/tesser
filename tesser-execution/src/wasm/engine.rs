@@ -5,20 +5,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use tesser_wasm::{PluginSide, PluginTick};
+use tesser_wasm::{
+    host::{ComponentBindings, DecimalValue, WasiSide, WasiTick},
+    PluginSide, PluginTick,
+};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::preview2::{command::sync::add_to_linker, WasiCtx, WasiCtxBuilder, WasiView};
-
-mod bindings {
-    wasmtime::component::bindgen!({
-        world: "execution-plugin",
-        path: "../tesser-wasm/wit",
-    });
-}
-
-use bindings::tesser::execution::primitives::{DecimalValue, Side as WasiSide, Tick as WasiTick};
-use bindings::ExecutionPlugin as ComponentBindings;
 
 /// Runtime responsible for loading, caching, and instantiating WASM plugins.
 #[derive(Clone)]
