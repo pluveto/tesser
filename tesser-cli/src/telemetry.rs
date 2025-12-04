@@ -76,6 +76,7 @@ pub struct LiveMetrics {
     execution_timestamp: Gauge,
     execution_events: IntCounterVec,
     execution_backfills: IntCounter,
+    reconciliation_actions: IntCounterVec,
 }
 
 impl LiveMetrics {
@@ -165,6 +166,14 @@ impl LiveMetrics {
             "Total number of executions recovered via REST catch-up",
         )
         .unwrap();
+        let reconciliation_actions = IntCounterVec::new(
+            prometheus::Opts::new(
+                "tesser_reconciliation_actions_total",
+                "Count of reconciliation actions grouped by action kind",
+            ),
+            &["action"],
+        )
+        .unwrap();
 
         registry.register(Box::new(ticks_total.clone())).unwrap();
         registry.register(Box::new(candles_total.clone())).unwrap();
@@ -202,6 +211,9 @@ impl LiveMetrics {
         registry
             .register(Box::new(execution_backfills.clone()))
             .unwrap();
+        registry
+            .register(Box::new(reconciliation_actions.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -223,6 +235,7 @@ impl LiveMetrics {
             execution_timestamp,
             execution_events,
             execution_backfills,
+            reconciliation_actions,
         }
     }
 
@@ -306,6 +319,12 @@ impl LiveMetrics {
 
     pub fn update_last_data_timestamp(&self, timestamp_secs: f64) {
         self.last_data_timestamp.set(timestamp_secs);
+    }
+
+    pub fn inc_reconciliation_action(&self, action: &str, count: u64) {
+        self.reconciliation_actions
+            .with_label_values(&[action])
+            .inc_by(count);
     }
 }
 

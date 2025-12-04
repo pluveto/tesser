@@ -247,6 +247,10 @@ pub struct OmsHandle {
 }
 
 impl OmsHandle {
+    pub(crate) fn new(tx: mpsc::Sender<OmsRequest>) -> Self {
+        Self { tx }
+    }
+
     pub async fn portfolio_state(&self) -> Option<PortfolioState> {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -294,6 +298,21 @@ impl OmsHandle {
             .await;
         let _ = rx.await;
     }
+
+    pub async fn apply_fills(&self, fills: Vec<Fill>) {
+        if fills.is_empty() {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(OmsRequest::ApplyFills {
+                fills,
+                respond_to: tx,
+            })
+            .await;
+        let _ = rx.await;
+    }
 }
 
 #[derive(Default, Clone)]
@@ -302,7 +321,7 @@ pub struct OmsStatus {
     pub liquidate_only: bool,
 }
 
-enum OmsRequest {
+pub(crate) enum OmsRequest {
     PortfolioState {
         respond_to: oneshot::Sender<Option<PortfolioState>>,
     },
@@ -317,6 +336,10 @@ enum OmsRequest {
     },
     ApplyOrderUpdates {
         orders: Vec<Order>,
+        respond_to: oneshot::Sender<()>,
+    },
+    ApplyFills {
+        fills: Vec<Fill>,
         respond_to: oneshot::Sender<()>,
     },
 }
@@ -1248,9 +1271,7 @@ impl LiveRuntime {
         let strategy_handle = StrategyHandle {
             tx: strategy_cmd_tx.clone(),
         };
-        let oms_handle = OmsHandle {
-            tx: oms_req_tx.clone(),
-        };
+        let oms_handle = OmsHandle::new(oms_req_tx.clone());
 
         let control_task = control::spawn_control_plane(
             settings.control_addr,
@@ -2388,6 +2409,14 @@ impl OmsActor {
                 for order in orders {
                     if let Err(err) = self.handle_order_update(order).await {
                         warn!(error = %err, "failed to apply reconciliation order update");
+                    }
+                }
+                let _ = respond_to.send(());
+            }
+            OmsRequest::ApplyFills { fills, respond_to } => {
+                for fill in fills {
+                    if let Err(err) = self.handle_fill(fill).await {
+                        warn!(error = %err, "failed to apply reconciliation fill");
                     }
                 }
                 let _ = respond_to.send(());

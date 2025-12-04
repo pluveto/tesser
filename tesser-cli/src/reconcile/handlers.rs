@@ -14,7 +14,7 @@ use super::diff::{BalanceDiscrepancy, PositionDiscrepancy, ReconciliationReport}
 use super::snapshot::{ExchangeSnapshot, LocalSnapshot};
 use super::StateDiffer;
 use tesser_broker::ExecutionClient;
-use tesser_core::{AssetId, Order, OrderStatus};
+use tesser_core::{AssetId, Fill, Order, OrderStatus};
 use tesser_markets::MarketRegistry;
 use tesser_portfolio::{Portfolio, PortfolioConfig, PortfolioState};
 
@@ -154,7 +154,8 @@ impl RuntimeHandler {
         if ghosts.is_empty() {
             return;
         }
-        let mut updates = Vec::new();
+        let mut canceled = Vec::new();
+        let mut filled = Vec::new();
         for order in ghosts {
             warn!(
                 order_id = %order.id,
@@ -162,6 +163,29 @@ impl RuntimeHandler {
                 status = ?order.status,
                 "ghost order detected (missing on exchange)"
             );
+            let fills = match self
+                .client
+                .list_order_fills(&order.id, order.request.symbol)
+                .await
+            {
+                Ok(fills) => fills,
+                Err(err) => {
+                    warn!(
+                        order_id = %order.id,
+                        symbol = %order.request.symbol.code(),
+                        error = %err,
+                        "failed to fetch fills for ghost order"
+                    );
+                    Vec::new()
+                }
+            };
+            if !fills.is_empty() {
+                self.metrics
+                    .inc_reconciliation_action("ghost_filled", fills.len() as u64);
+                self.oms.apply_fills(fills.clone()).await;
+                filled.push(build_filled_update(order, &fills));
+                continue;
+            }
             if matches!(
                 order.status,
                 OrderStatus::Canceled | OrderStatus::Filled | OrderStatus::Rejected
@@ -171,10 +195,17 @@ impl RuntimeHandler {
             let mut synthetic = order.clone();
             synthetic.status = OrderStatus::Canceled;
             synthetic.updated_at = Utc::now();
-            updates.push(synthetic);
+            canceled.push(synthetic);
         }
-        if !updates.is_empty() {
-            self.oms.apply_order_updates(updates).await;
+        if !canceled.is_empty() {
+            self.metrics
+                .inc_reconciliation_action("ghost_canceled", canceled.len() as u64);
+            self.oms.apply_order_updates(canceled).await;
+        }
+        if !filled.is_empty() {
+            self.metrics
+                .inc_reconciliation_action("ghost_updates", filled.len() as u64);
+            self.oms.apply_order_updates(filled).await;
         }
     }
 
@@ -192,6 +223,8 @@ impl RuntimeHandler {
         }
         // Adopt remote state before attempting any cancellations so the OMS is aware of them.
         self.oms.apply_order_updates(zombies.to_vec()).await;
+        self.metrics
+            .inc_reconciliation_action("zombie_adopted", zombies.len() as u64);
         let mut canceled = Vec::new();
         for order in zombies {
             match self
@@ -216,6 +249,8 @@ impl RuntimeHandler {
             }
         }
         if !canceled.is_empty() {
+            self.metrics
+                .inc_reconciliation_action("zombie_canceled", canceled.len() as u64);
             self.oms.apply_order_updates(canceled).await;
         }
     }
@@ -313,13 +348,55 @@ fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
     }
 }
 
+fn build_filled_update(order: &Order, fills: &[Fill]) -> Order {
+    let mut synthetic = order.clone();
+    let total_qty = fills
+        .iter()
+        .fold(Decimal::ZERO, |acc, fill| acc + fill.fill_quantity);
+    if total_qty > Decimal::ZERO {
+        let total_value = fills.iter().fold(Decimal::ZERO, |acc, fill| {
+            acc + fill.fill_price * fill.fill_quantity
+        });
+        synthetic.avg_fill_price = Some(total_value / total_qty);
+    }
+    if let Some(last) = fills.last() {
+        synthetic.updated_at = last.timestamp;
+    } else {
+        synthetic.updated_at = Utc::now();
+    }
+    synthetic.status = OrderStatus::Filled;
+    synthetic.filled_quantity = total_qty;
+    synthetic
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reconcile::snapshot::{ExchangeSnapshot, LocalSnapshot};
+    use crate::{
+        alerts::{AlertDispatcher, AlertManager},
+        live::{OmsHandle, OmsRequest},
+        reconcile::OrderDiff,
+        telemetry::LiveMetrics,
+    };
+    use async_trait::async_trait;
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use tesser_core::{OrderRequest, OrderType, Side, Symbol};
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tesser_broker::{BrokerError, BrokerInfo, BrokerResult};
+    use tesser_config::AlertingConfig;
+    use tesser_core::{
+        AccountBalance, Instrument, OrderId, OrderRequest, OrderType, OrderUpdateRequest, Position,
+        Side, Symbol,
+    };
+    use tokio::sync::{mpsc, Mutex};
+    use tokio::task::JoinHandle;
+    use uuid::Uuid;
 
     fn sample_order(id: &str, symbol: &str) -> Order {
         Order {
@@ -360,5 +437,227 @@ mod tests {
         let outcome = handler.reconcile(local, remote, None);
         assert_eq!(outcome.cancel_orders.len(), 1);
         assert_eq!(outcome.cancel_orders[0].id, "remote");
+    }
+
+    #[tokio::test]
+    async fn runtime_handler_replays_ghost_fills() {
+        let harness = TestOmsHarness::new();
+        let fake_client = Arc::new(FakeExecutionClient::with_fills(HashMap::from([(
+            "ghost-1".to_string(),
+            vec![sample_fill(Side::Buy, 1000, 1)],
+        )])));
+        let handler = runtime_handler_for_tests(harness.handle(), fake_client.clone());
+        let order = sample_order("ghost-1", "BTCUSDT");
+        let report = ReconciliationReport {
+            order_diff: OrderDiff {
+                ghosts: vec![order],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        handler.handle(&report).await.unwrap();
+        {
+            let fills = harness.state.fills.lock().await;
+            assert_eq!(fills.len(), 1);
+        }
+        {
+            let orders = harness.state.orders.lock().await;
+            assert_eq!(orders.len(), 1);
+            assert_eq!(orders[0].status, OrderStatus::Filled);
+        }
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_handler_cancels_zombie_orders() {
+        let harness = TestOmsHarness::new();
+        let fake_client = Arc::new(FakeExecutionClient::default());
+        let handler = runtime_handler_for_tests(harness.handle(), fake_client.clone());
+        let order = sample_order("remote-1", "BTCUSDT");
+        let report = ReconciliationReport {
+            order_diff: OrderDiff {
+                zombies: vec![order.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        handler.handle(&report).await.unwrap();
+        {
+            let orders = harness.state.orders.lock().await;
+            assert!(!orders.is_empty());
+            assert_eq!(orders.last().unwrap().status, OrderStatus::Canceled);
+        }
+        assert_eq!(
+            fake_client.canceled().await,
+            vec![(order.id.clone(), order.request.symbol)]
+        );
+        harness.shutdown().await;
+    }
+
+    fn runtime_handler_for_tests(
+        oms: OmsHandle,
+        client: Arc<FakeExecutionClient>,
+    ) -> RuntimeHandler {
+        let alerts = Arc::new(AlertManager::new(
+            AlertingConfig::default(),
+            AlertDispatcher::new(None),
+            None,
+            None,
+        ));
+        let metrics = Arc::new(LiveMetrics::new());
+        RuntimeHandler::new(RuntimeHandlerConfig {
+            alerts,
+            metrics,
+            oms,
+            reporting_currency: AssetId::from("USDT"),
+            threshold: Decimal::new(1, 3),
+            client,
+        })
+    }
+
+    #[derive(Default)]
+    struct TestOmsState {
+        orders: Mutex<Vec<Order>>,
+        fills: Mutex<Vec<Fill>>,
+        liquidate_only: AtomicBool,
+    }
+
+    struct TestOmsHarness {
+        handle: OmsHandle,
+        state: Arc<TestOmsState>,
+        task: JoinHandle<()>,
+    }
+
+    impl TestOmsHarness {
+        fn new() -> Self {
+            let (tx, mut rx) = mpsc::channel(16);
+            let state = Arc::new(TestOmsState::default());
+            let state_handle = state.clone();
+            let task = tokio::spawn(async move {
+                while let Some(request) = rx.recv().await {
+                    match request {
+                        OmsRequest::ApplyOrderUpdates { orders, respond_to } => {
+                            {
+                                let mut guard = state_handle.orders.lock().await;
+                                guard.extend(orders);
+                            }
+                            let _ = respond_to.send(());
+                        }
+                        OmsRequest::ApplyFills { fills, respond_to } => {
+                            {
+                                let mut guard = state_handle.fills.lock().await;
+                                guard.extend(fills);
+                            }
+                            let _ = respond_to.send(());
+                        }
+                        OmsRequest::EnterLiquidateOnly { respond_to } => {
+                            state_handle.liquidate_only.store(true, Ordering::SeqCst);
+                            let _ = respond_to.send(true);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let handle = OmsHandle::new(tx);
+            Self {
+                handle,
+                state,
+                task,
+            }
+        }
+
+        fn handle(&self) -> OmsHandle {
+            self.handle.clone()
+        }
+
+        async fn shutdown(self) {
+            self.task.abort();
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeExecutionClient {
+        fills: Mutex<HashMap<String, Vec<Fill>>>,
+        canceled: Mutex<Vec<(String, Symbol)>>,
+    }
+
+    impl FakeExecutionClient {
+        fn with_fills(map: HashMap<String, Vec<Fill>>) -> Self {
+            Self {
+                fills: Mutex::new(map),
+                canceled: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn canceled(&self) -> Vec<(String, Symbol)> {
+            self.canceled.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionClient for FakeExecutionClient {
+        fn info(&self) -> BrokerInfo {
+            BrokerInfo {
+                name: "test".into(),
+                markets: vec![],
+                supports_testnet: true,
+            }
+        }
+
+        async fn place_order(&self, _request: OrderRequest) -> BrokerResult<Order> {
+            Err(BrokerError::Other("not implemented".into()))
+        }
+
+        async fn cancel_order(&self, order_id: OrderId, symbol: Symbol) -> BrokerResult<()> {
+            let mut guard = self.canceled.lock().await;
+            guard.push((order_id, symbol));
+            Ok(())
+        }
+
+        async fn amend_order(&self, _request: OrderUpdateRequest) -> BrokerResult<Order> {
+            Err(BrokerError::Other("not implemented".into()))
+        }
+
+        async fn list_open_orders(&self, _symbol: Symbol) -> BrokerResult<Vec<Order>> {
+            Ok(Vec::new())
+        }
+
+        async fn account_balances(&self) -> BrokerResult<Vec<AccountBalance>> {
+            Ok(Vec::new())
+        }
+
+        async fn positions(&self, _symbols: Option<&Vec<Symbol>>) -> BrokerResult<Vec<Position>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_instruments(&self, _category: &str) -> BrokerResult<Vec<Instrument>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_order_fills(
+            &self,
+            order_id: &str,
+            _symbol: Symbol,
+        ) -> BrokerResult<Vec<Fill>> {
+            let guard = self.fills.lock().await;
+            Ok(guard.get(order_id).cloned().unwrap_or_default())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn sample_fill(side: Side, price: i64, qty: i64) -> Fill {
+        Fill {
+            order_id: Uuid::new_v4().to_string(),
+            symbol: Symbol::from("BTCUSDT"),
+            side,
+            fill_price: Decimal::new(price, 0),
+            fill_quantity: Decimal::new(qty, 0),
+            fee: None,
+            fee_asset: None,
+            timestamp: Utc::now(),
+        }
     }
 }
