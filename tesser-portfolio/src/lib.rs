@@ -133,6 +133,7 @@ impl Portfolio {
         balances: Vec<AccountBalance>,
         config: PortfolioConfig,
         registry: Arc<MarketRegistry>,
+        preserve_metrics_from: Option<&PortfolioState>,
     ) -> Self {
         let mut portfolio = Self::new(config, registry);
         portfolio.sub_accounts.clear();
@@ -163,6 +164,9 @@ impl Portfolio {
         portfolio.initial_equity = portfolio.cash_value();
         portfolio.peak_equity = portfolio.initial_equity;
         portfolio.update_drawdown_state();
+        if let Some(state) = preserve_metrics_from {
+            portfolio.peak_equity = cmp::max(state.peak_equity, portfolio.initial_equity);
+        }
         portfolio
     }
 

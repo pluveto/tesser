@@ -80,6 +80,10 @@ use tesser_strategy::{
 
 use crate::alerts::{AlertDispatcher, AlertManager};
 use crate::control;
+use crate::reconcile::{
+    ExchangeSnapshot, LocalSnapshot, RuntimeHandler, RuntimeHandlerConfig, StartupHandler,
+    StartupHandlerConfig, StateDiffer,
+};
 use crate::telemetry::{spawn_metrics_server, LiveMetrics};
 use crate::PublicChannel;
 
@@ -267,15 +271,6 @@ impl OmsHandle {
         rx.await.unwrap_or_default()
     }
 
-    pub(crate) async fn portfolio_summary(&self) -> PortfolioSummary {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .tx
-            .send(OmsRequest::PortfolioSummary { respond_to: tx })
-            .await;
-        rx.await.unwrap_or_default()
-    }
-
     pub async fn enter_liquidate_only(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -292,12 +287,6 @@ pub struct OmsStatus {
     pub liquidate_only: bool,
 }
 
-#[derive(Default, Clone)]
-pub(crate) struct PortfolioSummary {
-    positions: Vec<Position>,
-    cash: Price,
-}
-
 enum OmsRequest {
     PortfolioState {
         respond_to: oneshot::Sender<Option<PortfolioState>>,
@@ -307,9 +296,6 @@ enum OmsRequest {
     },
     Status {
         respond_to: oneshot::Sender<OmsStatus>,
-    },
-    PortfolioSummary {
-        respond_to: oneshot::Sender<PortfolioSummary>,
     },
     EnterLiquidateOnly {
         respond_to: oneshot::Sender<bool>,
@@ -1044,11 +1030,9 @@ impl LiveRuntime {
                 LiveState::default()
             }
         };
-        let mut live_bootstrap = None;
-        if let Some(data) = bootstrap {
-            persisted.open_orders = data.open_orders;
-            live_bootstrap = Some((data.positions, data.balances));
-        } else if matches!(settings.exec_backend, ExecutionBackend::Live) {
+        let remote_snapshot = bootstrap
+            .map(|data| ExchangeSnapshot::new(data.positions, data.balances, data.open_orders));
+        if remote_snapshot.is_none() && matches!(settings.exec_backend, ExecutionBackend::Live) {
             warn!("live session missing bootstrap data; continuing without remote snapshot");
         }
 
@@ -1057,13 +1041,16 @@ impl LiveRuntime {
             reporting_currency: settings.reporting_currency,
             max_drawdown: Some(settings.risk.max_drawdown),
         };
-        let portfolio = if let Some((positions, balances)) = live_bootstrap {
-            Portfolio::from_exchange_state(
-                positions,
-                balances,
-                portfolio_cfg.clone(),
-                market_registry.clone(),
-            )
+        let startup_handler = StartupHandler::new(StartupHandlerConfig {
+            portfolio_config: portfolio_cfg.clone(),
+            market_registry: market_registry.clone(),
+        });
+        let portfolio = if let Some(snapshot) = remote_snapshot {
+            let local_snapshot = LocalSnapshot::from_live_state(&persisted);
+            let report = StateDiffer::diff(local_snapshot, snapshot);
+            let outcome = startup_handler.apply(&report, persisted.portfolio.as_ref());
+            persisted.open_orders = outcome.open_orders.clone();
+            outcome.portfolio
         } else if let Some(snapshot) = persisted.portfolio.take() {
             Portfolio::from_state(snapshot, portfolio_cfg.clone(), market_registry.clone())
         } else {
@@ -1247,6 +1234,7 @@ impl LiveRuntime {
                 metrics: metrics.clone(),
                 reporting_currency: settings.reporting_currency,
                 threshold: settings.reconciliation_threshold,
+                symbols: symbols.clone(),
             }))
         });
         let reconciliation_task = reconciliation_ctx.as_ref().map(|ctx| {
@@ -1443,10 +1431,8 @@ impl LiveRuntime {
 struct ReconciliationContext {
     client: Arc<dyn ExecutionClient>,
     oms: OmsHandle,
-    alerts: Arc<AlertManager>,
-    metrics: Arc<LiveMetrics>,
-    reporting_currency: AssetId,
-    threshold: Decimal,
+    runtime_handler: RuntimeHandler,
+    tracked_symbols: Vec<Symbol>,
 }
 
 struct ReconciliationContextConfig {
@@ -1456,6 +1442,7 @@ struct ReconciliationContextConfig {
     metrics: Arc<LiveMetrics>,
     reporting_currency: AssetId,
     threshold: Decimal,
+    symbols: Vec<Symbol>,
 }
 
 impl ReconciliationContext {
@@ -1467,20 +1454,20 @@ impl ReconciliationContext {
             metrics,
             reporting_currency,
             threshold,
+            symbols,
         } = config;
-        let min_threshold = Decimal::new(1, 6); // 0.000001 as a practical floor
-        let threshold = if threshold <= Decimal::ZERO {
-            min_threshold
-        } else {
-            threshold
-        };
+        let handler = RuntimeHandler::new(RuntimeHandlerConfig {
+            alerts,
+            metrics,
+            oms: oms.clone(),
+            reporting_currency,
+            threshold,
+        });
         Self {
             client,
             oms,
-            alerts,
-            metrics,
-            reporting_currency,
-            threshold,
+            runtime_handler: handler,
+            tracked_symbols: symbols,
         }
     }
 }
@@ -1501,130 +1488,56 @@ fn spawn_reconciliation_loop(
 
 async fn perform_state_reconciliation(ctx: &ReconciliationContext) -> Result<()> {
     info!("running state reconciliation");
-    let local_summary = ctx.oms.portfolio_summary().await;
-    let local_positions = local_summary.positions.clone();
-    let local_cash = local_summary.cash;
-    let local_map = positions_to_map(local_positions);
+    let (portfolio_state, open_orders) =
+        tokio::join!(ctx.oms.portfolio_state(), ctx.oms.open_orders());
+    let local_snapshot = LocalSnapshot::new(portfolio_state, open_orders);
+    let remote_snapshot = fetch_remote_snapshot(ctx, &local_snapshot).await?;
+    let report = StateDiffer::diff(local_snapshot, remote_snapshot);
+    ctx.runtime_handler.handle(&report).await
+}
 
-    let remote_positions = ctx
-        .client
-        .positions(Some(&local_map.keys().cloned().collect::<Vec<_>>()))
-        .await
-        .context("failed to fetch remote positions")?;
+async fn fetch_remote_snapshot(
+    ctx: &ReconciliationContext,
+    local: &LocalSnapshot,
+) -> Result<ExchangeSnapshot> {
+    let mut tracked: HashSet<Symbol> = ctx.tracked_symbols.iter().copied().collect();
+    if let Some(portfolio) = &local.portfolio {
+        tracked.extend(portfolio.positions.keys().copied());
+    }
+    let remote_positions = if tracked.is_empty() {
+        ctx.client
+            .positions(None)
+            .await
+            .context("failed to fetch remote positions")?
+    } else {
+        let symbols: Vec<Symbol> = tracked.into_iter().collect();
+        ctx.client
+            .positions(Some(&symbols))
+            .await
+            .context("failed to fetch remote positions")?
+    };
     let remote_balances = ctx
         .client
         .account_balances()
         .await
         .context("failed to fetch remote balances")?;
-
-    let remote_map = positions_to_map(remote_positions);
-    let mut tracked_symbols: HashSet<Symbol> = HashSet::new();
-    tracked_symbols.extend(remote_map.keys().cloned());
-    tracked_symbols.extend(local_map.keys().cloned());
-
-    let mut severe_findings = Vec::new();
-    for symbol in tracked_symbols {
-        let local_qty = local_map.get(&symbol).copied().unwrap_or(Decimal::ZERO);
-        let remote_qty = remote_map.get(&symbol).copied().unwrap_or(Decimal::ZERO);
-        let diff = (local_qty - remote_qty).abs();
-        let diff_value = diff.to_f64().unwrap_or(0.0);
-        let symbol_name = symbol.code().to_string();
-        ctx.metrics.update_position_diff(&symbol_name, diff_value);
-        if diff > Decimal::ZERO {
-            warn!(
-                symbol = %symbol_name,
-                local = %local_qty,
-                remote = %remote_qty,
-                diff = %diff,
-                "position mismatch detected during reconciliation"
-            );
-            let pct = normalize_diff(diff, remote_qty);
-            if pct >= ctx.threshold {
-                error!(
-                    symbol = %symbol_name,
-                    local = %local_qty,
-                    remote = %remote_qty,
-                    diff = %diff,
-                    pct = %pct,
-                    "position mismatch exceeds threshold"
-                );
-                severe_findings.push(format!(
-                    "{symbol_name} local={local_qty} remote={remote_qty} diff={diff}"
-                ));
-            }
-        }
+    let mut order_symbols: HashSet<Symbol> = ctx.tracked_symbols.iter().copied().collect();
+    order_symbols.extend(local.open_orders.iter().map(|order| order.request.symbol));
+    order_symbols.extend(remote_positions.iter().map(|position| position.symbol));
+    let mut remote_orders = Vec::new();
+    for symbol in order_symbols {
+        let mut symbol_orders = ctx
+            .client
+            .list_open_orders(symbol)
+            .await
+            .with_context(|| format!("failed to fetch open orders for {}", symbol.code()))?;
+        remote_orders.append(&mut symbol_orders);
     }
-
-    let reporting = ctx.reporting_currency;
-    let reporting_label = reporting.to_string();
-    let remote_cash = remote_balances
-        .iter()
-        .find(|balance| balance.asset == reporting)
-        .map(|balance| balance.available)
-        .unwrap_or_else(|| Decimal::ZERO);
-    let cash_diff = (remote_cash - local_cash).abs();
-    ctx.metrics
-        .update_balance_diff(&reporting_label, cash_diff.to_f64().unwrap_or(0.0));
-    if cash_diff > Decimal::ZERO {
-        warn!(
-            currency = %reporting_label,
-            local = %local_cash,
-            remote = %remote_cash,
-            diff = %cash_diff,
-            "balance mismatch detected during reconciliation"
-        );
-        let pct = normalize_diff(cash_diff, remote_cash);
-        if pct >= ctx.threshold {
-            error!(
-                currency = %reporting_label,
-                local = %local_cash,
-                remote = %remote_cash,
-                diff = %cash_diff,
-                pct = %pct,
-                "balance mismatch exceeds threshold"
-            );
-            severe_findings.push(format!(
-                "{reporting_label} balance local={local_cash} remote={remote_cash} diff={cash_diff}"
-            ));
-        }
-    }
-
-    if severe_findings.is_empty() {
-        info!("state reconciliation complete with no critical divergence");
-        return Ok(());
-    }
-
-    let alert_body = severe_findings.join("; ");
-    ctx.alerts
-        .notify("State reconciliation divergence", &alert_body)
-        .await;
-    ctx.oms.enter_liquidate_only().await;
-    Ok(())
-}
-
-fn positions_to_map(positions: Vec<Position>) -> HashMap<Symbol, Decimal> {
-    let mut map = HashMap::new();
-    for position in positions {
-        map.insert(position.symbol, position_signed_qty(&position));
-    }
-    map
-}
-
-fn position_signed_qty(position: &Position) -> Decimal {
-    match position.side {
-        Some(Side::Buy) => position.quantity,
-        Some(Side::Sell) => -position.quantity,
-        None => Decimal::ZERO,
-    }
-}
-
-fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
-    if diff <= Decimal::ZERO {
-        Decimal::ZERO
-    } else {
-        let denominator = std::cmp::max(reference.abs(), Decimal::ONE);
-        diff / denominator
-    }
+    Ok(ExchangeSnapshot::new(
+        remote_positions,
+        remote_balances,
+        remote_orders,
+    ))
 }
 
 fn build_exchange_payload(
@@ -2424,13 +2337,6 @@ impl OmsActor {
                     liquidate_only: self.portfolio.liquidate_only(),
                 };
                 let _ = respond_to.send(status);
-            }
-            OmsRequest::PortfolioSummary { respond_to } => {
-                let summary = PortfolioSummary {
-                    positions: self.portfolio.positions(),
-                    cash: self.portfolio.cash(),
-                };
-                let _ = respond_to.send(summary);
             }
             OmsRequest::EnterLiquidateOnly { respond_to } => {
                 let changed = self.portfolio.set_liquidate_only(true);
