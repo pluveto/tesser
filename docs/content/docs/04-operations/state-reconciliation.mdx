@@ -71,6 +71,19 @@ Because the handler pushes synthetic `OrderUpdate` events through the OMS, the
 orchestrator/strategy pipeline see the same lifecycle they would have received from the
 exchange, keeping algo state, persistence snapshots, and telemetry in sync.
 
+## Configuration
+
+Two CLI flags govern the runtime cadence and sensitivity:
+
+- `--reconciliation-interval <duration>` controls how frequently the runtime poller runs.
+  Values like `30s` are a good default for liquid venues, while cold wallets can stretch
+  to minutes.
+- `--reconciliation-threshold <decimal>` is the percentage (expressed as a decimal fraction)
+  that classifies position/balance differences as severe. For example `0.05` = `5%`.
+
+Both options are exposed via `LiveSessionSettings` (and thus TOML configs) so operators
+can tune them per deployment.
+
 ## Operational Runbook
 
 1. **Startup**
