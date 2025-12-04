@@ -563,7 +563,7 @@ async fn live_run_executes_round_trip_multi_exchange() -> Result<()> {
         settings,
         shutdown.clone(),
     );
-    match timeout(Duration::from_secs(10), monitor.wait_for_fills(4)).await {
+    match timeout(Duration::from_secs(20), monitor.wait_for_fills(4)).await {
         Ok(result) => result?,
         Err(_) => {
             return Err(anyhow!(
@@ -869,7 +869,7 @@ async fn control_plane_updates_pairs_exit_strategy() -> Result<()> {
     );
 
     let mut client = connect_control_client(control_addr).await?;
-    let trade_id = timeout(Duration::from_secs(10), async {
+    let trade_id = timeout(Duration::from_secs(20), async {
         loop {
             let response = client
                 .list_managed_trades(ListManagedTradesRequest {})

@@ -4,6 +4,7 @@
     "backtesting",
     "live-trading",
     "risk-management",
+    "state-reconciliation",
     "data-engineering"
   ]
 }

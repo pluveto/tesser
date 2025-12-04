@@ -133,6 +133,7 @@ impl Portfolio {
         balances: Vec<AccountBalance>,
         config: PortfolioConfig,
         registry: Arc<MarketRegistry>,
+        preserve_metrics_from: Option<&PortfolioState>,
     ) -> Self {
         let mut portfolio = Self::new(config, registry);
         portfolio.sub_accounts.clear();
@@ -163,6 +164,9 @@ impl Portfolio {
         portfolio.initial_equity = portfolio.cash_value();
         portfolio.peak_equity = portfolio.initial_equity;
         portfolio.update_drawdown_state();
+        if let Some(state) = preserve_metrics_from {
+            portfolio.peak_equity = cmp::max(state.peak_equity, portfolio.initial_equity);
+        }
         portfolio
     }
 
@@ -805,7 +809,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::sync::Arc;
-    use tesser_core::{Instrument, InstrumentKind, Side, Symbol};
+    use tesser_core::{AssetId, ExchangeId, Instrument, InstrumentKind, Side, Symbol};
     use tesser_ledger::{entries_from_fill, FillLedgerContext};
 
     fn sample_fill(side: Side, price: Price, qty: Quantity) -> Fill {
@@ -858,6 +862,37 @@ mod tests {
             .update_market_data(buy.symbol, Decimal::ZERO)
             .unwrap();
         assert!(portfolio.liquidate_only());
+    }
+
+    #[test]
+    fn rebuild_preserves_peak_equity_from_previous_state() {
+        let registry = sample_registry();
+        let preserved = PortfolioState {
+            reporting_currency: AssetId::from("USDT"),
+            initial_equity: Decimal::from(10_000),
+            peak_equity: Decimal::from(25_000),
+            ..PortfolioState::default()
+        };
+        let balances = vec![AccountBalance {
+            exchange: ExchangeId::UNSPECIFIED,
+            asset: AssetId::from("USDT"),
+            total: Decimal::from(10_000),
+            available: Decimal::from(10_000),
+            updated_at: Utc::now(),
+        }];
+        let config = PortfolioConfig {
+            reporting_currency: AssetId::from("USDT"),
+            ..PortfolioConfig::default()
+        };
+        let portfolio = Portfolio::from_exchange_state(
+            Vec::new(),
+            balances,
+            config,
+            registry,
+            Some(&preserved),
+        );
+        let snapshot = portfolio.snapshot();
+        assert_eq!(snapshot.peak_equity, Decimal::from(25_000));
     }
 
     fn apply_with_ledger(portfolio: &mut Portfolio, fill: &Fill) {

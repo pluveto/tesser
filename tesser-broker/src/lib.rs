@@ -5,7 +5,7 @@ use std::any::Any;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tesser_core::{
-    AccountBalance, Candle, Instrument, Order, OrderBook, OrderId, OrderRequest,
+    AccountBalance, Candle, Fill, Instrument, Order, OrderBook, OrderId, OrderRequest,
     OrderUpdateRequest, Position, Signal, Symbol, Tick,
 };
 use thiserror::Error;
@@ -127,6 +127,14 @@ pub trait ExecutionClient: Send + Sync {
 
     /// Retrieve instrument metadata for the provided market category.
     async fn list_instruments(&self, category: &str) -> BrokerResult<Vec<Instrument>>;
+
+    /// Retrieve historical fills for an order when the exchange exposes this API.
+    async fn list_order_fills(&self, order_id: &str, symbol: Symbol) -> BrokerResult<Vec<Fill>> {
+        let _ = (order_id, symbol);
+        Err(BrokerError::Other(
+            "order fill queries not implemented by this connector".into(),
+        ))
+    }
 
     /// Helper for downcasting to a concrete type.
     fn as_any(&self) -> &dyn Any;

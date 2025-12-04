@@ -4,6 +4,7 @@ pub mod app;
 pub mod control;
 pub mod data_validation;
 pub mod live;
+pub mod reconcile;
 pub mod state;
 pub mod telemetry;
 pub mod tui;
