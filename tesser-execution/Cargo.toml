@@ -19,7 +19,7 @@ tracing.workspace = true
 tesser-broker = { version = "0.9.2", path = "../tesser-broker" }
 tesser-core = { version = "0.9.2", path = "../tesser-core" }
 tesser-strategy = { version = "0.9.2", path = "../tesser-strategy" }
-tesser-wasm = { path = "../tesser-wasm" }
+tesser-wasm.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
