@@ -1,0 +1,89 @@
+# State Reconciliation
+
+Live trading assumes the RPC/OMS state and the exchange ledger remain aligned.  The
+reconciliation engine is responsible for proving that assumption on startup and during
+runtime drifts.
+
+## Core Differ
+
+`StateDiffer` is a stateless comparator that accepts two snapshots:
+
+- `LocalSnapshot` – cloned from the OMS `LiveState` (portfolio + open orders).
+- `ExchangeSnapshot` – fetched via REST (positions, balances, and open orders).
+
+It produces a `ReconciliationReport` that buckets discrepancies into:
+
+- `PositionDiff`/`BalanceDiff` entries with signed deltas.
+- `OrderDiff` containing:
+  - `matched` pairs (local + remote copy),
+  - `ghosts` (local only), and
+  - `zombies` (remote only).
+
+Because the diff logic is shared, startup and runtime handlers make decisions from the
+same “single source of truth”.
+
+## Startup Handler
+
+`StartupHandler` is invoked exactly once before the actors spin up.  Its job is to build
+a trustworthy baseline:
+
+1. Rebuild the portfolio via `Portfolio::from_exchange_state`, optionally preserving
+   drawdown metrics (`peak_equity`).
+2. Adopt the remote open-order set as the canonical baseline (persisted back into
+   `LiveState`).
+3. Return `StartupOutcome` which includes any zombie orders that should be cancelled
+   immediately.
+
+`live.rs` consumes that outcome before the runtime starts:
+
+```rust
+if !outcome.cancel_orders.is_empty() {
+    let client = orchestrator.execution_engine().client();
+    for order in &outcome.cancel_orders {
+        client.cancel_order(order.id.clone(), order.request.symbol).await?;
+    }
+}
+```
+
+This ensures stale remote orders never make it past boot.
+
+## Runtime Handler
+
+`RuntimeHandler` drives the periodic loop created by `spawn_reconciliation_loop`.
+
+1. Pulls a lightweight `LocalSnapshot` from the OMS handle (`portfolio_state` +
+   `open_orders`).
+2. Builds an `ExchangeSnapshot` via REST (`positions`, `balances`, `list_open_orders`).
+3. Runs the diff and:
+   - Emits metrics/alerts when position or balance deltas exceed the configured
+     threshold.
+   - Automatically drops **ghost** orders from the OMS by synthesizing cancel updates.
+   - Adopts **zombie** orders into the OMS, cancels them through the execution client,
+     and then applies synthetic cancel events once the REST call succeeds.
+   - Escalates to liquidate-only mode if severe divergences are detected.
+
+Because the handler pushes synthetic `OrderUpdate` events through the OMS, the
+orchestrator/strategy pipeline see the same lifecycle they would have received from the
+exchange, keeping algo state, persistence snapshots, and telemetry in sync.
+
+## Operational Runbook
+
+1. **Startup**
+   - Fetch full snapshots (`positions`, `balances`, `open_orders`).
+   - `StartupHandler` rebuilds portfolio + generates cancel list.
+   - Cancel remote zombies before enabling strategies.
+
+2. **Runtime**
+   - Keep the reconciliation loop enabled (default interval is configurable via
+     `--reconciliation-interval`).
+   - Monitor `tesser_reconciliation_*` metrics and alert notifications for drifts.
+   - Investigate repeated ghost/zombie fixes – they normally point to a missing feed
+     (e.g., exchange not emitting fills) or a credential issue.
+
+3. **Recovery**
+   - On restart, the same startup path guarantees state convergence regardless of how
+     the previous process exited.
+
+The end result is a single reconciliation engine with two context-aware handlers,
+eliminating duplicated logic and ensuring deterministic behaviour across crashes,
+restarts, and long-running sessions.

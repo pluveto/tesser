@@ -279,6 +279,21 @@ impl OmsHandle {
             .await;
         rx.await.unwrap_or(false)
     }
+
+    pub async fn apply_order_updates(&self, orders: Vec<Order>) {
+        if orders.is_empty() {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(OmsRequest::ApplyOrderUpdates {
+                orders,
+                respond_to: tx,
+            })
+            .await;
+        let _ = rx.await;
+    }
 }
 
 #[derive(Default, Clone)]
@@ -299,6 +314,10 @@ enum OmsRequest {
     },
     EnterLiquidateOnly {
         respond_to: oneshot::Sender<bool>,
+    },
+    ApplyOrderUpdates {
+        orders: Vec<Order>,
+        respond_to: oneshot::Sender<()>,
     },
 }
 
@@ -1032,6 +1051,7 @@ impl LiveRuntime {
         };
         let remote_snapshot = bootstrap
             .map(|data| ExchangeSnapshot::new(data.positions, data.balances, data.open_orders));
+        let mut startup_cancellations: Vec<Order> = Vec::new();
         if remote_snapshot.is_none() && matches!(settings.exec_backend, ExecutionBackend::Live) {
             warn!("live session missing bootstrap data; continuing without remote snapshot");
         }
@@ -1050,6 +1070,7 @@ impl LiveRuntime {
             let report = StateDiffer::diff(local_snapshot, snapshot);
             let outcome = startup_handler.apply(&report, persisted.portfolio.as_ref());
             persisted.open_orders = outcome.open_orders.clone();
+            startup_cancellations = outcome.cancel_orders.clone();
             outcome.portfolio
         } else if let Some(snapshot) = persisted.portfolio.take() {
             Portfolio::from_state(snapshot, portfolio_cfg.clone(), market_registry.clone())
@@ -1201,6 +1222,22 @@ impl LiveRuntime {
         let last_data_timestamp = Arc::new(AtomicI64::new(0));
         let (persistence_handle, persistence_task) = spawn_persistence_actor(state_repo.clone());
         let orchestrator = Arc::new(orchestrator);
+        if !startup_cancellations.is_empty() {
+            let exec_client = orchestrator.execution_engine().client();
+            for order in &startup_cancellations {
+                if let Err(err) = exec_client
+                    .cancel_order(order.id.clone(), order.request.symbol)
+                    .await
+                {
+                    warn!(
+                        order_id = %order.id,
+                        symbol = %order.request.symbol.code(),
+                        error = %err,
+                        "failed to cancel zombie order during startup reconciliation"
+                    );
+                }
+            }
+        }
 
         let (strategy_market_tx, strategy_market_rx) = mpsc::channel(2048);
         let (oms_market_tx, oms_market_rx) = mpsc::channel(2048);
@@ -1462,6 +1499,7 @@ impl ReconciliationContext {
             oms: oms.clone(),
             reporting_currency,
             threshold,
+            client: client.clone(),
         });
         Self {
             client,
@@ -2345,6 +2383,14 @@ impl OmsActor {
                     self.persist_state(true).await;
                 }
                 let _ = respond_to.send(changed);
+            }
+            OmsRequest::ApplyOrderUpdates { orders, respond_to } => {
+                for order in orders {
+                    if let Err(err) = self.handle_order_update(order).await {
+                        warn!(error = %err, "failed to apply reconciliation order update");
+                    }
+                }
+                let _ = respond_to.send(());
             }
         }
     }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::Utc;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tracing::{error, info, warn};
@@ -12,7 +13,8 @@ use crate::telemetry::LiveMetrics;
 use super::diff::{BalanceDiscrepancy, PositionDiscrepancy, ReconciliationReport};
 use super::snapshot::{ExchangeSnapshot, LocalSnapshot};
 use super::StateDiffer;
-use tesser_core::{AssetId, Order};
+use tesser_broker::ExecutionClient;
+use tesser_core::{AssetId, Order, OrderStatus};
 use tesser_markets::MarketRegistry;
 use tesser_portfolio::{Portfolio, PortfolioConfig, PortfolioState};
 
@@ -24,6 +26,7 @@ pub struct RuntimeHandlerConfig {
     pub oms: OmsHandle,
     pub reporting_currency: AssetId,
     pub threshold: Decimal,
+    pub client: Arc<dyn ExecutionClient>,
 }
 
 /// Applies fine-grained corrections during the live reconciliation loop.
@@ -33,6 +36,7 @@ pub struct RuntimeHandler {
     oms: OmsHandle,
     reporting_currency: AssetId,
     threshold: Decimal,
+    client: Arc<dyn ExecutionClient>,
 }
 
 impl RuntimeHandler {
@@ -47,6 +51,7 @@ impl RuntimeHandler {
             } else {
                 config.threshold
             },
+            client: config.client,
         }
     }
 
@@ -54,7 +59,8 @@ impl RuntimeHandler {
         let mut severe_findings = Vec::new();
         self.handle_positions(&report.position_diff.discrepancies, &mut severe_findings);
         self.handle_balances(&report.balance_diff.discrepancies, &mut severe_findings);
-        self.handle_orders(report);
+        self.resolve_ghost_orders(&report.order_diff.ghosts).await;
+        self.resolve_zombie_orders(&report.order_diff.zombies).await;
 
         if severe_findings.is_empty() {
             info!("state reconciliation complete with no critical divergence");
@@ -144,26 +150,73 @@ impl RuntimeHandler {
         }
     }
 
-    fn handle_orders(&self, report: &ReconciliationReport) {
-        if !report.order_diff.ghosts.is_empty() {
-            for order in &report.order_diff.ghosts {
-                warn!(
-                    order_id = %order.id,
-                    symbol = %order.request.symbol.code(),
-                    status = ?order.status,
-                    "ghost order detected (missing on exchange)"
-                );
+    async fn resolve_ghost_orders(&self, ghosts: &[Order]) {
+        if ghosts.is_empty() {
+            return;
+        }
+        let mut updates = Vec::new();
+        for order in ghosts {
+            warn!(
+                order_id = %order.id,
+                symbol = %order.request.symbol.code(),
+                status = ?order.status,
+                "ghost order detected (missing on exchange)"
+            );
+            if matches!(
+                order.status,
+                OrderStatus::Canceled | OrderStatus::Filled | OrderStatus::Rejected
+            ) {
+                continue;
+            }
+            let mut synthetic = order.clone();
+            synthetic.status = OrderStatus::Canceled;
+            synthetic.updated_at = Utc::now();
+            updates.push(synthetic);
+        }
+        if !updates.is_empty() {
+            self.oms.apply_order_updates(updates).await;
+        }
+    }
+
+    async fn resolve_zombie_orders(&self, zombies: &[Order]) {
+        if zombies.is_empty() {
+            return;
+        }
+        for order in zombies {
+            warn!(
+                order_id = %order.id,
+                symbol = %order.request.symbol.code(),
+                status = ?order.status,
+                "zombie order detected (present on exchange but unknown locally)"
+            );
+        }
+        // Adopt remote state before attempting any cancellations so the OMS is aware of them.
+        self.oms.apply_order_updates(zombies.to_vec()).await;
+        let mut canceled = Vec::new();
+        for order in zombies {
+            match self
+                .client
+                .cancel_order(order.id.clone(), order.request.symbol)
+                .await
+            {
+                Ok(_) => {
+                    let mut update = order.clone();
+                    update.status = OrderStatus::Canceled;
+                    update.updated_at = Utc::now();
+                    canceled.push(update);
+                }
+                Err(err) => {
+                    warn!(
+                        order_id = %order.id,
+                        symbol = %order.request.symbol.code(),
+                        error = %err,
+                        "failed to cancel zombie order during reconciliation"
+                    );
+                }
             }
         }
-        if !report.order_diff.zombies.is_empty() {
-            for order in &report.order_diff.zombies {
-                warn!(
-                    order_id = %order.id,
-                    symbol = %order.request.symbol.code(),
-                    status = ?order.status,
-                    "zombie order detected (present on exchange but unknown locally)"
-                );
-            }
+        if !canceled.is_empty() {
+            self.oms.apply_order_updates(canceled).await;
         }
     }
 }
@@ -239,6 +292,7 @@ impl StartupHandler {
         StartupOutcome {
             portfolio,
             open_orders: report.remote.open_orders.clone(),
+            cancel_orders: report.order_diff.zombies.clone(),
         }
     }
 }
@@ -247,6 +301,7 @@ impl StartupHandler {
 pub struct StartupOutcome {
     pub portfolio: Portfolio,
     pub open_orders: Vec<Order>,
+    pub cancel_orders: Vec<Order>,
 }
 
 fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
@@ -255,5 +310,55 @@ fn normalize_diff(diff: Decimal, reference: Decimal) -> Decimal {
     } else {
         let denominator = std::cmp::max(reference.abs(), Decimal::ONE);
         diff / denominator
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reconcile::snapshot::{ExchangeSnapshot, LocalSnapshot};
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+    use tesser_core::{OrderRequest, OrderType, Side, Symbol};
+
+    fn sample_order(id: &str, symbol: &str) -> Order {
+        Order {
+            id: id.to_string(),
+            request: OrderRequest {
+                symbol: Symbol::from(symbol),
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                quantity: Decimal::ONE,
+                price: None,
+                trigger_price: None,
+                time_in_force: None,
+                client_order_id: None,
+                take_profit: None,
+                stop_loss: None,
+                display_quantity: None,
+            },
+            status: OrderStatus::Accepted,
+            filled_quantity: Decimal::ZERO,
+            avg_fill_price: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn startup_marks_remote_zombies_for_cancellation() {
+        let handler = StartupHandler::new(StartupHandlerConfig {
+            portfolio_config: PortfolioConfig::default(),
+            market_registry: Arc::new(MarketRegistry::default()),
+        });
+        let local = LocalSnapshot::new(None, vec![sample_order("local", "BTCUSDT")]);
+        let remote = ExchangeSnapshot::new(
+            Vec::new(),
+            Vec::new(),
+            vec![sample_order("remote", "BTCUSDT")],
+        );
+        let outcome = handler.reconcile(local, remote, None);
+        assert_eq!(outcome.cancel_orders.len(), 1);
+        assert_eq!(outcome.cancel_orders[0].id, "remote");
     }
 }
