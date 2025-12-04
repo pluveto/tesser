@@ -39,7 +39,7 @@ Each callback returns a `PluginResult` that can accumulate one or more `PluginCh
 
    [dependencies]
    rust_decimal = "1"
-   tesser-wasm = { path = "../../tesser-wasm", features = ["guest"] }
+   tesser-wasm = { version = "0.9", features = ["guest"] }
    ```
 3. **Implement the trait** – the SDK exposes the data types plus the `export_plugin!` macro:
    ```rust

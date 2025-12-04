@@ -8,3 +8,6 @@ pub mod guest;
 
 #[cfg(feature = "guest")]
 pub use guest::{ExecutionPlugin, PluginError};
+
+#[cfg(feature = "host")]
+pub mod host;
