@@ -26,7 +26,7 @@
 
    [dependencies]
    rust_decimal = "1"
-   tesser-wasm = { path = "../../tesser-wasm", features = ["guest"] }
+   tesser-wasm = { version = "0.9", features = ["guest"] }
    ```
 
 3. **Implement the trait and export it**
