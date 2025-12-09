@@ -2,7 +2,7 @@
 
 import { Suspense } from 'react';
 import { Canvas } from '@react-three/fiber';
-import { Loader } from '@react-three/drei';
+import { Loader, useProgress } from '@react-three/drei';
 import { CrystalScene } from './components/crystal-scene';
 import { UIOverlay } from './components/ui-overlay';
 
@@ -23,12 +23,33 @@ export default function HomePage() {
         <UIOverlay />
       </div>
 
-      <Loader
-        containerStyles={{ background: '#000000' }}
-        innerStyles={{ background: '#2563eb', height: 2 }}
-        barStyles={{ background: '#e879f9' }}
-        dataInterpolation={(p) => `Initializing Tesser... ${p.toFixed(0)}%`}
-      />
+      <SceneLoader />
     </div>
+  );
+}
+
+function SceneLoader() {
+  const { errors } = useProgress();
+  const hasErrors = errors.length > 0;
+
+  if (hasErrors) {
+    return (
+      <div className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-6">
+        <div className="max-w-xl rounded-full border border-zinc-800 bg-black/80 px-6 py-3 text-center text-sm text-zinc-300 shadow-lg backdrop-blur">
+          Unable to load the interactive background because of a blocked asset download.
+          The documentation is still fully browsable—please refresh when you have network
+          access to re-enable the 3D scene.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <Loader
+      containerStyles={{ background: '#000000' }}
+      innerStyles={{ background: '#2563eb', height: 2 }}
+      barStyles={{ background: '#e879f9' }}
+      dataInterpolation={(p) => `Initializing Tesser... ${p.toFixed(0)}%`}
+    />
   );
 }

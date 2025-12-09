@@ -509,7 +509,7 @@ function CTASection() {
             Get Started Now
           </Link>
           <Link 
-            href="/docs/getting-started"
+            href="/docs/01-getting-started"
             className="px-8 py-4 rounded-full bg-black border border-zinc-800 text-white font-medium text-lg hover:bg-zinc-900 transition-all flex items-center gap-2"
           >
             <Terminal className="size-5" /> Read the Docs
