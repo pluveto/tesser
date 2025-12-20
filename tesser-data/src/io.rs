@@ -10,13 +10,16 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use csv::{ReaderBuilder, WriterBuilder};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use rust_decimal::Decimal;
+use tokio::fs;
+use tokio::fs::File as TokioFile;
 
 use tesser_core::{Candle, Interval, Symbol, Tick};
 
-use crate::encoding::{candles_to_batch, ticks_to_batch};
+use crate::encoding::{candles_to_batch, tick_schema, ticks_to_batch};
 
 /// Canonical formats supported by `read_dataset`/`write_dataset`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +128,112 @@ impl TicksWriter {
                 && a.side == b.side
         });
         write_ticks_parquet(&self.path, &self.rows)
+    }
+}
+
+/// Streaming parquet writer for ticks that avoids buffering the full dataset in memory.
+///
+/// Writes to a temporary `*.part` file and atomically renames on `finish`.
+pub struct StreamingTicksWriter {
+    final_path: PathBuf,
+    tmp_path: PathBuf,
+    writer: AsyncArrowWriter<TokioFile>,
+    buffer: Vec<Tick>,
+    max_buffered_rows: usize,
+}
+
+impl StreamingTicksWriter {
+    pub async fn create_atomic(path: impl Into<PathBuf>, overwrite: bool) -> Result<Self> {
+        let final_path = path.into();
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        if !overwrite && fs::try_exists(&final_path).await? {
+            return Err(anyhow!("output already exists: {}", final_path.display()));
+        }
+
+        let file_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("invalid output path {}", final_path.display()))?;
+        let tmp_path = final_path.with_file_name(format!("{file_name}.part"));
+
+        if overwrite && fs::try_exists(&final_path).await? {
+            let _ = fs::remove_file(&final_path).await;
+        }
+        let _ = fs::remove_file(&tmp_path).await;
+
+        let file = TokioFile::create(&tmp_path)
+            .await
+            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let writer = AsyncArrowWriter::try_new(file, tick_schema(), Some(properties))?;
+
+        Ok(Self {
+            final_path,
+            tmp_path,
+            writer,
+            buffer: Vec::new(),
+            max_buffered_rows: 50_000,
+        })
+    }
+
+    pub fn with_max_buffered_rows(mut self, max_buffered_rows: usize) -> Self {
+        self.max_buffered_rows = max_buffered_rows.max(1);
+        self
+    }
+
+    pub async fn push(&mut self, tick: Tick) -> Result<()> {
+        self.buffer.push(tick);
+        if self.buffer.len() >= self.max_buffered_rows {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn extend<I>(&mut self, ticks: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Tick>,
+    {
+        for tick in ticks {
+            self.buffer.push(tick);
+            if self.buffer.len() >= self.max_buffered_rows {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let batch = ticks_to_batch(&self.buffer)?;
+        self.writer.write(&batch).await?;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    pub async fn finish(mut self) -> Result<PathBuf> {
+        self.flush().await?;
+        self.writer.finish().await?;
+        if fs::try_exists(&self.final_path).await? {
+            let _ = fs::remove_file(&self.final_path).await;
+        }
+        fs::rename(&self.tmp_path, &self.final_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to rename {} to {}",
+                    self.tmp_path.display(),
+                    self.final_path.display()
+                )
+            })?;
+        Ok(self.final_path)
     }
 }
 

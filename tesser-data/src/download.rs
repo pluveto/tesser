@@ -1096,15 +1096,14 @@ async fn download_archive_file(
     if resume && start > 0 {
         let mut restart_from_scratch = false;
         if status == StatusCode::PARTIAL_CONTENT {
-            if let Some(range) = response
+            match response
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_content_range)
             {
-                if range.0 != start {
-                    restart_from_scratch = true;
-                }
+                Some((range_start, _total)) if range_start == start => {}
+                _ => restart_from_scratch = true,
             }
         } else if status.is_success() {
             restart_from_scratch = true;
