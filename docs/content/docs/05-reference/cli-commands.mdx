@@ -10,8 +10,8 @@ tesser-cli --env <profile> <COMMAND>
 ## Data
 
 - `data download --symbol BTCUSDT --interval 1m --output data/raw/btc.csv`
-- `data download-trades --exchange bybit --symbol BTCUSDT --partition-by-day --resume --source bybit-public`
-- `data download-trades --exchange binance --symbol BTCUSDT --partition-by-day --resume --source binance-public --binance-market futures-um`
+- `data download-trades --exchange bybit --symbol BTCUSDT --partition-by-day --resume-output --resume-archives --source bybit-public --output-dir data/raw_trades/bybit/BTCUSDT`
+- `data download-trades --exchange binance --symbol BTCUSDT --partition-by-day --resume-output --resume-archives --source binance-public --binance-market futures-um --output-dir data/raw_trades/binance/BTCUSDT`
 - `data validate --path data/raw/btc.csv`
 - `data normalize --source data/raw/btc.csv --output data/candles --config configs/etl/sample_iso_csv.toml --symbol binance_perp:BTCUSDT`
 - `data resample --input data/candles/symbol=BTCUSDT/interval=1m/.../part-00000.parquet --interval 5m`

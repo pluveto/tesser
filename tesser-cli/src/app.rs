@@ -22,7 +22,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Days, Duration, NaiveDate, NaiveDateTime, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use csv::Writer;
 use futures::StreamExt;
 use rust_decimal::{
@@ -48,7 +48,7 @@ use tesser_data::download::{
 use tesser_data::etl::{
     MappingConfig as EtlMappingConfig, Partitioning as EtlPartitioning, Pipeline as EtlPipeline,
 };
-use tesser_data::io::{self, DatasetFormat as IoDatasetFormat, TicksWriter};
+use tesser_data::io::{self, DatasetFormat as IoDatasetFormat, StreamingTicksWriter};
 use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
 use tesser_data::transform::Resampler;
@@ -184,6 +184,11 @@ pub struct DataDownloadArgs {
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("tick_output_mode")
+        .required(true)
+        .args(["partition_by_day", "no_partition"])
+))]
 pub struct DataDownloadTradesArgs {
     #[arg(long, default_value = "bybit")]
     exchange: String,
@@ -196,11 +201,30 @@ pub struct DataDownloadTradesArgs {
     start: String,
     #[arg(long)]
     end: Option<String>,
-    #[arg(long)]
-    output: Option<PathBuf>,
-    /// Partition parquet output by trading day
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_partition")]
     partition_by_day: bool,
+    /// Write a single parquet file (may be large; no resume support for the output file)
+    #[arg(long, conflicts_with = "partition_by_day")]
+    no_partition: bool,
+    /// Output directory for partitioned tick data (`--partition-by-day`)
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "partition_by_day",
+        conflicts_with = "output"
+    )]
+    output_dir: Option<PathBuf>,
+    /// Output file path for unpartitioned tick data (`--no-partition`)
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "no_partition",
+        conflicts_with = "output"
+    )]
+    output_file: Option<PathBuf>,
+    /// Legacy output path (directory for `--partition-by-day`, file for `--no-partition`)
+    #[arg(long, hide = true)]
+    output: Option<PathBuf>,
     /// Per-request REST chunk size (max 1000)
     #[arg(long, default_value_t = 1000)]
     limit: usize,
@@ -208,8 +232,24 @@ pub struct DataDownloadTradesArgs {
     #[arg(long, value_enum, default_value_t = TradeSourceArg::Rest)]
     source: TradeSourceArg,
     /// Skip partitions that already exist
+    #[arg(
+        long,
+        requires = "partition_by_day",
+        conflicts_with = "overwrite_output"
+    )]
+    resume_output: bool,
+    /// Resume archive downloads via HTTP range requests
     #[arg(long)]
+    resume_archives: bool,
+    /// Overwrite output files if they already exist
+    #[arg(long)]
+    overwrite_output: bool,
+    /// Legacy resume flag (enables `--resume-output` and `--resume-archives`)
+    #[arg(long, hide = true)]
     resume: bool,
+    /// Override the on-disk archive cache directory (downloaded `.csv.gz`/`.zip` files)
+    #[arg(long, value_name = "DIR")]
+    archive_cache_dir: Option<PathBuf>,
     /// Override Bybit public archive base URL
     #[arg(long)]
     bybit_public_url: Option<String>,
@@ -455,10 +495,13 @@ impl DataDownloadTradesArgs {
             .join("cache")
             .join(&self.exchange)
             .join(&self.symbol);
+        let cache_dir = self.archive_cache_dir.clone().unwrap_or(cache_dir);
+        let resume_archives = self.resume_archives || self.resume;
+        let resume_output = self.resume_output || self.resume;
         let mut base_request = TradeRequest::new(&self.symbol, start, end)
             .with_limit(self.limit)
             .with_archive_cache_dir(cache_dir)
-            .with_resume_archives(self.resume);
+            .with_resume_archives(resume_archives);
         let driver = exchange_cfg.driver.as_str();
         match driver {
             "bybit" | "" => {
@@ -490,15 +533,18 @@ impl DataDownloadTradesArgs {
         if self.partition_by_day {
             self.download_partitioned(config, exchange_cfg, base_request, start, end)
                 .await
+        } else if self.no_partition {
+            self.download_unpartitioned(
+                config,
+                exchange_cfg,
+                base_request,
+                start,
+                end,
+                resume_output,
+            )
+            .await
         } else {
-            let trades = self
-                .fetch_trades(driver, &exchange_cfg.rest_url, base_request)
-                .await?;
-            if trades.is_empty() {
-                info!("No trades returned for {}", self.symbol);
-                return Ok(());
-            }
-            self.write_single(config, trades, start, end)
+            unreachable!("tick output mode is enforced by clap ArgGroup")
         }
     }
 
@@ -511,8 +557,9 @@ impl DataDownloadTradesArgs {
         end: DateTime<Utc>,
     ) -> Result<()> {
         let base_dir = self
-            .output
+            .output_dir
             .clone()
+            .or_else(|| self.output.clone())
             .unwrap_or_else(|| default_tick_partition_dir(config, &self.exchange, &self.symbol));
         let mut current = start.date_naive();
         let final_date = end.date_naive();
@@ -545,7 +592,7 @@ impl DataDownloadTradesArgs {
             }
 
             let partition_path = partition_path(&base_dir, current);
-            if self.resume && partition_path.exists() {
+            if self.resume_output && partition_path.exists() {
                 info!(
                     "Skipping {} because {} already exists",
                     current,
@@ -556,6 +603,12 @@ impl DataDownloadTradesArgs {
                 }
                 current = next_date;
                 continue;
+            }
+            if partition_path.exists() && !self.overwrite_output {
+                bail!(
+                    "output already exists (use --resume-output to skip or --overwrite-output to overwrite): {}",
+                    partition_path.display()
+                );
             }
 
             let mut day_request = base_request.clone();
@@ -578,10 +631,15 @@ impl DataDownloadTradesArgs {
                 continue;
             }
 
-            let mut writer = TicksWriter::new(&partition_path);
             let count = trades.len();
-            writer.extend(trades.into_iter().map(|trade| (trade.trade_id, trade.tick)));
-            writer.finish()?;
+            let mut writer =
+                StreamingTicksWriter::create_atomic(&partition_path, self.overwrite_output)
+                    .await?
+                    .with_max_buffered_rows(100_000);
+            writer
+                .extend(trades.into_iter().map(|trade| trade.tick))
+                .await?;
+            writer.finish().await?;
             total += count;
             files_written += 1;
             info!(
@@ -603,6 +661,92 @@ impl DataDownloadTradesArgs {
             files_written,
             base_dir.display()
         );
+        Ok(())
+    }
+
+    async fn download_unpartitioned(
+        &self,
+        config: &AppConfig,
+        exchange_cfg: &tesser_config::ExchangeConfig,
+        base_request: TradeRequest<'_>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        resume_output: bool,
+    ) -> Result<()> {
+        if resume_output {
+            bail!("--resume-output is only supported with --partition-by-day");
+        }
+        warn!("Writing a single tick parquet file; for large ranges prefer --partition-by-day");
+        let output_path = self
+            .output_file
+            .clone()
+            .or_else(|| self.output.clone())
+            .unwrap_or_else(|| {
+                default_tick_output_path(config, &self.exchange, &self.symbol, start, end)
+            });
+        if output_path.exists() && !self.overwrite_output {
+            bail!(
+                "output already exists (use --overwrite-output to overwrite): {}",
+                output_path.display()
+            );
+        }
+
+        let mut writer = StreamingTicksWriter::create_atomic(&output_path, self.overwrite_output)
+            .await?
+            .with_max_buffered_rows(100_000);
+
+        let mut current = start.date_naive();
+        let final_date = end.date_naive();
+        let mut total = 0usize;
+        while current <= final_date {
+            let next_date = current.checked_add_days(Days::new(1)).unwrap_or(current);
+            let day_start = DateTime::<Utc>::from_naive_utc_and_offset(
+                current
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| anyhow!("invalid date {}", current))?,
+                Utc,
+            )
+            .max(start);
+            let day_end = DateTime::<Utc>::from_naive_utc_and_offset(
+                next_date
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| anyhow!("invalid date {}", next_date))?,
+                Utc,
+            )
+            .min(end);
+            if day_start >= day_end {
+                if next_date == current {
+                    break;
+                }
+                current = next_date;
+                continue;
+            }
+
+            let mut day_request = base_request.clone();
+            day_request.start = day_start;
+            day_request.end = day_end;
+            let trades = self
+                .fetch_trades(
+                    exchange_cfg.driver.as_str(),
+                    &exchange_cfg.rest_url,
+                    day_request,
+                )
+                .await?;
+            if !trades.is_empty() {
+                total += trades.len();
+                writer
+                    .extend(trades.into_iter().map(|trade| trade.tick))
+                    .await?;
+            }
+
+            if next_date == current {
+                break;
+            }
+            current = next_date;
+        }
+
+        let final_path = writer.finish().await?;
+        info!("Saved {} raw trades to {}", total, final_path.display());
         Ok(())
     }
 
@@ -629,24 +773,6 @@ impl DataDownloadTradesArgs {
             }
             other => bail!("unknown exchange driver '{other}' for {}", self.exchange),
         }
-    }
-
-    fn write_single(
-        &self,
-        config: &AppConfig,
-        trades: Vec<NormalizedTrade>,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<()> {
-        let output_path = self.output.clone().unwrap_or_else(|| {
-            default_tick_output_path(config, &self.exchange, &self.symbol, start, end)
-        });
-        let total = trades.len();
-        let mut writer = TicksWriter::new(&output_path);
-        writer.extend(trades.into_iter().map(|trade| (trade.trade_id, trade.tick)));
-        writer.finish()?;
-        info!("Saved {} raw trades to {}", total, output_path.display());
-        Ok(())
     }
 }
 
