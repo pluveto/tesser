@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::fs::File as StdFile;
-use std::io::{BufRead as StdBufRead, BufReader as StdBufReader};
+use std::io::{BufRead as StdBufRead, BufReader as StdBufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -997,6 +998,51 @@ fn truncate(body: &str, max: usize) -> String {
     }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64)> {
+    // e.g. "bytes 1024-2047/4096"
+    let value = value.trim();
+    let mut parts = value.split_whitespace();
+    let unit = parts.next()?;
+    if unit != "bytes" {
+        return None;
+    }
+    let range_and_total = parts.next()?;
+    let (range, total) = range_and_total.split_once('/')?;
+    let (start, _end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    Some((start, total))
+}
+
 fn resolve_archive_cache_dir(req: &TradeRequest<'_>, exchange: &str, symbol: &str) -> PathBuf {
     req.archive_cache_dir.clone().unwrap_or_else(|| {
         std::env::temp_dir()
@@ -1025,23 +1071,59 @@ async fn download_archive_file(
     } else if fs::try_exists(cache_path).await? {
         fs::remove_file(cache_path).await?;
     }
-    let mut request = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", "https://public.bybit.com/");
-    if resume && start > 0 {
-        request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
-    }
-    let response = request
+    let build_request = |range_start: Option<u64>| {
+        let mut request = client
+            .get(url)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://public.bybit.com/");
+        if let Some(range_start) = range_start {
+            request = request.header(reqwest::header::RANGE, format!("bytes={range_start}-"));
+        }
+        request
+    };
+
+    let mut response = build_request((resume && start > 0).then_some(start))
         .send()
         .await
         .with_context(|| format!("failed to fetch archive {url}"))?;
-    let status = response.status();
+    let mut status = response.status();
+
+    if resume && start > 0 {
+        let mut restart_from_scratch = false;
+        if status == StatusCode::PARTIAL_CONTENT {
+            if let Some(range) = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range)
+            {
+                if range.0 != start {
+                    restart_from_scratch = true;
+                }
+            }
+        } else if status.is_success() {
+            restart_from_scratch = true;
+        }
+
+        if restart_from_scratch {
+            debug!(
+                "resume requested but server did not honor range; restarting download {}",
+                url
+            );
+            start = 0;
+            response = build_request(None)
+                .send()
+                .await
+                .with_context(|| format!("failed to fetch archive {url}"))?;
+            status = response.status();
+        }
+    }
+
     if status == StatusCode::NOT_FOUND {
         debug!("archive missing {}", url);
         return Ok(None);
@@ -1058,6 +1140,31 @@ async fn download_archive_file(
         ));
     }
 
+    let total_bytes = if status == StatusCode::PARTIAL_CONTENT {
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_content_range(value).map(|(_start, total)| total))
+            .or_else(|| {
+                response
+                    .content_length()
+                    .map(|len| start.saturating_add(len))
+            })
+    } else {
+        response.content_length()
+    };
+
+    let show_progress = std::io::stderr().is_terminal();
+    let label = cache_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(url);
+    let started_at = Instant::now();
+    let mut last_render = Instant::now();
+    let mut last_len = 0usize;
+    let mut downloaded = start;
+
     let mut file = if start > 0 {
         OpenOptions::new()
             .create(true)
@@ -1072,12 +1179,81 @@ async fn download_archive_file(
             .open(cache_path)
             .await?
     };
+
+    let mut render_progress = |downloaded: u64, done: bool| {
+        if !show_progress {
+            return;
+        }
+        let elapsed = started_at.elapsed();
+        let transferred = downloaded.saturating_sub(start);
+        let bytes_per_sec = if elapsed.as_secs_f64() > 0.0 {
+            (transferred as f64 / elapsed.as_secs_f64()) as u64
+        } else {
+            0
+        };
+        let speed = format!("{}/s", format_bytes(bytes_per_sec));
+        let line = if let Some(total) = total_bytes {
+            let pct = if total > 0 {
+                (downloaded as f64 / total as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let width = 20usize;
+            let filled = (pct * width as f64).round() as usize;
+            let filled = filled.min(width);
+            let bar = format!(
+                "[{}{}]",
+                "=".repeat(filled),
+                " ".repeat(width.saturating_sub(filled))
+            );
+            let eta = if bytes_per_sec > 0 && downloaded < total {
+                let remaining = total - downloaded;
+                format_duration(Duration::from_secs_f64(
+                    remaining as f64 / bytes_per_sec as f64,
+                ))
+            } else {
+                "0s".to_string()
+            };
+            format!(
+                "Downloading {} {} {:>5.1}% {}/{} {} ETA {}",
+                label,
+                bar,
+                pct * 100.0,
+                format_bytes(downloaded),
+                format_bytes(total),
+                speed,
+                eta
+            )
+        } else {
+            format!(
+                "Downloading {} {} {}",
+                label,
+                format_bytes(downloaded),
+                speed
+            )
+        };
+        let padding = " ".repeat(last_len.saturating_sub(line.len()));
+        eprint!("\r{}{}", line, padding);
+        let _ = std::io::stderr().flush();
+        last_len = line.len();
+        if done {
+            eprintln!();
+        }
+    };
+
+    render_progress(downloaded, false);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("failed to read archive chunk")?;
         file.write_all(&bytes).await?;
+        downloaded = downloaded.saturating_add(bytes.len() as u64);
+        if show_progress && last_render.elapsed() >= Duration::from_millis(250) {
+            render_progress(downloaded, false);
+            last_render = Instant::now();
+        }
     }
     file.flush().await?;
+    render_progress(downloaded, true);
     Ok(Some(()))
 }
 
@@ -1148,8 +1324,11 @@ async fn read_binance_archive(cache_path: PathBuf, symbol: String) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_public_trade_line() {
@@ -1179,5 +1358,126 @@ mod tests {
         assert_eq!(trade.trade_id.as_deref(), Some("1001"));
         assert_eq!(trade.tick.price, Decimal::from_str("51234.5").unwrap());
         assert_eq!(trade.tick.side, Side::Sell);
+    }
+
+    async fn serve_body(listener: TcpListener, body: Arc<Vec<u8>>, honor_range: bool, max: usize) {
+        for _ in 0..max {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut tmp).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
+            let mut range_start: Option<u64> = None;
+            for line in req.lines() {
+                let lower = line.to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("range: bytes=") {
+                    if let Some((start, _)) = rest.split_once('-') {
+                        range_start = start.parse().ok();
+                    }
+                    break;
+                }
+            }
+
+            let total = body.len() as u64;
+            let (status, headers, response_body): (&str, String, &[u8]) = if honor_range
+                && range_start.is_some()
+            {
+                let start = range_start.unwrap_or(0);
+                if start >= total {
+                    (
+                            "416 Range Not Satisfiable",
+                            format!(
+                                "Content-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n"
+                            ),
+                            &[],
+                        )
+                } else {
+                    let end = (total - 1).to_string();
+                    let start_usize = start as usize;
+                    let slice = &body[start_usize..];
+                    (
+                            "206 Partial Content",
+                            format!(
+                                "Accept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                slice.len()
+                            ),
+                            slice,
+                        )
+                }
+            } else {
+                (
+                    "200 OK",
+                    format!("Content-Length: {}\r\nConnection: close\r\n", body.len()),
+                    &body[..],
+                )
+            };
+
+            let response = format!("HTTP/1.1 {status}\r\n{headers}\r\n");
+            socket.write_all(response.as_bytes()).await.expect("write");
+            socket.write_all(response_body).await.expect("write body");
+        }
+    }
+
+    #[tokio::test]
+    async fn resumes_archive_download_when_server_honors_range() {
+        let body: Vec<u8> = (0..=255).collect();
+        let body = Arc::new(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(serve_body(listener, body.clone(), true, 1));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("archive.bin");
+        tokio::fs::write(&cache_path, &body[..32]).await.unwrap();
+
+        let client = Client::new();
+        let url = format!("http://{}/archive.bin", addr);
+        download_archive_file(&client, &url, &cache_path, true)
+            .await
+            .unwrap()
+            .expect("downloaded");
+
+        let downloaded = tokio::fs::read(&cache_path).await.unwrap();
+        assert_eq!(&downloaded, body.as_slice());
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarts_from_scratch_when_server_ignores_range() {
+        let body: Vec<u8> = (0..=127).collect();
+        let body = Arc::new(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(serve_body(listener, body.clone(), false, 2));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("archive.bin");
+        tokio::fs::write(&cache_path, &body[..16]).await.unwrap();
+
+        let client = Client::new();
+        let url = format!("http://{}/archive.bin", addr);
+        download_archive_file(&client, &url, &cache_path, true)
+            .await
+            .unwrap()
+            .expect("downloaded");
+
+        let downloaded = tokio::fs::read(&cache_path).await.unwrap();
+        assert_eq!(downloaded.len(), body.len());
+        assert_eq!(&downloaded, body.as_slice());
+
+        handle.await.unwrap();
     }
 }
