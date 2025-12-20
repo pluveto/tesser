@@ -4783,6 +4783,7 @@ dependencies = [
  "glob",
  "once_cell",
  "parquet",
+ "rayon",
  "reqwest",
  "rust_decimal",
  "serde",
