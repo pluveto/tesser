@@ -5,7 +5,10 @@ description: Acquire, validate, and store high quality market data.
 
 ## Sources
 
-- **Bybit/Binance Historical** – Use `tesser-cli data download` for candles or `tesser-cli data download-trades` for tick data. For Bybit, pass `--source bybit-public --partition-by-day --resume` to stream the public archive with automatic resume. For Binance, `--source binance-public --binance-market futures-um` (or `spot` / `futures-cm`) pulls and caches the daily ZIPs before normalizing them to Tesser ticks.
+- **Bybit/Binance Historical** – Use `tesser-cli data download` for candles or `tesser-cli data download-trades` for tick data.
+  - Prefer partitioned ticks: `--partition-by-day --resume-output --resume-archives` writes one parquet per trading day, keeps memory bounded, and can resume safely.
+  - Single-file ticks: `--no-partition` writes one parquet for the full range (can be extremely large and does not support resuming partial output).
+  - `--archive-cache-dir` optionally controls where downloaded `.csv.gz`/`.zip` archives are cached on disk (defaults under `data_path/ticks/cache/...`).
 - **Custom Feeds** – Drop CSV/JSONL files under `data/`, run `tesser-cli data normalize` to convert them into the canonical Parquet schema, then point backtests to those `.parquet` outputs via `--data`.
 
 ## Validation
