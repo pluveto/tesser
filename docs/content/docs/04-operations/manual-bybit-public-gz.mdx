@@ -1,0 +1,178 @@
+---
+title: Manual Bybit Public .csv.gz Ingestion
+description: Download Bybit public trade archives yourself and convert them into Tesser tick Parquet partitions.
+---
+
+This guide shows how to manually download Bybit public daily trade archives (`.csv.gz`), and then let `tesser-cli` convert them into Parquet tick partitions.
+
+The commands use `SOLUSDT` as an example, but the workflow is identical for other symbols.
+
+## What You Get
+
+- **Archive cache**: daily `<SYMBOL>_YYYY-MM-DD.csv.gz` files (small, compressed).
+- **Tesser output**: daily `YYYY-MM-DD.parquet` tick partitions (fast to query and replay).
+
+## 1) Download the `.csv.gz` archives (manual)
+
+Bybit public archives follow this URL pattern:
+
+```text
+https://public.bybit.com/trading/<SYMBOL>/<SYMBOL><YYYY-MM-DD>.csv.gz
+```
+
+Tesser expects cached files named like:
+
+```text
+<SYMBOL>_<YYYY-MM-DD>.csv.gz
+```
+
+Copy/paste one of the scripts below:
+
+### Bash (Linux/macOS)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Downloads daily Bybit public archives into OUT_ROOT/SYMBOL.
+# Requirements: curl, python3
+#
+# Usage:
+#   SYMBOL=SOLUSDT START_DATE=2021-06-29 END_DATE=2021-07-02 OUT_ROOT=./bybit_public_cache bash ./download_bybit_public_gz.sh
+
+SYMBOL="${SYMBOL:-SOLUSDT}"
+START_DATE="${START_DATE:-2021-06-29}" # inclusive (YYYY-MM-DD)
+END_DATE="${END_DATE:-2021-07-02}"     # inclusive (YYYY-MM-DD)
+OUT_ROOT="${OUT_ROOT:-./bybit_public_cache}"
+BASE_URL="${BYBIT_PUBLIC_BASE_URL:-https://public.bybit.com/trading}"
+
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+
+CACHE_DIR="${OUT_ROOT}/${SYMBOL}"
+mkdir -p "${CACHE_DIR}"
+
+python3 - "${START_DATE}" "${END_DATE}" <<'PY' | while IFS= read -r date; do
+import sys
+from datetime import datetime, timedelta
+
+start = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
+end = datetime.strptime(sys.argv[2], "%Y-%m-%d").date()
+cur = start
+while cur <= end:
+    print(cur.strftime("%Y-%m-%d"))
+    cur += timedelta(days=1)
+PY
+  filename="${SYMBOL}_${date}.csv.gz"
+  url="${BASE_URL}/${SYMBOL}/${SYMBOL}${date}.csv.gz"
+  dest="${CACHE_DIR}/${filename}"
+  tmp="${dest}.part"
+
+  if [[ -s "${dest}" ]]; then
+    echo "skip (exists): ${dest}"
+    continue
+  fi
+
+  echo "download: ${url}"
+  curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 -o "${tmp}" "${url}"
+  mv -f "${tmp}" "${dest}"
+done
+
+echo "done: ${CACHE_DIR}"
+```
+
+### PowerShell (Windows)
+
+```powershell
+param(
+  [string]$Symbol = "SOLUSDT",
+  [string]$StartDate = "2021-06-29",
+  [string]$EndDate = "2021-07-02",
+  [string]$OutRoot = ".\\bybit_public_cache",
+  [string]$BaseUrl = "https://public.bybit.com/trading"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Parse-Date([string]$value) {
+  return [DateTime]::ParseExact($value, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+$start = Parse-Date $StartDate
+$end = Parse-Date $EndDate
+
+$cacheDir = Join-Path $OutRoot $Symbol
+New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+
+for ($d = $start; $d -le $end; $d = $d.AddDays(1)) {
+  $date = $d.ToString("yyyy-MM-dd")
+  $fileName = "${Symbol}_${date}.csv.gz"
+  $dest = Join-Path $cacheDir $fileName
+  $tmp = "${dest}.part"
+  $url = "$BaseUrl/$Symbol/${Symbol}$date.csv.gz"
+
+  if (Test-Path -Path $dest) {
+    $info = Get-Item $dest
+    if ($info.Length -gt 0) {
+      Write-Host "skip (exists): $dest"
+      continue
+    }
+  }
+
+  Write-Host "download: $url"
+  Invoke-WebRequest -Uri $url -OutFile $tmp
+  Move-Item -Force $tmp $dest
+}
+
+Write-Host "done: $cacheDir"
+```
+
+Afterwards you should have files like:
+
+```text
+./bybit_public_cache/SOLUSDT/SOLUSDT_2021-06-29.csv.gz
+./bybit_public_cache/SOLUSDT/SOLUSDT_2021-06-30.csv.gz
+...
+```
+
+## 2) Convert cached archives into Tesser tick Parquet
+
+Use partitioned output (recommended for multi-year ranges):
+
+```bash
+cargo run -p tesser-cli -- data download-trades \
+  --exchange bybit_mainnet \
+  --symbol SOLUSDT \
+  --category spot \
+  --start 2021-06-29 \
+  --end 2021-07-03 \
+  --source bybit-public \
+  --partition-by-day \
+  --output-dir /path/to/raw_trades/SOLUSDT \
+  --archive-cache-dir ./bybit_public_cache/SOLUSDT \
+  --resume-output \
+  --resume-archives
+```
+
+Notes:
+
+- `--end` is parsed as a timestamp; when you pass a date it becomes `00:00:00 UTC`. To include the full day `2021-07-02`, set `--end 2021-07-03`.
+- `--archive-cache-dir` points at the directory containing your `SOLUSDT_YYYY-MM-DD.csv.gz` files.
+- `--resume-output` skips existing `YYYY-MM-DD.parquet` partitions.
+- `--resume-archives` prevents deleting your cached `.csv.gz` files (and uses HTTP range resume if a cached file is partial).
+
+## 3) Verify output
+
+```bash
+ls /path/to/raw_trades/SOLUSDT
+```
+
+Inspect one partition:
+
+```bash
+cargo run -p tesser-cli -- data inspect-parquet --path /path/to/raw_trades/SOLUSDT/2021-06-29.parquet --rows 5
+```
+
+## Related
+
+If you have candle CSV files compressed as `*.csv.gz`, `tesser-cli data normalize` can read them directly (no manual unzip required).

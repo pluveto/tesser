@@ -5,6 +5,7 @@
     "live-trading",
     "risk-management",
     "state-reconciliation",
-    "data-engineering"
+    "data-engineering",
+    "manual-bybit-public-gz"
   ]
 }

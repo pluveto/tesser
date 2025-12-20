@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -11,12 +11,14 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike, Utc};
 use csv::StringRecord;
+use flate2::read::GzDecoder;
 use glob::glob;
 use parquet::arrow::ArrowWriter;
+use rayon::prelude::*;
 use rust_decimal::prelude::RoundingStrategy;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::schema::{
     canonical_candle_schema, CANONICAL_DECIMAL_PRECISION, CANONICAL_DECIMAL_SCALE,
@@ -187,9 +189,34 @@ pub struct Pipeline {
     mapping: MappingConfig,
 }
 
+const MAX_ROWS_PER_PART: usize = 100_000;
+const MAX_TOTAL_BUFFERED_ROWS: usize = 1_000_000;
+
+#[derive(Default)]
+struct PartitionBuffer {
+    rows: Vec<CanonicalCandle>,
+    chunk: usize,
+}
+
 impl Pipeline {
     pub fn new(mapping: MappingConfig) -> Self {
         Self { mapping }
+    }
+
+    fn create_reader(&self, path: &Path) -> Result<Box<dyn Read>> {
+        let file = File::open(path)
+            .with_context(|| format!("failed to open source file {}", path.display()))?;
+        let is_gzip = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gz"))
+            .unwrap_or(false);
+        if is_gzip {
+            debug!(path = %path.display(), "detected gzip-compressed source");
+            Ok(Box::new(GzDecoder::new(file)))
+        } else {
+            Ok(Box::new(file))
+        }
     }
 
     pub fn run(
@@ -199,35 +226,42 @@ impl Pipeline {
         symbol: &str,
         partitioning: Partitioning,
     ) -> Result<usize> {
-        let mut total_rows = 0usize;
-        let mut matched = false;
+        let mut sources = Vec::new();
         for entry in glob(pattern).with_context(|| format!("invalid source glob {pattern}"))? {
-            let path = entry?;
-            matched = true;
-            let rows = self.load_rows(&path, symbol)?;
-            if rows.is_empty() {
-                continue;
-            }
-            let count = rows.len();
-            self.write_partitions(rows, output, partitioning)?;
-            total_rows += count;
-            info!(path = %path.display(), rows = count, "normalized source file");
+            sources.push(entry?);
         }
-        if !matched {
+        if sources.is_empty() {
             bail!("no files matched pattern {pattern}");
         }
-        Ok(total_rows)
+        sources.sort();
+        sources
+            .par_iter()
+            .enumerate()
+            .map(|(source_seq, path)| {
+                self.normalize_file(path, output, symbol, partitioning, source_seq)
+            })
+            .try_reduce(|| 0usize, |left, right| Ok(left + right))
     }
 
-    fn load_rows(&self, path: &Path, symbol: &str) -> Result<Vec<CanonicalCandle>> {
+    fn normalize_file(
+        &self,
+        path: &Path,
+        output: &Path,
+        symbol: &str,
+        partitioning: Partitioning,
+        source_seq: usize,
+    ) -> Result<usize> {
         let interval_label = self.mapping.interval.clone();
-        let file = File::open(path)
-            .with_context(|| format!("failed to open source file {}", path.display()))?;
+        let source = self.create_reader(path)?;
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(self.mapping.csv.delimiter())
             .has_headers(self.mapping.csv.has_header())
-            .from_reader(BufReader::new(file));
-        let mut rows = Vec::new();
+            .from_reader(BufReader::new(source));
+        let schema = canonical_candle_schema();
+        let mut partitions: BTreeMap<String, PartitionBuffer> = BTreeMap::new();
+        let mut total_buffered = 0usize;
+        let mut rows_seen = 0usize;
+
         for (idx, record) in reader.records().enumerate() {
             let record = record.with_context(|| format!("failed to read record {}", idx + 1))?;
             let timestamp = self
@@ -283,7 +317,8 @@ impl Pipeline {
             } else {
                 None
             };
-            rows.push(CanonicalCandle {
+
+            let candle = CanonicalCandle {
                 timestamp,
                 symbol: symbol.to_string(),
                 interval: interval_label.clone(),
@@ -292,35 +327,103 @@ impl Pipeline {
                 low,
                 close,
                 volume,
-            });
+            };
+            let key = partition_path(
+                &candle.symbol,
+                &candle.interval,
+                candle.timestamp,
+                partitioning,
+            )?;
+            let mut flush_key: Option<String> = None;
+            {
+                let buffer = partitions.entry(key.clone()).or_default();
+                buffer.rows.push(candle);
+                if buffer.rows.len() >= MAX_ROWS_PER_PART {
+                    flush_key = Some(key.clone());
+                }
+            }
+            total_buffered += 1;
+            rows_seen += 1;
+
+            if let Some(flush_key) = flush_key {
+                let flushed =
+                    self.flush_partition(&schema, output, &mut partitions, source_seq, &flush_key)?;
+                total_buffered = total_buffered.saturating_sub(flushed);
+            }
+
+            if total_buffered >= MAX_TOTAL_BUFFERED_ROWS {
+                self.flush_all_partitions(&schema, output, &mut partitions, source_seq)?;
+                total_buffered = partitions.values().map(|buf| buf.rows.len()).sum();
+            }
         }
-        Ok(rows)
+
+        self.flush_all_partitions(&schema, output, &mut partitions, source_seq)?;
+        info!(path = %path.display(), rows = rows_seen, "normalized source file");
+        Ok(rows_seen)
     }
 
-    fn write_partitions(
+    fn flush_partition(
         &self,
-        rows: Vec<CanonicalCandle>,
+        schema: &SchemaRef,
         output: &Path,
-        partitioning: Partitioning,
+        partitions: &mut BTreeMap<String, PartitionBuffer>,
+        source_seq: usize,
+        key: &str,
+    ) -> Result<usize> {
+        let Some(buffer) = partitions.get_mut(key) else {
+            return Ok(0);
+        };
+        if buffer.rows.is_empty() {
+            return Ok(0);
+        }
+        let rows = std::mem::take(&mut buffer.rows);
+        let flushed = rows.len();
+        self.write_partition_rows(schema, output, key, &rows, source_seq, buffer.chunk)?;
+        buffer.chunk = buffer.chunk.saturating_add(1);
+        Ok(flushed)
+    }
+
+    fn flush_all_partitions(
+        &self,
+        schema: &SchemaRef,
+        output: &Path,
+        partitions: &mut BTreeMap<String, PartitionBuffer>,
+        source_seq: usize,
     ) -> Result<()> {
-        let schema = canonical_candle_schema();
-        let mut partitions: BTreeMap<String, Vec<CanonicalCandle>> = BTreeMap::new();
-        for row in rows {
-            let key = partition_path(&row.symbol, &row.interval, row.timestamp, partitioning)?;
-            partitions.entry(key).or_default().push(row);
+        for (relative, buffer) in partitions.iter_mut() {
+            if buffer.rows.is_empty() {
+                continue;
+            }
+            let rows = std::mem::take(&mut buffer.rows);
+            self.write_partition_rows(schema, output, relative, &rows, source_seq, buffer.chunk)?;
+            buffer.chunk = buffer.chunk.saturating_add(1);
         }
-        for (counter, (relative, records)) in partitions.into_iter().enumerate() {
-            let dir = output.join(&relative);
-            fs::create_dir_all(&dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
-            let file_path = dir.join(format!("part-{counter:05}.parquet"));
-            let batch = rows_to_batch(&records, &schema)?;
-            let file = File::create(&file_path)
-                .with_context(|| format!("failed to create {}", file_path.display()))?;
-            let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
-            writer.write(&batch)?;
-            writer.close()?;
-        }
+        Ok(())
+    }
+
+    fn write_partition_rows(
+        &self,
+        schema: &SchemaRef,
+        output: &Path,
+        relative: &str,
+        records: &[CanonicalCandle],
+        source_seq: usize,
+        chunk: usize,
+    ) -> Result<()> {
+        let dir = output.join(relative);
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let file_name = if chunk == 0 {
+            format!("part-{source_seq:05}.parquet")
+        } else {
+            format!("part-{source_seq:05}-{chunk:05}.parquet")
+        };
+        let file_path = dir.join(file_name);
+        let batch = rows_to_batch(records, schema)?;
+        let file = File::create(&file_path)
+            .with_context(|| format!("failed to create {}", file_path.display()))?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
         Ok(())
     }
 }
@@ -443,6 +546,7 @@ fn datetime_from_ns(timestamp: i64) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -485,6 +589,88 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 2);
         assert!(count_files(&output) > 0, "no parquet files written");
+    }
+
+    #[test]
+    fn pipeline_normalizes_csv_gz() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("candles.csv.gz");
+        let payload = b"ts,open,high,low,close,vol\n1700000000000,100,110,90,105,12\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        fs::write(&src, compressed).unwrap();
+
+        let mapping = MappingConfig {
+            csv: CsvConfig::default(),
+            fields: FieldMapping {
+                timestamp: TimestampField {
+                    col: 0,
+                    unit: TimestampUnit::Milliseconds,
+                    format: TimestampFormat::Unix,
+                },
+                open: ValueField { col: 1 },
+                high: ValueField { col: 2 },
+                low: ValueField { col: 3 },
+                close: ValueField { col: 4 },
+                volume: Some(ValueField { col: 5 }),
+            },
+            interval: "1m".into(),
+        };
+        let pipeline = Pipeline::new(mapping);
+        let output = dir.path().join("lake");
+        let rows = pipeline
+            .run(
+                src.to_str().unwrap(),
+                &output,
+                "binance:BTCUSDT",
+                Partitioning::Daily,
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(count_files(&output) > 0, "no parquet files written");
+    }
+
+    #[test]
+    fn pipeline_writes_unique_parts_per_source_file() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("a.csv"),
+            "ts,open,high,low,close,vol\n1700000000000,100,110,90,105,12\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("b.csv"),
+            "ts,open,high,low,close,vol\n1700000000000,101,111,91,106,13\n",
+        )
+        .unwrap();
+
+        let mapping = MappingConfig {
+            csv: CsvConfig::default(),
+            fields: FieldMapping {
+                timestamp: TimestampField {
+                    col: 0,
+                    unit: TimestampUnit::Milliseconds,
+                    format: TimestampFormat::Unix,
+                },
+                open: ValueField { col: 1 },
+                high: ValueField { col: 2 },
+                low: ValueField { col: 3 },
+                close: ValueField { col: 4 },
+                volume: Some(ValueField { col: 5 }),
+            },
+            interval: "1m".into(),
+        };
+        let pipeline = Pipeline::new(mapping);
+        let output = dir.path().join("lake");
+        let pattern = format!("{}/{}.csv", src_dir.display(), "*");
+        let rows = pipeline
+            .run(&pattern, &output, "binance:BTCUSDT", Partitioning::Daily)
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(count_files(&output), 2);
     }
 
     #[test]
