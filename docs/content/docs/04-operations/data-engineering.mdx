@@ -11,6 +11,8 @@ description: Acquire, validate, and store high quality market data.
   - `--archive-cache-dir` optionally controls where downloaded `.csv.gz`/`.zip` archives are cached on disk (defaults under `data_path/ticks/cache/...`).
 - **Custom Feeds** – Drop CSV/JSONL files under `data/`, run `tesser-cli data normalize` to convert them into the canonical Parquet schema, then point backtests to those `.parquet` outputs via `--data`.
 
+`tesser-cli data normalize` accepts both plain CSV files and gzip-compressed sources (e.g. `*.csv.gz`).
+
 ## Validation
 
 ```bash

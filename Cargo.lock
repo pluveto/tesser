@@ -4778,6 +4778,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "csv",
+ "flate2",
  "futures",
  "glob",
  "once_cell",

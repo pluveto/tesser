@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -11,12 +11,13 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike, Utc};
 use csv::StringRecord;
+use flate2::read::GzDecoder;
 use glob::glob;
 use parquet::arrow::ArrowWriter;
 use rust_decimal::prelude::RoundingStrategy;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::schema::{
     canonical_candle_schema, CANONICAL_DECIMAL_PRECISION, CANONICAL_DECIMAL_SCALE,
@@ -192,6 +193,22 @@ impl Pipeline {
         Self { mapping }
     }
 
+    fn create_reader(&self, path: &Path) -> Result<Box<dyn Read>> {
+        let file = File::open(path)
+            .with_context(|| format!("failed to open source file {}", path.display()))?;
+        let is_gzip = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gz"))
+            .unwrap_or(false);
+        if is_gzip {
+            debug!(path = %path.display(), "detected gzip-compressed source");
+            Ok(Box::new(GzDecoder::new(file)))
+        } else {
+            Ok(Box::new(file))
+        }
+    }
+
     pub fn run(
         &self,
         pattern: &str,
@@ -221,12 +238,11 @@ impl Pipeline {
 
     fn load_rows(&self, path: &Path, symbol: &str) -> Result<Vec<CanonicalCandle>> {
         let interval_label = self.mapping.interval.clone();
-        let file = File::open(path)
-            .with_context(|| format!("failed to open source file {}", path.display()))?;
+        let source = self.create_reader(path)?;
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(self.mapping.csv.delimiter())
             .has_headers(self.mapping.csv.has_header())
-            .from_reader(BufReader::new(file));
+            .from_reader(BufReader::new(source));
         let mut rows = Vec::new();
         for (idx, record) in reader.records().enumerate() {
             let record = record.with_context(|| format!("failed to read record {}", idx + 1))?;
@@ -443,6 +459,7 @@ fn datetime_from_ns(timestamp: i64) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -484,6 +501,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 2);
+        assert!(count_files(&output) > 0, "no parquet files written");
+    }
+
+    #[test]
+    fn pipeline_normalizes_csv_gz() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("candles.csv.gz");
+        let payload = b"ts,open,high,low,close,vol\n1700000000000,100,110,90,105,12\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        fs::write(&src, compressed).unwrap();
+
+        let mapping = MappingConfig {
+            csv: CsvConfig::default(),
+            fields: FieldMapping {
+                timestamp: TimestampField {
+                    col: 0,
+                    unit: TimestampUnit::Milliseconds,
+                    format: TimestampFormat::Unix,
+                },
+                open: ValueField { col: 1 },
+                high: ValueField { col: 2 },
+                low: ValueField { col: 3 },
+                close: ValueField { col: 4 },
+                volume: Some(ValueField { col: 5 }),
+            },
+            interval: "1m".into(),
+        };
+        let pipeline = Pipeline::new(mapping);
+        let output = dir.path().join("lake");
+        let rows = pipeline
+            .run(
+                src.to_str().unwrap(),
+                &output,
+                "binance:BTCUSDT",
+                Partitioning::Daily,
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
         assert!(count_files(&output) > 0, "no parquet files written");
     }
 
