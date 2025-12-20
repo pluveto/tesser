@@ -15,7 +15,7 @@ use tesser_core::{Candle, Interval, Side, Symbol, Tick};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
 const MAX_LIMIT: usize = 1000;
@@ -261,6 +261,16 @@ impl MarketDataDownloader for BybitDownloader {
             }
 
             batch.sort_by_key(|c| c.timestamp);
+            let first_ts = batch.first().map(|c| c.timestamp).unwrap();
+            if first_ts.timestamp_millis() > cursor + interval_ms * 10 {
+                warn!(
+                    "bybit klines returned first_ts={}ms for cursor={}ms (interval_ms={}, batch_len={})",
+                    first_ts.timestamp_millis(),
+                    cursor,
+                    interval_ms,
+                    batch.len()
+                );
+            }
             cursor = batch
                 .last()
                 .map(|c| c.timestamp.timestamp_millis() + interval_ms)
