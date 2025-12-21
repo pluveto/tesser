@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Days, Utc};
+use chrono::{DateTime, Days, Duration as ChronoDuration, NaiveTime, Utc};
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
@@ -404,7 +404,13 @@ impl BybitDownloader {
 
     async fn download_trades_public(&self, req: &TradeRequest<'_>) -> Result<Vec<NormalizedTrade>> {
         let mut cursor_date = req.start.date_naive();
-        let end_date = req.end.date_naive();
+        let effective_end =
+            if req.end.time() == NaiveTime::from_hms_opt(0, 0, 0).unwrap() && req.end > req.start {
+                req.end - ChronoDuration::nanoseconds(1)
+            } else {
+                req.end
+            };
+        let end_date = effective_end.date_naive();
         let mut trades = Vec::new();
         let mut seen_ids = HashSet::new();
         let base_url = req.public_data_url.unwrap_or(BYBIT_PUBLIC_BASE_URL);
@@ -670,7 +676,13 @@ impl BinanceDownloader {
 
     async fn download_trades_public(&self, req: &TradeRequest<'_>) -> Result<Vec<NormalizedTrade>> {
         let mut cursor_date = req.start.date_naive();
-        let end_date = req.end.date_naive();
+        let effective_end =
+            if req.end.time() == NaiveTime::from_hms_opt(0, 0, 0).unwrap() && req.end > req.start {
+                req.end - ChronoDuration::nanoseconds(1)
+            } else {
+                req.end
+            };
+        let end_date = effective_end.date_naive();
         let mut trades = Vec::new();
         let mut seen_ids = HashSet::new();
         let base_url = req.public_data_url.unwrap_or(BINANCE_PUBLIC_BASE_URL);
@@ -1478,5 +1490,34 @@ mod tests {
         assert_eq!(&downloaded, body.as_slice());
 
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn archive_day_span_treats_midnight_end_as_exclusive() {
+        let start = DateTime::<Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2021, 8, 27)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+        let end = DateTime::<Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2021, 8, 28)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+
+        let effective_end =
+            if end.time() == NaiveTime::from_hms_opt(0, 0, 0).unwrap() && end > start {
+                end - ChronoDuration::nanoseconds(1)
+            } else {
+                end
+            };
+        assert_eq!(
+            effective_end.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2021, 8, 27).unwrap()
+        );
     }
 }
